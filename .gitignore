@@ -1,0 +1,12 @@
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+.DS_Store
+dist/
+*.zip
+*.sha256
+.env
+*.pem
+*.p12
+*.mobileprovision

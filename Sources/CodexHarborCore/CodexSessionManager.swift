@@ -65,6 +65,14 @@ public struct CodexSessionManager {
         try save(entries); return entries
     }
 
+    public func rename(_ id: String, to title: String) throws -> [CodexSessionEntry] {
+        let value = title.trimmingCharacters(in: .whitespacesAndNewlines); guard !value.isEmpty else { return try reconcile() }
+        let url = paths.codexHome.appendingPathComponent("state_5.sqlite"); var db: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK, let db else { return try reconcile() }; defer { sqlite3_close(db) }
+        try execute("UPDATE threads SET title='\(sql(value))', name='\(sql(value))' WHERE id='\(sql(id))'", db: db)
+        return try reconcile()
+    }
+
     private struct ThreadRow { let id: String; let title: String; let group: String?; let projectID: String?; let sectionID: String?; let cwd: String?; let deleted: Bool }
     private func readCodexThreads() throws -> [ThreadRow] {
         let url = paths.codexHome.appendingPathComponent("state_5.sqlite"); guard fileManager.fileExists(atPath: url.path) else { return [] }
@@ -76,10 +84,10 @@ public struct CodexSessionManager {
     private func readCatalog() throws -> [String: (title: String, group: String?, projectID: String?, cwd: String?)] {
         let url = paths.codexHome.appendingPathComponent("sqlite/codex-dev.db"); guard fileManager.fileExists(atPath: url.path) else { return [:] }
         var db: OpaquePointer?; guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK, let db else { return [:] }; defer { sqlite3_close(db) }
-        let sql = "SELECT c.thread_id, c.display_title, p.name, c.project_id, c.cwd FROM local_thread_catalog c LEFT JOIN \"projects\" p ON p.id=c.project_id WHERE c.host_id='local'"
+        let sql = "SELECT c.thread_id, c.display_title, c.project_id, c.cwd FROM local_thread_catalog c WHERE c.host_id='local'"
         var st: OpaquePointer?; guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK, let st else { return [:] }; defer { sqlite3_finalize(st) }
         var result: [String: (String,String?,String?,String?)] = [:]
-        while sqlite3_step(st) == SQLITE_ROW { func str(_ i:Int32)->String? { sqlite3_column_text(st,i).map{String(cString:$0)} }; if let id = str(0) { result[id] = (str(1) ?? "", str(2), str(3), str(4)) } }
+        while sqlite3_step(st) == SQLITE_ROW { func str(_ i:Int32)->String? { sqlite3_column_text(st,i).map{String(cString:$0)} }; if let id = str(0) { let cwd = str(3); let folder = cwd.flatMap { URL(fileURLWithPath: $0).lastPathComponent.isEmpty ? nil : URL(fileURLWithPath: $0).lastPathComponent }; result[id] = (str(1) ?? "", folder, str(2), cwd) } }
         return result
     }
     private func findProject(named name: String, in db: OpaquePointer) throws -> String? { var st:OpaquePointer?; guard sqlite3_prepare_v2(db,"SELECT id FROM projects WHERE name = ? LIMIT 1",-1,&st,nil)==SQLITE_OK, let st else{return nil}; defer{sqlite3_finalize(st)}; sqlite3_bind_text(st,1,name,-1,sessionSQLiteTransient); return sqlite3_step(st)==SQLITE_ROW ? sqlite3_column_text(st,0).map{String(cString:$0)} : nil }

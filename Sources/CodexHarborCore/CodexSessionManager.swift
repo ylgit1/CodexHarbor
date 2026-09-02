@@ -85,6 +85,14 @@ public struct CodexSessionManager {
         try execute("UPDATE threads SET project_id=NULL WHERE project_id IN (SELECT id FROM projects WHERE name='\(sql(name))')", db: db); try execute("DELETE FROM projects WHERE name='\(sql(name))'", db: db); return try reconcile()
     }
 
+    public func createGroup(_ name: String) throws -> [CodexSessionEntry] {
+        let value = name.trimmingCharacters(in: .whitespacesAndNewlines); guard !value.isEmpty else { return try reconcile() }
+        let url = paths.codexHome.appendingPathComponent("state_5.sqlite"); var db: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK, let db else { return try reconcile() }; defer { sqlite3_close(db) }
+        if try findProject(named: value, in: db) == nil { let now = Int(Date().timeIntervalSince1970 * 1000); try execute("INSERT INTO projects (id,name,metadata,position,created_at_ms,updated_at_ms) VALUES ('\(UUID().uuidString)', '\(sql(value))', '{}', 999999, \(now), \(now))", db: db) }
+        return try reconcile()
+    }
+
     private struct ThreadRow { let id: String; let title: String; let group: String?; let projectID: String?; let sectionID: String?; let cwd: String?; let deleted: Bool }
     private func readCodexThreads() throws -> [ThreadRow] {
         let url = paths.codexHome.appendingPathComponent("state_5.sqlite"); guard fileManager.fileExists(atPath: url.path) else { return [] }

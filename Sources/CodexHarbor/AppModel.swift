@@ -120,6 +120,7 @@ final class AppModel: ObservableObject {
     func renameSession(_ id: String, title: String) async { do { sessions = try sessionManager.rename(id, to: title) } catch { appendLog("重命名会话失败：\(redacted(error.localizedDescription))", level: .error) } }
     func renameSessionGroup(_ old: String, new: String) async { do { sessions = try sessionManager.renameGroup(old, to: new) } catch { appendLog("重命名目录失败：\(redacted(error.localizedDescription))", level: .error) } }
     func deleteSessionGroup(_ name: String) async { do { sessions = try sessionManager.deleteGroup(name) } catch { appendLog("删除目录失败：\(redacted(error.localizedDescription))", level: .error) } }
+    func createSessionGroup(_ name: String) async { do { sessions = try sessionManager.createGroup(name) } catch { appendLog("创建目录失败：\(redacted(error.localizedDescription))", level: .error) } }
 
     /// Re-reads Codex's live files so external login/configuration changes are reflected immediately.
     func refreshEnvironment() async {

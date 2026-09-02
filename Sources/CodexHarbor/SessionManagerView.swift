@@ -11,6 +11,8 @@ struct SessionManagerView: View {
     @State private var renameText = ""
     @State private var renameGroupName: String?
     @State private var renameGroupText = ""
+    @State private var showsNewGroup = false
+    @State private var newGroupName = ""
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             titleBar
@@ -34,11 +36,13 @@ struct SessionManagerView: View {
         }
         .alert("编辑任务名称", isPresented: Binding(get: { renameID != nil }, set: { if !$0 { renameID = nil } })) { TextField("任务名称", text: $renameText); Button("保存") { if let id = renameID { Task { await model.renameSession(id, title: renameText) }; renameID = nil } }; Button("取消", role: .cancel) { renameID = nil } }
         .alert("编辑目录名称", isPresented: Binding(get: { renameGroupName != nil }, set: { if !$0 { renameGroupName = nil } })) { TextField("目录名称", text: $renameGroupText); Button("保存") { if let old = renameGroupName { Task { await model.renameSessionGroup(old, new: renameGroupText) }; renameGroupName = nil } }; Button("取消", role: .cancel) { renameGroupName = nil } }
+        .alert("新建目录", isPresented: $showsNewGroup) { TextField("目录名称", text: $newGroupName); Button("创建") { Task { await model.createSessionGroup(newGroupName) } }; Button("取消", role: .cancel) { } }
     }
-    private var groupedKeys: [String] { Array(Set(model.sessions.map { $0.group ?? "未分组" })).sorted() }
-    private func sessions(in key: String) -> [CodexSessionEntry] { model.sessions.filter { ($0.group ?? "未分组") == key && (filter == "全部" || key == filter) } }
+    private var activeSessions: [CodexSessionEntry] { model.sessions.filter { !$0.deleted } }
+    private var groupedKeys: [String] { Array(Set(activeSessions.map { $0.group ?? "未分组" })).sorted() }
+    private func sessions(in key: String) -> [CodexSessionEntry] { activeSessions.filter { ($0.group ?? "未分组") == key && (filter == "全部" || key == filter) } }
     private var titleBar: some View { HStack { Text("会话管理").font(.title2.bold()); Spacer() } }
-    private var filterPicker: some View { HStack { Picker("分组", selection: $filter) { Text("全部").tag("全部"); Text("未分组").tag("未分组"); ForEach(Array(Set(model.sessions.compactMap(\.group))).sorted(), id: \.self) { Text($0).tag($0) } }.frame(width: 150); Spacer(); Button("刷新") { Task { await model.refreshSessions() } } } }
+    private var filterPicker: some View { HStack { Picker("分组", selection: $filter) { Text("全部").tag("全部"); Text("未分组").tag("未分组"); ForEach(Array(Set(activeSessions.compactMap(\.group))).sorted(), id: \.self) { Text($0).tag($0) } }.frame(width: 150); Spacer(); Button("新建目录") { newGroupName = ""; showsNewGroup = true }; Button("刷新") { Task { await model.refreshSessions() } } } }
     private var closeBar: some View { HStack { Spacer(); Button("关闭") { dismiss() }.keyboardShortcut(.cancelAction) } }
 
     @ViewBuilder private func sessionRow(_ s: CodexSessionEntry) -> some View {

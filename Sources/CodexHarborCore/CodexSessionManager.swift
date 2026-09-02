@@ -47,7 +47,8 @@ public struct CodexSessionManager {
         }
         for id in ids { try execute("UPDATE threads SET project_id = \(projectID.map { "'\($0)'" } ?? "NULL") WHERE id = '\(sql(id))'", db: db) }
         sqlite3_exec(db, "COMMIT", nil, nil, nil)
-        if let catalog = paths.codexHome.deletingLastPathComponent().appendingPathComponent("sqlite/codex-dev.db") as URL?, fileManager.fileExists(atPath: catalog.path) { try? updateCatalog(catalog, ids: ids, projectID: projectID) }
+        let catalog = paths.codexHome.appendingPathComponent("sqlite/codex-dev.db")
+        if fileManager.fileExists(atPath: catalog.path) { try? updateCatalog(catalog, ids: ids, projectID: projectID) }
         return try reconcile()
     }
 

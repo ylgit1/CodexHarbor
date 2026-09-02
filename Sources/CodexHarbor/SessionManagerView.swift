@@ -21,7 +21,7 @@ struct SessionManagerView: View {
                     } label: {
                         Label(key, systemImage: "folder")
                             .onDrop(of: [.text], isTargeted: nil) { providers in
-                                for provider in providers { provider.loadObject(ofClass: NSString.self) { object, _ in if let id = object as? NSString { Task { await model.groupSessions([id as String], group: key) } } } }
+                                for provider in providers { provider.loadObject(ofClass: NSString.self) { object, _ in if let id = object as? NSString { let value = String(id); Task { @MainActor in await model.groupSessions([value], group: key) } } } }
                                 return true
                             }
                     }

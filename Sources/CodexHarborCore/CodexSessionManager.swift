@@ -26,11 +26,16 @@ public struct CodexSessionManager {
     public func reconcile() throws -> [CodexSessionEntry] {
         var entries = try load(); let old = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
         let catalog = try readCatalog()
-        let live = try readCodexThreads().map { row -> ThreadRow in
+        var live = try readCodexThreads().map { row -> ThreadRow in
             guard let c = catalog[row.id] else { return row }
             let cwdGroup = c.cwd.flatMap { URL(fileURLWithPath: $0).lastPathComponent.isEmpty ? nil : URL(fileURLWithPath: $0).lastPathComponent }
             return .init(id: row.id, title: c.title.isEmpty ? row.title : c.title, group: row.group ?? c.group ?? cwdGroup, projectID: row.projectID ?? c.projectID, sectionID: row.sectionID, cwd: c.cwd ?? row.cwd, deleted: row.deleted)
         }
+        let stateIDs = Set(live.map(\.id))
+        live.append(contentsOf: catalog.compactMap { id, c in
+            guard !stateIDs.contains(id) else { return nil }
+            return ThreadRow(id: id, title: c.title.isEmpty ? id : c.title, group: c.group, projectID: c.projectID, sectionID: nil, cwd: c.cwd, deleted: false)
+        })
         entries = live.map { row in
             var item = old[row.id] ?? .init(id: row.id, title: row.title)
             item.title = row.title; item.group = row.group; item.projectID = row.projectID; item.sectionID = row.sectionID; item.cwd = row.cwd; item.deleted = row.deleted

@@ -11,13 +11,13 @@ struct SessionManagerView: View {
     @State private var renameText = ""
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack { Text("会话管理").font(.title2.bold()); Spacer(); Button("完成") { dismiss() } }
+            titleBar
             Text("删除会话会移入回收站，不删除原始内容；分组仅保存在 Harbor。").font(.caption).foregroundStyle(.secondary)
-            HStack { Picker("分组", selection: $filter) { Text("全部").tag("全部"); Text("未分组").tag("未分组"); ForEach(Array(Set(model.sessions.compactMap(\.group))).sorted(), id: \.self) { Text($0).tag($0) } }.frame(width: 150); Spacer(); Button("刷新") { Task { await model.refreshSessions() } }; Button("移入回收站", role: .destructive) { Task { await model.deleteSessions(selected); selected.removeAll() } }.disabled(selected.isEmpty); Button("恢复") { Task { await model.restoreSessions(selected); selected.removeAll() } }.disabled(selected.isEmpty) }
+            toolbar
             List(selection: $selected) {
                 ForEach(groupedKeys, id: \.self) { key in
                     DisclosureGroup {
-                        ForEach(model.sessions.filter { ($0.group ?? "未分组") == key && (filter == "全部" || key == filter) }) { s in sessionRow(s) }
+                        ForEach(sessions(in: key)) { s in sessionRow(s) }
                     } label: {
                         Label(key, systemImage: "folder")
                             .onDrop(of: [.text], isTargeted: nil) { providers in
@@ -27,11 +27,15 @@ struct SessionManagerView: View {
                     }
                 }
             }
-            HStack { TextField("分组名称", text: $group); Button("设置分组") { let g = group.trimmingCharacters(in: .whitespacesAndNewlines); guard !g.isEmpty else { return }; Task { await model.groupSessions(selected, group: g); group = "" } }.disabled(selected.isEmpty || group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty); Button("取消分组") { Task { await model.groupSessions(selected, group: nil) } }.disabled(selected.isEmpty) }
+            footer
         }
         .alert("编辑任务名称", isPresented: Binding(get: { renameID != nil }, set: { if !$0 { renameID = nil } })) { TextField("任务名称", text: $renameText); Button("保存") { if let id = renameID { Task { await model.renameSession(id, title: renameText) }; renameID = nil } }; Button("取消", role: .cancel) { renameID = nil } }
     }
     private var groupedKeys: [String] { Array(Set(model.sessions.map { $0.group ?? "未分组" })).sorted() }
+    private func sessions(in key: String) -> [CodexSessionEntry] { model.sessions.filter { ($0.group ?? "未分组") == key && (filter == "全部" || key == filter) } }
+    private var titleBar: some View { HStack { Text("会话管理").font(.title2.bold()); Spacer(); Button("完成") { dismiss() } } }
+    private var toolbar: some View { HStack { Picker("分组", selection: $filter) { Text("全部").tag("全部"); Text("未分组").tag("未分组"); ForEach(Array(Set(model.sessions.compactMap(\.group))).sorted(), id: \.self) { Text($0).tag($0) } }.frame(width: 150); Spacer(); Button("刷新") { Task { await model.refreshSessions() } }; Button("移入回收站", role: .destructive) { Task { await model.deleteSessions(selected); selected.removeAll() } }.disabled(selected.isEmpty); Button("恢复") { Task { await model.restoreSessions(selected); selected.removeAll() } }.disabled(selected.isEmpty) } }
+    private var footer: some View { HStack { TextField("分组名称", text: $group); Button("设置分组") { let g = group.trimmingCharacters(in: .whitespacesAndNewlines); guard !g.isEmpty else { return }; Task { await model.groupSessions(selected, group: g); group = "" } }.disabled(selected.isEmpty || group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty); Button("取消分组") { Task { await model.groupSessions(selected, group: nil) } }.disabled(selected.isEmpty) } }
 
     @ViewBuilder private func sessionRow(_ s: CodexSessionEntry) -> some View {
         HStack { Image(systemName: s.deleted ? "trash" : "bubble.left.and.bubble.right"); Text(s.title).lineLimit(1); Spacer(); if s.deleted { Text("回收站").font(.caption2).foregroundStyle(.secondary) } }

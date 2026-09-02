@@ -25,10 +25,15 @@ public struct CodexSessionManager {
 
     public func reconcile() throws -> [CodexSessionEntry] {
         var entries = try load(); let old = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
-        let live = try readCodexThreads()
+        let catalog = try readCatalog()
+        let live = try readCodexThreads().map { row -> ThreadRow in
+            guard let c = catalog[row.id] else { return row }
+            let cwdGroup = c.cwd.flatMap { URL(fileURLWithPath: $0).lastPathComponent.isEmpty ? nil : URL(fileURLWithPath: $0).lastPathComponent }
+            return .init(id: row.id, title: c.title.isEmpty ? row.title : c.title, group: row.group ?? c.group ?? cwdGroup, projectID: row.projectID ?? c.projectID, sectionID: row.sectionID, cwd: c.cwd ?? row.cwd, deleted: row.deleted)
+        }
         entries = live.map { row in
             var item = old[row.id] ?? .init(id: row.id, title: row.title)
-            item.title = row.title; item.group = row.group; item.projectID = row.projectID; item.sectionID = row.sectionID; item.deleted = row.deleted
+            item.title = row.title; item.group = row.group; item.projectID = row.projectID; item.sectionID = row.sectionID; item.cwd = row.cwd; item.deleted = row.deleted
             return item
         }
         try save(entries)
@@ -60,13 +65,22 @@ public struct CodexSessionManager {
         try save(entries); return entries
     }
 
-    private struct ThreadRow { let id: String; let title: String; let group: String?; let projectID: String?; let sectionID: String?; let deleted: Bool }
+    private struct ThreadRow { let id: String; let title: String; let group: String?; let projectID: String?; let sectionID: String?; let cwd: String?; let deleted: Bool }
     private func readCodexThreads() throws -> [ThreadRow] {
         let url = paths.codexHome.appendingPathComponent("state_5.sqlite"); guard fileManager.fileExists(atPath: url.path) else { return [] }
         var db: OpaquePointer?; guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK, let db else { return [] }; defer { sqlite3_close(db) }
-        let sql = "SELECT t.id, COALESCE(NULLIF(t.title,''), t.name, t.first_user_message, t.id), p.name, t.project_id, t.thread_section_id, t.archived FROM threads t LEFT JOIN projects p ON p.id=t.project_id"
+        let sql = "SELECT t.id, COALESCE(NULLIF(t.title,''), NULLIF(t.name,''), NULLIF(t.first_user_message,''), t.id), p.name, t.project_id, t.thread_section_id, t.cwd, t.archived FROM threads t LEFT JOIN projects p ON p.id=t.project_id"
         var st: OpaquePointer?; guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK, let st else { return [] }; defer { sqlite3_finalize(st) }
-        var rows:[ThreadRow]=[]; while sqlite3_step(st) == SQLITE_ROW { func str(_ i:Int32)->String? { sqlite3_column_text(st,i).map{String(cString:$0)} }; rows.append(.init(id:str(0) ?? "", title:str(1) ?? "未命名会话", group:str(2), projectID:str(3), sectionID:str(4), deleted:sqlite3_column_int(st,5) != 0)) }; return rows.filter{ !$0.id.isEmpty }
+        var rows:[ThreadRow]=[]; while sqlite3_step(st) == SQLITE_ROW { func str(_ i:Int32)->String? { sqlite3_column_text(st,i).map{String(cString:$0)} }; rows.append(.init(id:str(0) ?? "", title:str(1) ?? "未命名会话", group:str(2), projectID:str(3), sectionID:str(4), cwd:str(5), deleted:sqlite3_column_int(st,6) != 0)) }; return rows.filter{ !$0.id.isEmpty }
+    }
+    private func readCatalog() throws -> [String: (title: String, group: String?, projectID: String?, cwd: String?)] {
+        let url = paths.codexHome.appendingPathComponent("sqlite/codex-dev.db"); guard fileManager.fileExists(atPath: url.path) else { return [:] }
+        var db: OpaquePointer?; guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK, let db else { return [:] }; defer { sqlite3_close(db) }
+        let sql = "SELECT c.thread_id, c.display_title, p.name, c.project_id, c.cwd FROM local_thread_catalog c LEFT JOIN \"projects\" p ON p.id=c.project_id WHERE c.host_id='local'"
+        var st: OpaquePointer?; guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK, let st else { return [:] }; defer { sqlite3_finalize(st) }
+        var result: [String: (String,String?,String?,String?)] = [:]
+        while sqlite3_step(st) == SQLITE_ROW { func str(_ i:Int32)->String? { sqlite3_column_text(st,i).map{String(cString:$0)} }; if let id = str(0) { result[id] = (str(1) ?? "", str(2), str(3), str(4)) } }
+        return result
     }
     private func findProject(named name: String, in db: OpaquePointer) throws -> String? { var st:OpaquePointer?; guard sqlite3_prepare_v2(db,"SELECT id FROM projects WHERE name = ? LIMIT 1",-1,&st,nil)==SQLITE_OK, let st else{return nil}; defer{sqlite3_finalize(st)}; sqlite3_bind_text(st,1,name,-1,sessionSQLiteTransient); return sqlite3_step(st)==SQLITE_ROW ? sqlite3_column_text(st,0).map{String(cString:$0)} : nil }
     private func updateCatalog(_ url: URL, ids: Set<String>, projectID: String?) throws { var db:OpaquePointer?; guard sqlite3_open_v2(url.path,&db,SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX,nil)==SQLITE_OK,let db else{return}; defer{sqlite3_close(db)}; for id in ids { try execute("UPDATE local_thread_catalog SET project_id = \(projectID.map { "'\($0)'" } ?? "NULL") WHERE thread_id = '\(sql(id))'",db:db) } }

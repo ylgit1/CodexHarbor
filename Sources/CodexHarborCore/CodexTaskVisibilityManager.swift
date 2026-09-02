@@ -25,10 +25,12 @@ public struct CodexSessionEntry: Identifiable, Codable, Equatable, Sendable {
     public let id: String
     public var title: String
     public var group: String?
+    public var projectID: String?
+    public var sectionID: String?
     public var deleted: Bool
 
-    public init(id: String, title: String, group: String? = nil, deleted: Bool = false) {
-        self.id = id; self.title = title; self.group = group; self.deleted = deleted
+    public init(id: String, title: String, group: String? = nil, deleted: Bool = false, projectID: String? = nil, sectionID: String? = nil) {
+        self.id = id; self.title = title; self.group = group; self.deleted = deleted; self.projectID = projectID; self.sectionID = sectionID
     }
 }
 

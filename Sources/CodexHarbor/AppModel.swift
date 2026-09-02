@@ -118,6 +118,8 @@ final class AppModel: ObservableObject {
     func restoreSessions(_ ids: Set<String>) async { guard !ids.isEmpty else { return }; do { sessions = try sessionManager.setDeleted(false, for: ids); appendLog("已恢复会话：\(ids.count) 个", level: .success) } catch { appendLog("恢复会话失败：\(redacted(error.localizedDescription))", level: .error) } }
     func groupSessions(_ ids: Set<String>, group: String?) async { do { sessions = try sessionManager.setGroup(group, for: ids) } catch { appendLog("会话分组失败：\(redacted(error.localizedDescription))", level: .error) } }
     func renameSession(_ id: String, title: String) async { do { sessions = try sessionManager.rename(id, to: title) } catch { appendLog("重命名会话失败：\(redacted(error.localizedDescription))", level: .error) } }
+    func renameSessionGroup(_ old: String, new: String) async { do { sessions = try sessionManager.renameGroup(old, to: new) } catch { appendLog("重命名目录失败：\(redacted(error.localizedDescription))", level: .error) } }
+    func deleteSessionGroup(_ name: String) async { do { sessions = try sessionManager.deleteGroup(name) } catch { appendLog("删除目录失败：\(redacted(error.localizedDescription))", level: .error) } }
 
     /// Re-reads Codex's live files so external login/configuration changes are reflected immediately.
     func refreshEnvironment() async {

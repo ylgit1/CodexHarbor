@@ -73,6 +73,18 @@ public struct CodexSessionManager {
         return try reconcile()
     }
 
+    public func renameGroup(_ oldName: String, to newName: String) throws -> [CodexSessionEntry] {
+        let name = newName.trimmingCharacters(in: .whitespacesAndNewlines); guard !name.isEmpty else { return try reconcile() }
+        let url = paths.codexHome.appendingPathComponent("state_5.sqlite"); var db: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK, let db else { return try reconcile() }; defer { sqlite3_close(db) }
+        try execute("UPDATE projects SET name='\(sql(name))' WHERE name='\(sql(oldName))'", db: db); return try reconcile()
+    }
+    public func deleteGroup(_ name: String) throws -> [CodexSessionEntry] {
+        let url = paths.codexHome.appendingPathComponent("state_5.sqlite"); var db: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK, let db else { return try reconcile() }; defer { sqlite3_close(db) }
+        try execute("UPDATE threads SET project_id=NULL WHERE project_id IN (SELECT id FROM projects WHERE name='\(sql(name))')", db: db); try execute("DELETE FROM projects WHERE name='\(sql(name))'", db: db); return try reconcile()
+    }
+
     private struct ThreadRow { let id: String; let title: String; let group: String?; let projectID: String?; let sectionID: String?; let cwd: String?; let deleted: Bool }
     private func readCodexThreads() throws -> [ThreadRow] {
         let url = paths.codexHome.appendingPathComponent("state_5.sqlite"); guard fileManager.fileExists(atPath: url.path) else { return [] }

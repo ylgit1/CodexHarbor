@@ -19,6 +19,19 @@ public struct CodexTaskVisibilityResult: Equatable, Sendable {
     }
 }
 
+/// A lightweight session entry used by Harbor's session manager. The actual
+/// rollout JSONL is never rewritten by this type.
+public struct CodexSessionEntry: Identifiable, Codable, Equatable, Sendable {
+    public let id: String
+    public var title: String
+    public var group: String?
+    public var deleted: Bool
+
+    public init(id: String, title: String, group: String? = nil, deleted: Bool = false) {
+        self.id = id; self.title = title; self.group = group; self.deleted = deleted
+    }
+}
+
 /// Keeps each connection kind's task list separate. Tasks are archived in the
 /// Codex index only; rollout files remain untouched and can be restored when
 /// the same connection kind is selected again.
@@ -77,6 +90,15 @@ public struct CodexTaskVisibilityManager {
     public func visibleTaskIDs() throws -> [String] {
         let catalogIDs = try visibleCatalogIDs()
         return catalogIDs.isEmpty ? try visibleTaskRecords().map(\.id) : catalogIDs
+    }
+
+    /// Archives sessions in Codex's indexes without touching their rollout files.
+    public func archiveTaskIDs(_ ids: [String]) throws { try setArchived(true, ids: ids); try setCatalogVisible(false, ids: ids) }
+    public func restoreTaskIDs(_ ids: [String]) throws { try setArchived(false, ids: ids); try setCatalogVisible(true, ids: ids) }
+    public func indexedTaskIDs() throws -> [String] {
+        var ids: [String] = []
+        for database in try stateDatabases() { ids.append(contentsOf: try queryRecords(in: database, archived: false).map(\.id)); ids.append(contentsOf: try queryRecords(in: database, archived: true).map(\.id)) }
+        return Array(Set(ids)).sorted()
     }
 
     private struct TaskRecord {

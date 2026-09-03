@@ -31,6 +31,11 @@ struct SessionManagerView: View {
                             }
                     }
                 }
+                if !recentSessions.isEmpty {
+                    Section("最近") {
+                        ForEach(recentSessions) { s in sessionRow(s) }
+                    }
+                }
             }
             closeBar
         }
@@ -39,8 +44,10 @@ struct SessionManagerView: View {
         .alert("新建目录", isPresented: $showsNewGroup) { TextField("目录名称", text: $newGroupName); Button("创建") { Task { await model.createSessionGroup(newGroupName) } }; Button("取消", role: .cancel) { } }
     }
     private var activeSessions: [CodexSessionEntry] { model.sessions.filter { !$0.deleted } }
-    private var groupedKeys: [String] { Array(Set(activeSessions.map { $0.group ?? "未分组" })).sorted() }
-    private func sessions(in key: String) -> [CodexSessionEntry] { activeSessions.filter { ($0.group ?? "未分组") == key && (filter == "全部" || key == filter) } }
+    private var projectSessions: [CodexSessionEntry] { activeSessions.filter { $0.cwd == "/Users/mac/Documents/project" } }
+    private var recentSessions: [CodexSessionEntry] { activeSessions.filter { $0.cwd != "/Users/mac/Documents/project" }.prefix(10).map { $0 } }
+    private var groupedKeys: [String] { projectSessions.isEmpty ? [] : ["project"] }
+    private func sessions(in key: String) -> [CodexSessionEntry] { projectSessions.filter { (filter == "全部" || key == filter) } }
     private var titleBar: some View { HStack { Text("会话管理").font(.title2.bold()); Spacer() } }
     private var filterPicker: some View { HStack { Picker("分组", selection: $filter) { Text("全部").tag("全部"); Text("未分组").tag("未分组"); ForEach(Array(Set(activeSessions.compactMap(\.group))).sorted(), id: \.self) { Text($0).tag($0) } }.frame(width: 150); Spacer(); Button("新建目录") { newGroupName = ""; showsNewGroup = true }; Button("刷新") { Task { await model.refreshSessions() } } } }
     private var closeBar: some View { HStack { Spacer(); Button("关闭") { dismiss() }.keyboardShortcut(.cancelAction) } }

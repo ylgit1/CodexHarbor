@@ -47,9 +47,9 @@ struct SessionManagerView: View {
     private var projectSessions: [CodexSessionEntry] { activeSessions.filter { $0.cwd == "/Users/mac/Documents/project" } }
     private var recentSessions: [CodexSessionEntry] { activeSessions.filter { $0.cwd != "/Users/mac/Documents/project" }.prefix(10).map { $0 } }
     private var groupedKeys: [String] { projectSessions.isEmpty ? [] : ["project"] }
-    private func sessions(in key: String) -> [CodexSessionEntry] { projectSessions.filter { (filter == "全部" || key == filter) } }
+    private func sessions(in key: String) -> [CodexSessionEntry] { filter == "全部" || key == filter ? projectSessions : [] }
     private var titleBar: some View { HStack { Text("会话管理").font(.title2.bold()); Spacer() } }
-    private var filterPicker: some View { HStack { Picker("分组", selection: $filter) { Text("全部").tag("全部"); Text("未分组").tag("未分组"); ForEach(Array(Set(activeSessions.compactMap(\.group))).sorted(), id: \.self) { Text($0).tag($0) } }.frame(width: 150); Spacer(); Button("新建目录") { newGroupName = ""; showsNewGroup = true }; Button("刷新") { Task { await model.refreshSessions() } } } }
+    private var filterPicker: some View { HStack { Picker("分组", selection: $filter) { Text("全部").tag("全部"); Text("project").tag("project") }.frame(width: 150); Spacer(); Button("新建目录") { newGroupName = ""; showsNewGroup = true }; Button("刷新") { Task { await model.refreshSessions() } } } }
     private var closeBar: some View { HStack { Spacer(); Button("关闭") { dismiss() }.keyboardShortcut(.cancelAction) } }
 
     @ViewBuilder private func sessionRow(_ s: CodexSessionEntry) -> some View {

@@ -29,12 +29,12 @@ public struct CodexSessionManager {
         var live = try readCodexThreads().map { row -> ThreadRow in
             guard let c = catalog[row.id] else { return row }
             let cwdGroup = c.cwd.flatMap { URL(fileURLWithPath: $0).lastPathComponent.isEmpty ? nil : URL(fileURLWithPath: $0).lastPathComponent }
-            return .init(id: row.id, title: c.title.isEmpty ? row.title : c.title, group: row.group ?? c.group ?? cwdGroup, projectID: row.projectID ?? c.projectID, sectionID: row.sectionID, cwd: c.cwd ?? row.cwd, deleted: row.deleted)
+            return .init(id: row.id, title: c.title.isEmpty ? row.title : c.title, group: row.group ?? c.group ?? cwdGroup, projectID: row.projectID ?? c.projectID, sectionID: row.sectionID, cwd: c.cwd ?? row.cwd, deleted: row.deleted || c.deleted)
         }
         let stateIDs = Set(live.map(\.id))
         live.append(contentsOf: catalog.compactMap { id, c in
             guard !stateIDs.contains(id) else { return nil }
-            return ThreadRow(id: id, title: c.title.isEmpty ? id : c.title, group: c.group, projectID: c.projectID, sectionID: nil, cwd: c.cwd, deleted: false)
+            return ThreadRow(id: id, title: c.title.isEmpty ? id : c.title, group: c.group, projectID: c.projectID, sectionID: nil, cwd: c.cwd, deleted: c.deleted)
         })
         entries = live.map { row in
             var item = old[row.id] ?? .init(id: row.id, title: row.title)
@@ -66,6 +66,8 @@ public struct CodexSessionManager {
         var entries = try reconcile()
         let visibility = CodexTaskVisibilityManager(paths: paths, fileManager: fileManager)
         if deleted { try visibility.archiveTaskIDs(Array(ids)) } else { try visibility.restoreTaskIDs(Array(ids)) }
+        let catalog = paths.codexHome.appendingPathComponent("sqlite/codex-dev.db")
+        if fileManager.fileExists(atPath: catalog.path) { try? updateCatalogDeleted(catalog, ids: ids, deleted: deleted) }
         for index in entries.indices where ids.contains(entries[index].id) { entries[index].deleted = deleted }
         try save(entries); return entries
     }
@@ -106,17 +108,18 @@ public struct CodexSessionManager {
         var st: OpaquePointer?; guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK, let st else { return [] }; defer { sqlite3_finalize(st) }
         var rows:[ThreadRow]=[]; while sqlite3_step(st) == SQLITE_ROW { func str(_ i:Int32)->String? { sqlite3_column_text(st,i).map{String(cString:$0)} }; rows.append(.init(id:str(0) ?? "", title:str(1) ?? "未命名会话", group:str(2), projectID:str(3), sectionID:str(4), cwd:str(5), deleted:sqlite3_column_int(st,6) != 0)) }; return rows.filter{ !$0.id.isEmpty }
     }
-    private func readCatalog() throws -> [String: (title: String, group: String?, projectID: String?, cwd: String?)] {
+    private func readCatalog() throws -> [String: (title: String, group: String?, projectID: String?, cwd: String?, deleted: Bool)] {
         let url = paths.codexHome.appendingPathComponent("sqlite/codex-dev.db"); guard fileManager.fileExists(atPath: url.path) else { return [:] }
         var db: OpaquePointer?; guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK, let db else { return [:] }; defer { sqlite3_close(db) }
-        let sql = "SELECT c.thread_id, c.display_title, c.project_id, c.cwd FROM local_thread_catalog c WHERE c.host_id='local'"
+        let sql = "SELECT c.thread_id, c.display_title, c.project_id, c.cwd, c.missing_candidate FROM local_thread_catalog c WHERE c.host_id='local'"
         var st: OpaquePointer?; guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK, let st else { return [:] }; defer { sqlite3_finalize(st) }
-        var result: [String: (String,String?,String?,String?)] = [:]
-        while sqlite3_step(st) == SQLITE_ROW { func str(_ i:Int32)->String? { sqlite3_column_text(st,i).map{String(cString:$0)} }; if let id = str(0) { let cwd = str(3); let folder = cwd.flatMap { URL(fileURLWithPath: $0).lastPathComponent.isEmpty ? nil : URL(fileURLWithPath: $0).lastPathComponent }; result[id] = (str(1) ?? "", folder, str(2), cwd) } }
+        var result: [String: (String,String?,String?,String?,Bool)] = [:]
+        while sqlite3_step(st) == SQLITE_ROW { func str(_ i:Int32)->String? { sqlite3_column_text(st,i).map{String(cString:$0)} }; if let id = str(0) { let cwd = str(3); let folder = cwd.flatMap { URL(fileURLWithPath: $0).lastPathComponent.isEmpty ? nil : URL(fileURLWithPath: $0).lastPathComponent }; result[id] = (str(1) ?? "", folder, str(2), cwd, sqlite3_column_int(st,4) != 0) } }
         return result
     }
     private func findProject(named name: String, in db: OpaquePointer) throws -> String? { var st:OpaquePointer?; guard sqlite3_prepare_v2(db,"SELECT id FROM projects WHERE name = ? LIMIT 1",-1,&st,nil)==SQLITE_OK, let st else{return nil}; defer{sqlite3_finalize(st)}; sqlite3_bind_text(st,1,name,-1,sessionSQLiteTransient); return sqlite3_step(st)==SQLITE_ROW ? sqlite3_column_text(st,0).map{String(cString:$0)} : nil }
     private func updateCatalog(_ url: URL, ids: Set<String>, projectID: String?) throws { var db:OpaquePointer?; guard sqlite3_open_v2(url.path,&db,SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX,nil)==SQLITE_OK,let db else{return}; defer{sqlite3_close(db)}; for id in ids { try execute("UPDATE local_thread_catalog SET project_id = \(projectID.map { "'\($0)'" } ?? "NULL") WHERE thread_id = '\(sql(id))'",db:db) } }
+    private func updateCatalogDeleted(_ url: URL, ids: Set<String>, deleted: Bool) throws { var db:OpaquePointer?; guard sqlite3_open_v2(url.path,&db,SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX,nil)==SQLITE_OK,let db else{return}; defer{sqlite3_close(db)}; for id in ids { try execute("UPDATE local_thread_catalog SET missing_candidate = \(deleted ? 1 : 0) WHERE thread_id = '\(sql(id))'",db:db) } }
     private func execute(_ sql:String, db:OpaquePointer) throws { guard sqlite3_exec(db,sql,nil,nil,nil)==SQLITE_OK else { throw HarborError.invalidConfiguration("Codex 会话索引更新失败") } }
     private func sql(_ value:String)->String { value.replacingOccurrences(of:"'",with:"''") }
 }

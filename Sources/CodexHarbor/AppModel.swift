@@ -45,14 +45,12 @@ final class AppModel: ObservableObject {
     @Published private(set) var isAwaitingAccountLogin = false
     @Published private(set) var detectedAccountName: String?
     @Published private(set) var migrationPreview: CodexTaskMigrationPreview?
-    @Published private(set) var sessions: [CodexSessionEntry] = []
 
     private let store: LocalSecretStore
     private let manager: CodexConfigurationManager
     private let service: HarborServiceClient
     private let profileRepository: HarborProfileRepository
     private let accountProfileRepository: CodexAccountProfileRepository
-    private let sessionManager: CodexSessionManager
     private var apiBaseURLWasEdited = false
     private var didAutoQueryUsage = false
     private var codexLoginProcess: Process?
@@ -68,7 +66,6 @@ final class AppModel: ObservableObject {
         service = HarborServiceClient()
         profileRepository = HarborProfileRepository(store: store)
         accountProfileRepository = CodexAccountProfileRepository(store: store)
-        sessionManager = CodexSessionManager()
         if let data = UserDefaults.standard.data(forKey: logsStorageKey),
            let savedLogs = try? JSONDecoder().decode([HarborLogEntry].self, from: data) {
             logs = Array(savedLogs.suffix(200))
@@ -110,17 +107,8 @@ final class AppModel: ObservableObject {
             await queryUsage()
         }
         await refreshConnectionHealth(logResult: false)
-        await refreshSessions()
     }
 
-    func refreshSessions() async { do { sessions = try sessionManager.reconcile() } catch { appendLog("会话列表读取失败：\(redacted(error.localizedDescription))", level: .error) } }
-    func deleteSessions(_ ids: Set<String>) async { guard !ids.isEmpty else { return }; do { sessions = try sessionManager.setDeleted(true, for: ids); appendLog("已移入会话回收站：\(ids.count) 个", level: .success) } catch { appendLog("删除会话失败：\(redacted(error.localizedDescription))", level: .error) } }
-    func restoreSessions(_ ids: Set<String>) async { guard !ids.isEmpty else { return }; do { sessions = try sessionManager.setDeleted(false, for: ids); appendLog("已恢复会话：\(ids.count) 个", level: .success) } catch { appendLog("恢复会话失败：\(redacted(error.localizedDescription))", level: .error) } }
-    func groupSessions(_ ids: Set<String>, group: String?) async { do { sessions = try sessionManager.setGroup(group, for: ids) } catch { appendLog("会话分组失败：\(redacted(error.localizedDescription))", level: .error) } }
-    func renameSession(_ id: String, title: String) async { do { sessions = try sessionManager.rename(id, to: title) } catch { appendLog("重命名会话失败：\(redacted(error.localizedDescription))", level: .error) } }
-    func renameSessionGroup(_ old: String, new: String) async { do { sessions = try sessionManager.renameGroup(old, to: new) } catch { appendLog("重命名目录失败：\(redacted(error.localizedDescription))", level: .error) } }
-    func deleteSessionGroup(_ name: String) async { do { sessions = try sessionManager.deleteGroup(name) } catch { appendLog("删除目录失败：\(redacted(error.localizedDescription))", level: .error) } }
-    func createSessionGroup(_ name: String) async { do { sessions = try sessionManager.createGroup(name) } catch { appendLog("创建目录失败：\(redacted(error.localizedDescription))", level: .error) } }
 
     /// Re-reads Codex's live files so external login/configuration changes are reflected immediately.
     func refreshEnvironment() async {

@@ -30,7 +30,6 @@ struct RootView: View {
     @State private var showsActivationSheet = false
     @State private var showsAccountSetupSheet = false
     @State private var showsCustomAPISheet = false
-    @State private var showsSessionManager = false
     @State private var customAPIName = ""
     @State private var customAPIKey = ""
     @State private var customAPIProvider: CustomAPIProvider = .openAI
@@ -52,7 +51,6 @@ struct RootView: View {
         .sheet(isPresented: $showsCustomAPISheet) {
             customAPISheet
         }
-        .sheet(isPresented: $showsSessionManager) { SessionManagerView(model: model).frame(minWidth: 650, minHeight: 440).padding(20) }
         .confirmationDialog(
             "删除连接档案？",
             isPresented: Binding(
@@ -133,7 +131,6 @@ struct RootView: View {
             }
 
             Spacer()
-            Button { showsSessionManager = true; Task { await model.refreshSessions() } } label: { Label("会话管理", systemImage: "rectangle.3.group") }.buttonStyle(.bordered)
             statusPill
         }
     }

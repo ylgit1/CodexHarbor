@@ -22,7 +22,7 @@ public actor CodexAccountProfileRepository {
     }
 
     public func profiles() throws -> [CodexAccountProfile] {
-        try load().profiles.sorted { $0.createdAt < $1.createdAt }
+        try load().profiles
     }
 
     public func selectedProfileID() throws -> UUID? {
@@ -172,6 +172,38 @@ public actor CodexAccountProfileRepository {
         }
         catalog.profiles.remove(at: index)
         try store.remove(.accountAuthentication(identifier))
+        try persist(catalog)
+    }
+
+    public func rename(_ identifier: UUID, to rawName: String) throws {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw HarborError.invalidConfiguration("账户名称不能为空") }
+        var catalog = try load()
+        guard let index = catalog.profiles.firstIndex(where: { $0.id == identifier }) else { return }
+        catalog.profiles[index].name = name
+        try persist(catalog)
+    }
+
+    public func moveToBoundary(_ identifier: UUID, toFront: Bool) throws {
+        var catalog = try load()
+        guard let index = catalog.profiles.firstIndex(where: { $0.id == identifier }) else { return }
+        let profile = catalog.profiles.remove(at: index)
+        if toFront {
+            catalog.profiles.insert(profile, at: 0)
+        } else {
+            catalog.profiles.append(profile)
+        }
+        try persist(catalog)
+    }
+
+    public func reorder(moving identifier: UUID, before target: UUID) throws {
+        var catalog = try load()
+        guard identifier != target,
+              let sourceIndex = catalog.profiles.firstIndex(where: { $0.id == identifier }),
+              let targetIndex = catalog.profiles.firstIndex(where: { $0.id == target }) else { return }
+        let profile = catalog.profiles.remove(at: sourceIndex)
+        let adjustedTargetIndex = catalog.profiles.firstIndex(where: { $0.id == target }) ?? targetIndex
+        catalog.profiles.insert(profile, at: adjustedTargetIndex)
         try persist(catalog)
     }
 

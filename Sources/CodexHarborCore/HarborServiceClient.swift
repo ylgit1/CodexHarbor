@@ -75,15 +75,32 @@ public actor HarborServiceClient {
     }
 
     public func validateService(baseURL: URL, token: String) async throws {
+        _ = try await probeService(baseURL: baseURL, token: token)
+    }
+
+    public func probeService(baseURL: URL, token: String) async throws -> ServiceProbe {
         let baseURL = try Self.normalizedAPIBaseURL(baseURL)
         let modelsURL = Self.modelsURL(for: baseURL)
         var request = URLRequest(url: modelsURL)
         request.timeoutInterval = 15
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let (_, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw HarborError.serverRejected("服务凭据验证失败。")
+        let startedAt = Date()
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw HarborError.invalidServerResponse }
+        guard (200..<300).contains(http.statusCode) else {
+            let message = switch http.statusCode {
+            case 401, 403: "API 密钥无效，或没有访问模型目录的权限。"
+            case 404: "服务没有提供 /models 模型目录。"
+            case 429: "服务请求受限，或当前额度不足。"
+            case 500...599: "供应商服务暂时不可用（\(http.statusCode)）。"
+            default: "连接检查失败（HTTP \(http.statusCode)）。"
+            }
+            throw HarborError.serverRejected(message)
         }
+        let elapsed = max(1, Int(Date().timeIntervalSince(startedAt) * 1_000))
+        let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let entries = object?["data"] as? [[String: Any]]
+        return ServiceProbe(latencyMilliseconds: elapsed, modelCount: entries?.count)
     }
 
     public func fetchModels(baseURL: URL, token: String) async throws -> [String] {

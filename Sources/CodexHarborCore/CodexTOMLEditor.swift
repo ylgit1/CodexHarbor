@@ -19,13 +19,13 @@ struct CodexConfigurationSpec: Equatable, Sendable {
 }
 
 enum CodexTOMLEditor {
-    private static let managedTopLevelKeys = ["model", "model_provider", "model_reasoning_effort", "model_catalog_json"]
+    private static let managedTopLevelKeys = ["model", "model_provider", "model_reasoning_effort", "model_catalog_json", "service_tier"]
 
     static func applying(
         to original: String,
         spec: CodexConfigurationSpec
     ) throws -> String {
-        guard spec.apiBaseURL.scheme?.lowercased() == "https" else { throw HarborError.invalidBaseURL }
+        guard isAllowedBaseURL(spec.apiBaseURL) else { throw HarborError.invalidBaseURL }
         guard isSafeModel(spec.model) else { throw HarborError.invalidModel }
 
         let removal = removeManagedBlock(from: normalized(original))
@@ -35,7 +35,8 @@ enum CodexTOMLEditor {
 
         var updated = setTopLevelString(key: "model", value: spec.model, in: removal.text)
         updated = setTopLevelString(key: "model_provider", value: CodexConfigurationSpec.provider, in: updated)
-        updated = setTopLevelString(key: "model_reasoning_effort", value: "high", in: updated)
+        updated = setTopLevelString(key: "model_reasoning_effort", value: CodexDefaults.reasoningEffort, in: updated)
+        updated = setTopLevelString(key: "service_tier", value: CodexDefaults.serviceTier, in: updated)
         if let modelCatalogURL = spec.modelCatalogURL {
             updated = setTopLevelString(key: "model_catalog_json", value: modelCatalogURL.path, in: updated)
         } else {
@@ -108,12 +109,27 @@ enum CodexTOMLEditor {
     /// definition available. Existing Codex sessions remember the provider they
     /// were created with, so removing this block during a mode switch makes older
     /// Harbor sessions impossible to resume.
-    static func selectingAccountConfiguration(in configuration: String, original: String) throws -> String {
+    static func selectingAccountConfiguration(
+        in configuration: String,
+        original: String,
+        preferredModel: String? = nil,
+        preferredReasoningEffort: String? = nil,
+        preferredServiceTier: String? = nil
+    ) throws -> String {
         let normalizedConfiguration = normalized(configuration)
         try validateManagedBlock(normalizedConfiguration)
         var selected = normalizedConfiguration
         for key in managedTopLevelKeys {
             selected = restoreTopLevelAssignment(key: key, from: normalized(original), in: selected)
+        }
+        if let preferredModel {
+            selected = setTopLevelString(key: "model", value: preferredModel, in: selected)
+        }
+        if let preferredReasoningEffort {
+            selected = setTopLevelString(key: "model_reasoning_effort", value: preferredReasoningEffort, in: selected)
+        }
+        if let preferredServiceTier {
+            selected = setTopLevelString(key: "service_tier", value: preferredServiceTier, in: selected)
         }
         return selected.trimmingCharacters(in: .newlines) + "\n"
     }
@@ -285,6 +301,12 @@ enum CodexTOMLEditor {
             "refresh_interval_ms = 1000",
             CodexConfigurationSpec.endMarker
         ].joined(separator: "\n")
+    }
+
+    private static func isAllowedBaseURL(_ url: URL) -> Bool {
+        if url.scheme?.lowercased() == "https", url.host?.isEmpty == false { return true }
+        guard url.scheme?.lowercased() == "http" else { return false }
+        return url.host == "127.0.0.1" || url.host == "localhost" || url.host == "::1"
     }
 
     private static func quoted(_ value: String) -> String {

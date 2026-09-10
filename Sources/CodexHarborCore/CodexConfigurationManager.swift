@@ -117,7 +117,7 @@ public actor CodexConfigurationManager {
                 throw HarborError.deploymentAlreadyExists
             }
         }
-        guard request.apiBaseURL.scheme?.lowercased() == "https" else { throw HarborError.invalidBaseURL }
+        guard Self.isAllowedBaseURL(request.apiBaseURL) else { throw HarborError.invalidBaseURL }
         guard !request.token.isEmpty else { throw HarborError.missingToken }
 
         try fileManager.createDirectory(at: paths.codexHome, withIntermediateDirectories: true)
@@ -192,7 +192,13 @@ public actor CodexConfigurationManager {
     }
 
     @discardableResult
-    public func switchMode(_ mode: CodexMode, helperExecutable: URL) throws -> CodexEnvironment {
+    public func switchMode(
+        _ mode: CodexMode,
+        helperExecutable: URL,
+        preferredModel: String? = nil,
+        preferredReasoningEffort: String? = nil,
+        preferredServiceTier: String? = nil
+    ) throws -> CodexEnvironment {
         var manifest = try requireInstalledManifest()
         let actualMode = try inspect().activeMode
         if actualMode == mode {
@@ -210,7 +216,10 @@ public actor CodexConfigurationManager {
                     let withProvider = try CodexTOMLEditor.applying(to: current, spec: spec)
                     let selected = try CodexTOMLEditor.selectingAccountConfiguration(
                         in: withProvider,
-                        original: current
+                        original: current,
+                        preferredModel: preferredModel,
+                        preferredReasoningEffort: preferredReasoningEffort,
+                        preferredServiceTier: preferredServiceTier
                     )
                     try write(Data(selected.utf8), to: paths.configURL, permissions: manifest.originalPermissions)
                 }
@@ -230,7 +239,10 @@ public actor CodexConfigurationManager {
             let current = try currentConfigurationText()
             let selected = try CodexTOMLEditor.selectingAccountConfiguration(
                 in: current,
-                original: try originalConfigurationText(using: manifest)
+                original: try originalConfigurationText(using: manifest),
+                preferredModel: preferredModel,
+                preferredReasoningEffort: preferredReasoningEffort,
+                preferredServiceTier: preferredServiceTier
             )
             try write(Data(selected.utf8), to: paths.configURL, permissions: manifest.originalPermissions)
             try captureCurrentConfigurationAsRestoreBaseline(manifest: &manifest)
@@ -267,7 +279,7 @@ public actor CodexConfigurationManager {
     public func updateConnection(apiBaseURL: URL, model: String, helperExecutable: URL, modelCatalogURL: URL? = nil) throws -> CodexEnvironment {
         let previousManifest = try requireInstalledManifest()
         let actualMode = try inspect().activeMode
-        guard apiBaseURL.scheme?.lowercased() == "https", apiBaseURL.host?.isEmpty == false else {
+        guard Self.isAllowedBaseURL(apiBaseURL) else {
             throw HarborError.invalidBaseURL
         }
 
@@ -306,6 +318,12 @@ public actor CodexConfigurationManager {
             try saveManifest(updatedManifest)
         }
         return try inspect()
+    }
+
+    private static func isAllowedBaseURL(_ url: URL) -> Bool {
+        if url.scheme?.lowercased() == "https", url.host?.isEmpty == false { return true }
+        guard url.scheme?.lowercased() == "http" else { return false }
+        return url.host == "127.0.0.1" || url.host == "localhost" || url.host == "::1"
     }
 
     /// Rebinds every persisted local task to the connection selected in the

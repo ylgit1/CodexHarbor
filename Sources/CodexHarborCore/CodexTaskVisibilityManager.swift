@@ -42,23 +42,57 @@ public struct CodexTaskVisibilityManager {
         let currentRecords = try visibleTaskRecords()
         let currentIDs = currentRecords.map(\.id)
         let sourceGroup = snapshot.activeGroup
-        let externalIDs = Set(currentRecords.filter { externalModelIDs.contains($0.model ?? "") }.map(\.id))
+        let detectedExternalIDs = Set(
+            currentRecords
+                .filter { externalModelIDs.contains($0.model ?? "") }
+                .map(\.id)
+        )
+        // When leaving custom mode, the active group is the safer source of
+        // truth than a model-name heuristic. Older builds could leave a
+        // mixed list visible; treating every currently visible task as
+        // external prevents those provider-local IDs from leaking back into
+        // an account or Harbor session.
+        let externalIDs = sourceGroup == .customAPI
+            ? Set(currentIDs)
+            : detectedExternalIDs
         let nativeIDs = currentIDs.filter { !externalIDs.contains($0) }
         if target == .customAPI {
-            // All sessions visible before entering an external API belong to
-            // the native group, even if an older Harbor version rewrote their
-            // provider/model fields and made model-based detection unreliable.
-            snapshot.taskIDsByGroup[sourceGroup] = currentIDs
+            // Keep any legacy external tasks in the external group instead
+            // of assigning them to the native source group.
+            snapshot.taskIDsByGroup[sourceGroup] = merged(
+                snapshot.taskIDsByGroup[sourceGroup],
+                Set(nativeIDs)
+            )
+            snapshot.taskIDsByGroup[.customAPI] = merged(
+                snapshot.taskIDsByGroup[.customAPI],
+                externalIDs
+            )
         } else if sourceGroup == .customAPI {
-            // Sessions visible while in external mode are external sessions.
-            snapshot.taskIDsByGroup[.customAPI] = currentIDs
+            // Sessions visible while in external mode remain external,
+            // including sessions created before the profile was deleted or
+            // before its model list was refreshed.
+            snapshot.taskIDsByGroup[.customAPI] = merged(
+                snapshot.taskIDsByGroup[.customAPI],
+                externalIDs.isEmpty ? Set(currentIDs) : externalIDs
+            )
+            // Native tasks that were already remembered for the destination
+            // stay in that destination group; do not infer their origin from
+            // a custom provider's model string.
         } else {
-            snapshot.taskIDsByGroup[sourceGroup] = nativeIDs
+            snapshot.taskIDsByGroup[sourceGroup] = merged(
+                snapshot.taskIDsByGroup[sourceGroup],
+                Set(nativeIDs)
+            )
+            snapshot.taskIDsByGroup[.customAPI] = merged(
+                snapshot.taskIDsByGroup[.customAPI],
+                externalIDs
+            )
         }
         // Native account and Harbor connections share the Responses session
         // semantics, so their visible tasks remain eligible for migration.
         // External API tasks are isolated from every native connection.
-        let mustIsolate = sourceGroup == .customAPI || target == .customAPI
+        let hasMixedExternalTasks = sourceGroup != .customAPI && !externalIDs.isEmpty
+        let mustIsolate = sourceGroup == .customAPI || target == .customAPI || hasMixedExternalTasks
         if mustIsolate {
             try setArchived(true, ids: currentIDs)
             try setCatalogVisible(false, ids: currentIDs)
@@ -72,6 +106,12 @@ public struct CodexTaskVisibilityManager {
             hiddenTaskCount: mustIsolate ? currentIDs.count : 0,
             shownTaskCount: targetIDs.count
         )
+    }
+
+    private func merged(_ existing: [String]?, _ additions: Set<String>) -> [String] {
+        var ids = Set(existing ?? [])
+        ids.formUnion(additions)
+        return ids.sorted()
     }
 
     public func visibleTaskIDs() throws -> [String] {

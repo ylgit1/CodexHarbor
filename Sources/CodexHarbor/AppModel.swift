@@ -2,6 +2,7 @@ import CodexHarborCore
 import AppKit
 import Darwin
 import Foundation
+import UserNotifications
 
 struct HarborLogEntry: Identifiable, Equatable, Codable {
     enum Level: String, Codable {
@@ -14,6 +15,22 @@ struct HarborLogEntry: Identifiable, Equatable, Codable {
     let timeText: String
     let level: Level
     let message: String
+}
+
+struct ConnectionDiagnostic: Equatable {
+    let checkedAt: Date
+    let latencyMilliseconds: Int?
+    let modelCount: Int?
+    let failureReason: String?
+}
+
+private struct CodexRequestMonitorState: Codable {
+    var observedTurnIDs: [String]
+}
+
+private struct CodexRequestConnectionSnapshot {
+    let kind: CodexConnectionKind
+    let profileID: UUID?
 }
 
 @MainActor
@@ -32,6 +49,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var expiresAt: String?
     @Published private(set) var notice: String?
     @Published private(set) var usage: UsageSnapshot?
+    @Published private(set) var usageByProfileID: [UUID: UsageSnapshot] = [:]
+    @Published private(set) var isQueryingUsage = false
     @Published private(set) var logs: [HarborLogEntry] = []
     @Published private(set) var profiles: [HarborProfile] = []
     @Published private(set) var selectedProfileID: UUID?
@@ -40,24 +59,43 @@ final class AppModel: ObservableObject {
     @Published private(set) var selectedAccountProfileID: UUID?
     @Published private(set) var apiProfileHealth: [UUID: ConnectionHealth] = [:]
     @Published private(set) var accountProfileHealth: [UUID: ConnectionHealth] = [:]
+    @Published private(set) var apiProfileDiagnostics: [UUID: ConnectionDiagnostic] = [:]
+    @Published private(set) var accountProfileDiagnostics: [UUID: ConnectionDiagnostic] = [:]
+    @Published private(set) var activityEvents: [ConnectionActivityEvent] = []
+    @Published private(set) var codexTokenUsageRecords: [CodexTokenUsageRecord] = []
+    @Published private(set) var providerBillingByProfileID: [UUID: ProviderBillingSnapshot] = [:]
     @Published private(set) var isCheckingConnectionHealth = false
     @Published private(set) var requiresCodexReload = false
     @Published private(set) var isAwaitingAccountLogin = false
     @Published private(set) var detectedAccountName: String?
     @Published private(set) var migrationPreview: CodexTaskMigrationPreview?
+    @Published private(set) var notificationsEnabled = false
 
     private let store: LocalSecretStore
     private let manager: CodexConfigurationManager
     private let service: HarborServiceClient
     private let profileRepository: HarborProfileRepository
     private let accountProfileRepository: CodexAccountProfileRepository
+    private let activityStore: ConnectionActivityStore
+    private let requestMonitor: CodexRequestMonitor
+    private let tokenUsageMonitor: CodexTokenUsageMonitor
+    private let relayConfigurationStore: RelayConfigurationStore
+    private let relayActivityStore: RelayActivityStore
+    private let providerUsageAdapter: ProviderUsageAdapterClient
     private var apiBaseURLWasEdited = false
     private var didAutoQueryUsage = false
     private var codexLoginProcess: Process?
     private var accountBeforeLoginID: UUID?
     private var accountLoginHomeURL: URL?
+    private var requestMonitorTask: Task<Void, Never>?
+    private var observedCodexTurnIDs: Set<String>
+    private var activeCodexTurnSnapshots: [String: CodexRequestConnectionSnapshot] = [:]
+    private let requestMonitorStartedAt = Date()
+    private var relayTokenUsageRecords: [CodexTokenUsageRecord] = []
 
     private let logsStorageKey = "codex-harbor.run-logs"
+    private let notificationsStorageKey = "codex-harbor.notifications-enabled"
+    private let notificationSignatureKey = "codex-harbor.last-notification-signature"
 
     init() {
         let store = LocalSecretStore.liveMigratingLegacyKeychain()
@@ -66,6 +104,20 @@ final class AppModel: ObservableObject {
         service = HarborServiceClient()
         profileRepository = HarborProfileRepository(store: store)
         accountProfileRepository = CodexAccountProfileRepository(store: store)
+        activityStore = ConnectionActivityStore()
+        requestMonitor = CodexRequestMonitor()
+        tokenUsageMonitor = CodexTokenUsageMonitor()
+        relayConfigurationStore = RelayConfigurationStore()
+        relayActivityStore = RelayActivityStore()
+        providerUsageAdapter = ProviderUsageAdapterClient()
+        if let data = try? Data(contentsOf: CodexPaths.live().requestMonitorStateURL),
+           let state = try? JSONDecoder().decode(CodexRequestMonitorState.self, from: data) {
+            observedCodexTurnIDs = Set(state.observedTurnIDs)
+        } else {
+            observedCodexTurnIDs = []
+        }
+        activityEvents = (try? activityStore.load()) ?? []
+        notificationsEnabled = UserDefaults.standard.bool(forKey: notificationsStorageKey)
         if let data = UserDefaults.standard.data(forKey: logsStorageKey),
            let savedLogs = try? JSONDecoder().decode([HarborLogEntry].self, from: data) {
             logs = Array(savedLogs.suffix(200))
@@ -82,13 +134,25 @@ final class AppModel: ObservableObject {
                 let catalogValid = await manager.isModelCatalogValid()
                 if let activeProfile = activeCustomProfile,
                    environment.activeMode == .harbor,
-                   (environment.model != activeProfile.model || environment.apiBaseURL != activeProfile.apiBaseURL || environment.modelCatalogURL == nil || activeProfile.modelsNeedRefresh || !catalogValid) {
+                   (environment.model != activeProfile.model || environment.apiBaseURL != RelayConfiguration.localBaseURL || environment.modelCatalogURL == nil || activeProfile.modelsNeedRefresh || !catalogValid) {
                     refreshModelCatalogInBackground = true
                 }
                 if try await manager.reconcileManagedConfiguration(helperExecutable: executable) {
                     environment = try await manager.inspect()
                     markCodexReloadRequired()
                     appendLog("已升级 Harbor 托管配置", level: .success)
+                }
+                if let activeProfile = activeCustomProfile, environment.activeMode == .harbor {
+                    try configureRelay(for: activeProfile, executable: executable)
+                    if environment.apiBaseURL != RelayConfiguration.localBaseURL {
+                        environment = try await manager.updateConnection(
+                            apiBaseURL: RelayConfiguration.localBaseURL,
+                            model: activeProfile.model,
+                            helperExecutable: executable,
+                            modelCatalogURL: environment.modelCatalogURL
+                        )
+                        markCodexReloadRequired()
+                    }
                 }
             }
             appendLog(environment.configExists ? "已检测到 Codex 主配置" : "Codex 主配置尚未创建")
@@ -107,6 +171,8 @@ final class AppModel: ObservableObject {
             await queryUsage()
         }
         await refreshConnectionHealth(logResult: false)
+        if let activeCustomProfile { await refreshProviderBilling(for: activeCustomProfile.id) }
+        startCodexRequestMonitor()
     }
 
 
@@ -123,6 +189,7 @@ final class AppModel: ObservableObject {
     }
 
     func activate() async {
+        let startedAt = Date()
         await perform("Codex Harbor 已激活并通过验证") {
             let trimmed = activationKey.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { throw HarborError.invalidActivationKey }
@@ -151,7 +218,7 @@ final class AppModel: ObservableObject {
             environment = try await manager.deploy(.init(
                 token: receipt.token,
                 apiBaseURL: apiBaseURL,
-                model: remote.model,
+                model: CodexDefaults.model,
                 helperExecutable: executable
             ))
             appendLog("原配置已备份，Codex 配置写入并校验完成", level: .success)
@@ -160,21 +227,23 @@ final class AppModel: ObservableObject {
             apiBaseURLWasEdited = false
             expiresAt = receipt.expiresAt
             notice = remote.notice ?? receipt.message
-            _ = try await profileRepository.save(
+            let profile = try await profileRepository.save(
                 activationKey: trimmed,
                 token: receipt.token,
                 apiBaseURL: apiBaseURL,
-                model: remote.model,
+                model: CodexDefaults.model,
                 expiresAt: receipt.expiresAt
             )
             try await refreshProfiles()
             if let activeProfileID { apiProfileHealth[activeProfileID] = .available("连接验证通过") }
+            recordActivity(.profileCreate, connectionKind: .harborKey, profileID: profile.id, succeeded: true, startedAt: startedAt)
             activationKey = ""
             markCodexReloadRequired()
         }
     }
 
     func addProfile(activationKey rawKey: String, apiBaseURL rawURL: String) async {
+        let startedAt = Date()
         if !environment.deploymentExists {
             activationKey = rawKey
             setAPIBaseURLInput(rawURL)
@@ -201,11 +270,12 @@ final class AppModel: ObservableObject {
                 activationKey: key,
                 token: receipt.token,
                 apiBaseURL: apiBaseURL,
-                model: remote.model,
+                model: CodexDefaults.model,
                 expiresAt: receipt.expiresAt,
                 select: false
             )
             try await activateProfile(profile.id)
+            recordActivity(.profileCreate, connectionKind: .harborKey, profileID: profile.id, succeeded: true, startedAt: startedAt)
             appendLog("已激活并切换到 \(profile.name)", level: .success)
         }
     }
@@ -217,6 +287,7 @@ final class AppModel: ObservableObject {
         model rawModel: String,
         provider: CustomAPIProvider = .openAICompatible
     ) async {
+        let startedAt = Date()
         await perform("自定义 API 已添加并切换") {
             let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
             let key = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -259,25 +330,31 @@ final class AppModel: ObservableObject {
             )
             try await activateProfile(profile.id)
             await applyTaskVisibility(for: .customAPI)
+            recordActivity(.profileCreate, connectionKind: .apiKey, profileID: profile.id, succeeded: true, startedAt: startedAt)
             appendLog("\(provider.title) 验证通过并已切换：\(profile.name)", level: .success)
         }
     }
 
     func switchProfile(to identifier: UUID) async {
         guard !(environment.activeMode == .harbor && activeProfileID == identifier) else { return }
+        let startedAt = Date()
+        let connectionKind = profiles.first(where: { $0.id == identifier })?.kind.connectionKind ?? .harborKey
         await perform("密钥档案切换完成") {
             try await refreshEnvironment(recoverInterruptedDeployment: false)
             do {
                 try await activateProfile(identifier)
                 apiProfileHealth[identifier] = .available("连接验证通过")
+                recordActivity(.connectionSwitch, connectionKind: connectionKind, profileID: identifier, succeeded: true, startedAt: startedAt)
             } catch {
                 apiProfileHealth[identifier] = .unavailable(Self.connectionFailureMessage(error))
+                recordActivity(.connectionSwitch, connectionKind: connectionKind, profileID: identifier, succeeded: false, startedAt: startedAt)
                 throw error
             }
         }
         if environment.activeMode == .harbor,
            profiles.first(where: { $0.id == identifier })?.kind == .customResponses {
             await applyTaskVisibility(for: .customAPI)
+            await refreshProviderBilling(for: identifier)
         }
         if environment.activeMode == .harbor,
            activeProfileID == identifier,
@@ -303,7 +380,7 @@ final class AppModel: ObservableObject {
                 if !(await manager.isModelCatalogValid()), environment.activeMode == .harbor {
                     let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
                     environment = try await manager.updateConnection(
-                        apiBaseURL: profile.apiBaseURL,
+                        apiBaseURL: RelayConfiguration.localBaseURL,
                         model: profile.model,
                         helperExecutable: executable,
                         modelCatalogURL: nil
@@ -320,8 +397,9 @@ final class AppModel: ObservableObject {
                 let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
                 let catalogModels = models.contains(profile.model) ? models : [profile.model] + models
                 let catalogURL = try await manager.writeModelCatalog(models: catalogModels)
+                try configureRelay(for: profile, executable: executable)
                 environment = try await manager.updateConnection(
-                    apiBaseURL: profile.apiBaseURL,
+                    apiBaseURL: RelayConfiguration.localBaseURL,
                     model: profile.model.isEmpty ? selectedModel : profile.model,
                     helperExecutable: executable,
                     modelCatalogURL: catalogURL
@@ -341,6 +419,27 @@ final class AppModel: ObservableObject {
             }
             try await profileRepository.remove(identifier)
             apiProfileHealth[identifier] = nil
+            try await refreshProfiles()
+        }
+    }
+
+    func renameProfile(_ identifier: UUID, to name: String) async {
+        await perform("连接档案已重命名") {
+            try await profileRepository.rename(identifier, to: name)
+            try await refreshProfiles()
+        }
+    }
+
+    func moveProfileToBoundary(_ identifier: UUID, toFront: Bool) async {
+        await perform("连接档案顺序已更新", logsSuccess: false) {
+            try await profileRepository.moveToBoundary(identifier, toFront: toFront)
+            try await refreshProfiles()
+        }
+    }
+
+    func reorderProfile(moving identifier: UUID, before target: UUID) async {
+        await perform("连接档案顺序已更新", logsSuccess: false) {
+            try await profileRepository.reorder(moving: identifier, before: target)
             try await refreshProfiles()
         }
     }
@@ -410,7 +509,13 @@ final class AppModel: ObservableObject {
                 _ = try await accountProfileRepository.switchToProfile(profile.id)
                 if environment.deploymentExists, environment.activeMode != .chatGPT {
                     let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
-                    environment = try await manager.switchMode(.chatGPT, helperExecutable: executable)
+                    environment = try await manager.switchMode(
+                        .chatGPT,
+                        helperExecutable: executable,
+                        preferredModel: CodexDefaults.model,
+                        preferredReasoningEffort: CodexDefaults.reasoningEffort,
+                        preferredServiceTier: CodexDefaults.serviceTier
+                    )
                 } else {
                     environment = try await manager.inspect()
                 }
@@ -459,6 +564,7 @@ final class AppModel: ObservableObject {
 
     func switchAccount(to identifier: UUID) async {
         guard !(environment.activeMode == .chatGPT && selectedAccountProfileID == identifier) else { return }
+        let startedAt = Date()
         appendLog("准备切换 Codex 账户档案")
         await perform("Codex 账户档案切换完成") {
             try await refreshEnvironment(recoverInterruptedDeployment: false)
@@ -467,7 +573,13 @@ final class AppModel: ObservableObject {
             do {
                 if environment.deploymentExists, environment.activeMode != .chatGPT {
                     let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
-                    environment = try await manager.switchMode(.chatGPT, helperExecutable: executable)
+                    environment = try await manager.switchMode(
+                        .chatGPT,
+                        helperExecutable: executable,
+                        preferredModel: CodexDefaults.model,
+                        preferredReasoningEffort: CodexDefaults.reasoningEffort,
+                        preferredServiceTier: CodexDefaults.serviceTier
+                    )
                 } else {
                     environment = try await manager.inspect()
                 }
@@ -479,11 +591,13 @@ final class AppModel: ObservableObject {
                 if let previousIdentifier, previousIdentifier != identifier {
                     _ = try? await accountProfileRepository.switchToProfile(previousIdentifier)
                 }
+                recordActivity(.connectionSwitch, connectionKind: .account, profileID: identifier, succeeded: false, startedAt: startedAt)
                 throw error
             }
             try await refreshAccountProfiles()
             usage = nil
             accountProfileHealth[identifier] = .available("已切换并加载")
+            recordActivity(.connectionSwitch, connectionKind: .account, profileID: identifier, succeeded: true, startedAt: startedAt)
             appendLog("已切换账户档案：\(profile.name)", level: .success)
             await applyTaskVisibility(for: .account)
             markCodexReloadRequired()
@@ -497,6 +611,27 @@ final class AppModel: ObservableObject {
             }
             try await accountProfileRepository.remove(identifier)
             accountProfileHealth[identifier] = nil
+            try await refreshAccountProfiles()
+        }
+    }
+
+    func renameAccount(_ identifier: UUID, to name: String) async {
+        await perform("账户档案已重命名") {
+            try await accountProfileRepository.rename(identifier, to: name)
+            try await refreshAccountProfiles()
+        }
+    }
+
+    func moveAccountToBoundary(_ identifier: UUID, toFront: Bool) async {
+        await perform("账户档案顺序已更新", logsSuccess: false) {
+            try await accountProfileRepository.moveToBoundary(identifier, toFront: toFront)
+            try await refreshAccountProfiles()
+        }
+    }
+
+    func reorderAccount(moving identifier: UUID, before target: UUID) async {
+        await perform("账户档案顺序已更新", logsSuccess: false) {
+            try await accountProfileRepository.reorder(moving: identifier, before: target)
             try await refreshAccountProfiles()
         }
     }
@@ -517,7 +652,13 @@ final class AppModel: ObservableObject {
         appendLog("准备切换到\(mode.title)")
         await perform("已切换到 ChatGPT 账户") {
             let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
-            environment = try await manager.switchMode(.chatGPT, helperExecutable: executable)
+            environment = try await manager.switchMode(
+                .chatGPT,
+                helperExecutable: executable,
+                preferredModel: CodexDefaults.model,
+                preferredReasoningEffort: CodexDefaults.reasoningEffort,
+                preferredServiceTier: CodexDefaults.serviceTier
+            )
             guard environment.activeMode == .chatGPT else {
                 throw HarborError.invalidConfiguration("Codex 实际连接模式未切换成功")
             }
@@ -527,26 +668,52 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func queryUsage() async {
-        await perform("用量查询完成", logsSuccess: false) {
-            if let activeProfileID,
-               let activeProfile = profiles.first(where: { $0.id == activeProfileID }),
-               activeProfile.kind == .customResponses {
-                throw HarborError.invalidConfiguration("自定义 API 不提供 Harbor 用量接口")
+    func queryUsage(for profileID: UUID? = nil) async {
+        guard !isBusy, !isQueryingUsage else { return }
+        let startedAt = Date()
+        let targetProfileID = profileID ?? activeProfileID
+        var targetKind: CodexConnectionKind = .harborKey
+        isQueryingUsage = true
+        errorMessage = nil
+        activity = "正在查询用量…"
+        defer { isQueryingUsage = false }
+
+        do {
+            if let targetProfileID,
+               let targetProfile = profiles.first(where: { $0.id == targetProfileID }) {
+                targetKind = targetProfile.kind.connectionKind
+                if targetProfile.kind == .customResponses {
+                    throw HarborError.invalidConfiguration("自定义 API 不提供 Harbor 用量接口")
+                }
             }
-            let key = environment.deploymentExists
-                ? (try store.string(for: .activationKey) ?? "")
-                : activationKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            let key: String
+            if let targetProfileID {
+                key = try await profileRepository.credentials(for: targetProfileID).activationKey
+            } else {
+                key = environment.deploymentExists
+                    ? (try store.string(for: .activationKey) ?? "")
+                    : activationKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
             guard !key.isEmpty else { throw HarborError.invalidActivationKey }
-            activity = "正在查询用量…"
             let deviceHash = try DeviceIdentity.hash(using: store)
             let snapshot = try await service.usage(activationKey: key, deviceHash: deviceHash)
-            usage = snapshot
-            if let activeProfileID { apiProfileHealth[activeProfileID] = .available("用量查询成功") }
+            if let targetProfileID {
+                usageByProfileID[targetProfileID] = snapshot
+                if targetProfileID == activeProfileID { usage = snapshot }
+            } else {
+                usage = snapshot
+            }
             if let expiry = snapshot.expiresAt { expiresAt = expiry }
             let used = snapshot.used.map { $0.formatted(.number.precision(.fractionLength(0...2))) } ?? "未知"
             let remaining = snapshot.remaining.map { $0.formatted(.number.precision(.fractionLength(0...2))) } ?? "未知"
+            recordActivity(.usageQuery, connectionKind: targetKind, profileID: targetProfileID, succeeded: true, startedAt: startedAt)
             appendLog("用量查询完成：已用 \(used)，剩余 \(remaining)", level: .success)
+            await scheduleUsageNotificationsIfNeeded(snapshot)
+        } catch {
+            recordActivity(.usageQuery, connectionKind: targetKind, profileID: targetProfileID, succeeded: false, startedAt: startedAt)
+            errorMessage = error.localizedDescription
+            activity = "用量查询未完成"
+            appendLog("操作失败：\(redacted(error.localizedDescription))", level: .error)
         }
     }
 
@@ -569,33 +736,92 @@ final class AppModel: ObservableObject {
         UserDefaults.standard.removeObject(forKey: logsStorageKey)
     }
 
+    func setNotificationsEnabled(_ enabled: Bool) async {
+        if enabled {
+            do {
+                let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge])
+                notificationsEnabled = granted
+                UserDefaults.standard.set(granted, forKey: notificationsStorageKey)
+                appendLog(granted ? "到期与异常提醒已开启" : "系统未授予通知权限", level: granted ? .success : .info)
+            } catch {
+                notificationsEnabled = false
+                UserDefaults.standard.set(false, forKey: notificationsStorageKey)
+                appendLog("通知权限申请失败：\(redacted(error.localizedDescription))", level: .error)
+            }
+        } else {
+            notificationsEnabled = false
+            UserDefaults.standard.set(false, forKey: notificationsStorageKey)
+            UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [
+                "codex-harbor-low-balance",
+                "codex-harbor-expiry"
+            ])
+            appendLog("到期与异常提醒已关闭")
+        }
+    }
+
     func refreshConnectionHealth(logResult: Bool = true) async {
         guard !isCheckingConnectionHealth, !isBusy else { return }
         isCheckingConnectionHealth = true
         defer { isCheckingConnectionHealth = false }
 
         for profile in accountProfiles {
+            let startedAt = Date()
             accountProfileHealth[profile.id] = .checking
             do {
-                accountProfileHealth[profile.id] = try await accountProfileRepository
+                let health = try await accountProfileRepository
                     .credentialHealth(for: profile.id)
+                accountProfileHealth[profile.id] = health
+                accountProfileDiagnostics[profile.id] = ConnectionDiagnostic(
+                    checkedAt: Date(),
+                    latencyMilliseconds: nil,
+                    modelCount: nil,
+                    failureReason: nil
+                )
+                recordActivity(.healthCheck, connectionKind: .account, profileID: profile.id, succeeded: Self.isAvailable(health), startedAt: startedAt)
             } catch {
                 accountProfileHealth[profile.id] = .unavailable("本地凭据无法读取")
+                accountProfileDiagnostics[profile.id] = ConnectionDiagnostic(
+                    checkedAt: Date(),
+                    latencyMilliseconds: nil,
+                    modelCount: nil,
+                    failureReason: "本地凭据无法读取"
+                )
+                recordActivity(.healthCheck, connectionKind: .account, profileID: profile.id, succeeded: false, startedAt: startedAt)
             }
         }
 
         for profile in profiles {
+            let startedAt = Date()
             if Self.isExpired(profile.expiresAt) {
                 apiProfileHealth[profile.id] = .expired("激活密钥已过期")
+                recordActivity(.healthCheck, connectionKind: profile.kind.connectionKind, profileID: profile.id, succeeded: false, startedAt: startedAt)
                 continue
             }
             apiProfileHealth[profile.id] = .checking
             do {
                 let credentials = try await profileRepository.credentials(for: profile.id)
-                try await service.validateService(baseURL: profile.apiBaseURL, token: credentials.token)
+                let probe = try await service.probeService(baseURL: profile.apiBaseURL, token: credentials.token)
                 apiProfileHealth[profile.id] = .available("服务验证通过")
+                apiProfileDiagnostics[profile.id] = ConnectionDiagnostic(
+                    checkedAt: Date(),
+                    latencyMilliseconds: probe.latencyMilliseconds,
+                    modelCount: probe.modelCount,
+                    failureReason: nil
+                )
+                recordActivity(.healthCheck, connectionKind: profile.kind.connectionKind, profileID: profile.id, succeeded: true, startedAt: startedAt)
+                if profile.kind == .customResponses {
+                    await refreshProviderBilling(for: profile.id)
+                }
             } catch {
-                apiProfileHealth[profile.id] = .unavailable(Self.connectionFailureMessage(error))
+                let message = Self.connectionFailureMessage(error)
+                apiProfileHealth[profile.id] = .unavailable(message)
+                apiProfileDiagnostics[profile.id] = ConnectionDiagnostic(
+                    checkedAt: Date(),
+                    latencyMilliseconds: nil,
+                    modelCount: nil,
+                    failureReason: message
+                )
+                recordActivity(.healthCheck, connectionKind: profile.kind.connectionKind, profileID: profile.id, succeeded: false, startedAt: startedAt)
             }
         }
 
@@ -724,11 +950,18 @@ final class AppModel: ObservableObject {
                     models: models
                 )
                 modelCatalogURL = try await manager.writeModelCatalog(models: catalogModels)
+                try relayConfigurationStore.save(RelayConfiguration(
+                    profileID: activeProfile.id,
+                    upstreamBaseURL: apiBaseURL,
+                    model: model,
+                    upstreamProtocol: activeProfile.relayProtocol
+                ))
+                try HarborRelayProcess.ensureRunning(executable: executable)
             } else {
                 modelCatalogURL = nil
             }
             environment = try await manager.updateConnection(
-                apiBaseURL: apiBaseURL,
+                apiBaseURL: activeCustomProfile == nil ? apiBaseURL : RelayConfiguration.localBaseURL,
                 model: model,
                 helperExecutable: executable,
                 modelCatalogURL: modelCatalogURL
@@ -753,10 +986,14 @@ final class AppModel: ObservableObject {
 
     private func activateProfile(_ identifier: UUID) async throws {
         let credentials = try await profileRepository.credentials(for: identifier)
+        let selectedModel = credentials.profile.kind == .harbor ? CodexDefaults.model : credentials.profile.model
         var activeToken = credentials.token
+        var latestProbe = recentlyValidatedProbe(for: identifier)
         let modelCatalogURL: URL?
         if credentials.profile.kind == .customResponses {
-            try await service.validateService(baseURL: credentials.profile.apiBaseURL, token: activeToken)
+            if latestProbe == nil {
+                latestProbe = try await service.probeService(baseURL: credentials.profile.apiBaseURL, token: activeToken)
+            }
             let models: [String]
             if !credentials.profile.models.isEmpty {
                 models = credentials.profile.models
@@ -768,27 +1005,29 @@ final class AppModel: ObservableObject {
             modelCatalogURL = try await manager.writeModelCatalog(models: models)
         } else {
             modelCatalogURL = nil
-            do {
-                try await service.validateService(baseURL: credentials.profile.apiBaseURL, token: activeToken)
-            } catch let error as HarborError {
-                guard case .serverRejected = error else { throw error }
-                appendLog("当前服务令牌已失效，正在使用激活密钥刷新")
-                let deviceHash = try DeviceIdentity.hash(using: store)
-                let receipt = try await service.redeem(
-                    activationKey: credentials.activationKey,
-                    deviceHash: deviceHash
-                )
-                activeToken = receipt.token
-                try await service.validateService(baseURL: credentials.profile.apiBaseURL, token: activeToken)
-                _ = try await profileRepository.save(
-                    activationKey: credentials.activationKey,
-                    token: activeToken,
-                    apiBaseURL: credentials.profile.apiBaseURL,
-                    model: credentials.profile.model,
-                    expiresAt: receipt.expiresAt ?? credentials.profile.expiresAt,
-                    select: false
-                )
-                appendLog("服务令牌刷新并验证通过", level: .success)
+            if latestProbe == nil {
+                do {
+                    latestProbe = try await service.probeService(baseURL: credentials.profile.apiBaseURL, token: activeToken)
+                } catch let error as HarborError {
+                    guard case .serverRejected = error else { throw error }
+                    appendLog("当前服务令牌已失效，正在使用激活密钥刷新")
+                    let deviceHash = try DeviceIdentity.hash(using: store)
+                    let receipt = try await service.redeem(
+                        activationKey: credentials.activationKey,
+                        deviceHash: deviceHash
+                    )
+                    activeToken = receipt.token
+                    latestProbe = try await service.probeService(baseURL: credentials.profile.apiBaseURL, token: activeToken)
+                    _ = try await profileRepository.save(
+                        activationKey: credentials.activationKey,
+                        token: activeToken,
+                        apiBaseURL: credentials.profile.apiBaseURL,
+                        model: selectedModel,
+                        expiresAt: receipt.expiresAt ?? credentials.profile.expiresAt,
+                        select: false
+                    )
+                    appendLog("服务令牌刷新并验证通过", level: .success)
+                }
             }
         }
         let previousToken = try store.data(for: .apiToken)
@@ -797,6 +1036,7 @@ final class AppModel: ObservableObject {
         let previousModel = environment.model
         let previousMode = environment.activeMode
         let previousModelCatalog = try? await manager.modelCatalogSnapshot()
+        let previousRelayConfiguration = try? relayConfigurationStore.load()
         var modelCatalogWasChanged = false
         let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
         do {
@@ -807,18 +1047,25 @@ final class AppModel: ObservableObject {
             } else {
                 try store.set(credentials.activationKey, for: .activationKey)
             }
+            let configuredBaseURL: URL
+            if credentials.profile.kind == .customResponses {
+                try configureRelay(for: credentials.profile, executable: executable)
+                configuredBaseURL = RelayConfiguration.localBaseURL
+            } else {
+                configuredBaseURL = credentials.profile.apiBaseURL
+            }
             if environment.deploymentExists {
                 environment = try await manager.updateConnection(
-                    apiBaseURL: credentials.profile.apiBaseURL,
-                    model: credentials.profile.model,
+                    apiBaseURL: configuredBaseURL,
+                    model: selectedModel,
                     helperExecutable: executable,
                     modelCatalogURL: modelCatalogURL
                 )
             } else {
                 environment = try await manager.deploy(.init(
                     token: activeToken,
-                    apiBaseURL: credentials.profile.apiBaseURL,
-                    model: credentials.profile.model,
+                    apiBaseURL: configuredBaseURL,
+                    model: selectedModel,
                     helperExecutable: executable,
                     modelCatalogURL: modelCatalogURL
                 ))
@@ -831,14 +1078,30 @@ final class AppModel: ObservableObject {
             }
             try await profileRepository.select(identifier)
             try await refreshProfiles()
+            if credentials.profile.kind == .harbor {
+                HarborRelayProcess.stopIfRunning()
+            }
             try? await manager.invalidateModelCatalogCache()
             usage = nil
             expiresAt = credentials.profile.kind == .harbor ? credentials.profile.expiresAt : nil
             apiBaseURLInput = credentials.profile.apiBaseURL.absoluteString
             apiBaseURLWasEdited = false
+            if let latestProbe {
+                apiProfileDiagnostics[identifier] = ConnectionDiagnostic(
+                    checkedAt: Date(),
+                    latencyMilliseconds: latestProbe.latencyMilliseconds,
+                    modelCount: latestProbe.modelCount,
+                    failureReason: nil
+                )
+            }
             appendLog("当前密钥档案：\(credentials.profile.name)", level: .success)
             markCodexReloadRequired()
         } catch {
+            if let previousRelayConfiguration {
+                try? relayConfigurationStore.save(previousRelayConfiguration)
+            } else {
+                try? relayConfigurationStore.clear()
+            }
             if let previousToken {
                 try? store.set(previousToken, for: .apiToken)
             } else {
@@ -871,6 +1134,9 @@ final class AppModel: ObservableObject {
         apiProfileHealth = apiProfileHealth.filter { key, _ in
             profiles.contains(where: { $0.id == key })
         }
+        apiProfileDiagnostics = apiProfileDiagnostics.filter { key, _ in
+            profiles.contains(where: { $0.id == key })
+        }
         for profile in profiles where apiProfileHealth[profile.id] == nil {
             apiProfileHealth[profile.id] = Self.isExpired(profile.expiresAt)
                 ? .expired("激活密钥已过期")
@@ -891,6 +1157,18 @@ final class AppModel: ObservableObject {
               let profile = profiles.first(where: { $0.id == activeProfileID }),
               profile.kind == .customResponses else { return nil }
         return profile
+    }
+
+    private func recentlyValidatedProbe(for identifier: UUID) -> ServiceProbe? {
+        guard case .available = apiProfileHealth[identifier],
+              let diagnostic = apiProfileDiagnostics[identifier],
+              diagnostic.failureReason == nil,
+              Date().timeIntervalSince(diagnostic.checkedAt) < 90,
+              let latency = diagnostic.latencyMilliseconds else { return nil }
+        return ServiceProbe(
+            latencyMilliseconds: latency,
+            modelCount: diagnostic.modelCount
+        )
     }
 
     private var currentTaskVisibilityGroup: CodexTaskVisibilityGroup {
@@ -929,6 +1207,9 @@ final class AppModel: ObservableObject {
         accountProfileHealth = accountProfileHealth.filter { key, _ in
             accountProfiles.contains(where: { $0.id == key })
         }
+        accountProfileDiagnostics = accountProfileDiagnostics.filter { key, _ in
+            accountProfiles.contains(where: { $0.id == key })
+        }
         for profile in accountProfiles where accountProfileHealth[profile.id] == nil {
             accountProfileHealth[profile.id] = .unchecked
         }
@@ -945,9 +1226,22 @@ final class AppModel: ObservableObject {
         try await accountProfileRepository.synchronizeCurrentLoginIfPresent()
         try await refreshProfiles()
         try await refreshAccountProfiles()
-        if let apiURL = environment.apiBaseURL {
-            apiBaseURLInput = apiURL.absoluteString
+        if environment.activeMode != .harbor || activeCustomProfile == nil {
+            HarborRelayProcess.stopIfRunning()
         }
+        if let apiURL = environment.apiBaseURL {
+            apiBaseURLInput = activeCustomProfile?.apiBaseURL.absoluteString ?? apiURL.absoluteString
+        }
+    }
+
+    private func configureRelay(for profile: HarborProfile, executable: URL) throws {
+        try relayConfigurationStore.save(RelayConfiguration(
+            profileID: profile.id,
+            upstreamBaseURL: profile.apiBaseURL,
+            model: profile.model,
+            upstreamProtocol: profile.relayProtocol
+        ))
+        try HarborRelayProcess.ensureRunning(executable: executable)
     }
 
     private nonisolated static func codexExecutableURL() throws -> URL {
@@ -972,25 +1266,85 @@ final class AppModel: ObservableObject {
     }
 
     private nonisolated static func isExpired(_ value: String?) -> Bool {
-        guard let value, !value.isEmpty else { return false }
+        guard let date = expiryDate(value) else { return false }
+        return date <= Date()
+    }
+
+    private nonisolated static func expiryDate(_ value: String?) -> Date? {
+        guard let value, !value.isEmpty else { return nil }
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = iso.date(from: value) { return date <= Date() }
+        if let date = iso.date(from: value) { return date }
         iso.formatOptions = [.withInternetDateTime]
-        if let date = iso.date(from: value) { return date <= Date() }
+        if let date = iso.date(from: value) { return date }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         for format in ["yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd"] {
             formatter.dateFormat = format
             if let date = formatter.date(from: value.replacingOccurrences(of: "T", with: " ")) {
-                return date <= Date()
+                return date
             }
         }
+        return nil
+    }
+
+    private nonisolated static func isAvailable(_ health: ConnectionHealth) -> Bool {
+        if case .available = health { return true }
         return false
     }
 
+    private func scheduleUsageNotificationsIfNeeded(_ snapshot: UsageSnapshot) async {
+        guard notificationsEnabled else { return }
+        let center = UNUserNotificationCenter.current()
+
+        if let remaining = snapshot.remaining, remaining <= 5 {
+            let signature = "balance-\(remaining.formatted(.number.precision(.fractionLength(2))))"
+            if UserDefaults.standard.string(forKey: notificationSignatureKey) != signature {
+                let content = UNMutableNotificationContent()
+                content.title = "Codex Harbor 余额提醒"
+                content.body = "当前托管密钥剩余 \(remaining.formatted(.number.precision(.fractionLength(2)))) 美元。"
+                try? await center.add(UNNotificationRequest(
+                    identifier: "codex-harbor-low-balance",
+                    content: content,
+                    trigger: nil
+                ))
+                UserDefaults.standard.set(signature, forKey: notificationSignatureKey)
+            }
+        }
+
+        guard let expiry = Self.expiryDate(snapshot.expiresAt) else { return }
+        center.removePendingNotificationRequests(withIdentifiers: ["codex-harbor-expiry"])
+        let reminderDate = expiry.addingTimeInterval(-3 * 24 * 60 * 60)
+        guard reminderDate > Date() else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "Codex Harbor 到期提醒"
+        content.body = "当前托管密钥将在 3 天后到期。"
+        let trigger = UNCalendarNotificationTrigger(
+            dateMatching: Calendar.current.dateComponents(
+                [.year, .month, .day, .hour, .minute],
+                from: reminderDate
+            ),
+            repeats: false
+        )
+        try? await center.add(UNNotificationRequest(
+            identifier: "codex-harbor-expiry",
+            content: content,
+            trigger: trigger
+        ))
+    }
+
     private nonisolated static func connectionFailureMessage(_ error: Error) -> String {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut: return "连接超时，请检查服务地址或网络"
+            case .cannotFindHost, .dnsLookupFailed: return "无法解析服务域名"
+            case .notConnectedToInternet, .networkConnectionLost: return "网络连接不可用"
+            case .serverCertificateUntrusted, .serverCertificateHasBadDate, .secureConnectionFailed:
+                return "TLS 证书或安全连接异常"
+            default: break
+            }
+        }
         if let harborError = error as? HarborError {
             switch harborError {
             case .serverRejected(let message): return message
@@ -1101,6 +1455,573 @@ final class AppModel: ObservableObject {
     private func markCodexReloadRequired() {
         requiresCodexReload = true
         appendLog("切换已安全写入；重新载入后仅新任务使用当前连接，历史任务保持原连接")
+    }
+
+    func activitySummary(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?
+    ) -> ConnectionActivitySummary {
+        return ConnectionActivitySummary.make(
+            from: activityEvents,
+            connectionKind: connectionKind,
+            profileID: profileID
+        )
+    }
+
+    func codexRequestSummary(for connectionKind: CodexConnectionKind) -> ConnectionActivitySummary {
+        ConnectionActivitySummary.make(
+            from: activityEvents,
+            connectionKind: connectionKind,
+            profileID: nil,
+            eventKinds: [.codexRequest]
+        )
+    }
+
+    func codexRequestSummary(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        since: Date? = nil
+    ) -> ConnectionActivitySummary {
+        let source = since.map { start in
+            activityEvents.filter { $0.timestamp >= start }
+        } ?? activityEvents
+        return ConnectionActivitySummary.make(
+            from: source,
+            connectionKind: connectionKind,
+            profileID: profileID,
+            eventKinds: [.codexRequest]
+        )
+    }
+
+    struct CodexRequestMetrics: Equatable, Sendable {
+        let count: Int
+        let successfulCount: Int
+        let averageDurationMilliseconds: Int?
+        let p95DurationMilliseconds: Int?
+
+        var successRate: Double? {
+            guard count > 0 else { return nil }
+            return Double(successfulCount) / Double(count)
+        }
+    }
+
+    func codexRequestMetrics(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        since: Date?,
+        now: Date = Date()
+    ) -> CodexRequestMetrics {
+        let events = activityEvents.filter {
+            $0.kind == .codexRequest
+                && $0.connectionKind == connectionKind
+                && (profileID == nil || $0.profileID == profileID)
+                && (since == nil || $0.timestamp >= since!)
+                && $0.timestamp <= now
+        }
+        let durations = events.compactMap(\.durationMilliseconds).sorted()
+        let p95: Int?
+        if durations.isEmpty {
+            p95 = nil
+        } else {
+            let index = min(durations.count - 1, max(0, Int(ceil(Double(durations.count) * 0.95)) - 1))
+            p95 = durations[index]
+        }
+        return CodexRequestMetrics(
+            count: events.count,
+            successfulCount: events.filter(\.succeeded).count,
+            averageDurationMilliseconds: durations.isEmpty ? nil : durations.reduce(0, +) / durations.count,
+            p95DurationMilliseconds: p95
+        )
+    }
+
+    func codexWorkDurationMilliseconds(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        since: Date? = nil
+    ) -> Int? {
+        let durations = activityEvents.compactMap { event -> Int? in
+            guard event.kind == .codexRequest,
+                  event.connectionKind == connectionKind,
+                  (profileID == nil || event.profileID == profileID),
+                  (since == nil || event.timestamp >= since!) else { return nil }
+            return event.durationMilliseconds
+        }
+        guard !durations.isEmpty else { return nil }
+        return durations.reduce(0, +)
+    }
+
+    func codexTokenSummary(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        since: Date? = nil
+    ) -> CodexTokenUsageSummary {
+        let events = activityEvents.filter {
+            $0.connectionKind == connectionKind
+                && (profileID == nil || $0.profileID == profileID)
+                && $0.kind == .codexRequest
+                && (since == nil || $0.timestamp >= since!)
+        }
+        let tokenByTurn = Dictionary(uniqueKeysWithValues: codexTokenUsageRecords.map { ($0.id, $0) })
+        let matched = events.compactMap { event -> CodexTokenUsageRecord? in
+            guard let sourceID = event.sourceID else { return nil }
+            return tokenByTurn[sourceID]
+        }
+        return CodexTokenUsageSummary(
+            requestCount: matched.count,
+            inputTokens: matched.reduce(0) { $0 + $1.inputTokens },
+            cachedInputTokens: matched.reduce(0) { $0 + $1.cachedInputTokens },
+            outputTokens: matched.reduce(0) { $0 + $1.outputTokens },
+            reasoningOutputTokens: matched.reduce(0) { $0 + $1.reasoningOutputTokens },
+            totalTokens: matched.reduce(0) { $0 + $1.totalTokens }
+        )
+    }
+
+    func providerBilledTokenTotal(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        since: Date? = nil
+    ) -> Int {
+        guard connectionKind == .apiKey else { return 0 }
+        let records = (try? relayActivityStore.load()) ?? []
+        return records.reduce(0) { result, record in
+            guard (profileID == nil || record.profileID == profileID),
+                  (since == nil || record.startedAt >= since!),
+                  let billed = record.usage.billedTokens else { return result }
+            return result + billed
+        }
+    }
+
+    func refreshProviderBilling(for profileID: UUID) async {
+        guard let profile = profiles.first(where: { $0.id == profileID }),
+              profile.kind == .customResponses,
+              let credentials = try? await profileRepository.credentials(for: profileID) else { return }
+        do {
+            if let snapshot = try await providerUsageAdapter.billing(profile: profile, token: credentials.token) {
+                providerBillingByProfileID[profileID] = snapshot
+            }
+        } catch {
+            // Billing access can require a management-scoped key. It must not
+            // affect connection health or interrupt normal model requests.
+        }
+    }
+
+    func codexRequestHourlyCounts(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        now: Date = Date(),
+        since: Date? = nil
+    ) -> [Int] {
+        let calendar = Calendar.current
+        let currentHour = calendar.dateInterval(of: .hour, for: now)?.start ?? now
+        let firstHour = since.flatMap { calendar.dateInterval(of: .hour, for: $0)?.start }
+            ?? calendar.date(byAdding: .hour, value: -23, to: currentHour)
+        guard let firstHour else {
+            return Array(repeating: 0, count: 24)
+        }
+        var counts = Array(repeating: 0, count: 24)
+        for event in activityEvents where
+            event.kind == .codexRequest &&
+            event.connectionKind == connectionKind &&
+            (profileID == nil || event.profileID == profileID) &&
+            event.timestamp >= firstHour && event.timestamp <= now {
+            let index = calendar.dateComponents([.hour], from: firstHour, to: event.timestamp).hour ?? -1
+            if counts.indices.contains(index) { counts[index] += 1 }
+        }
+        return counts
+    }
+
+    /// Average Codex request duration for each of the last 24 clock hours.
+    /// The profile is optional on purpose: detail charts are mode-level views,
+    /// so switching between profiles does not make the chart appear to reset.
+    func codexResponseHourlyAverages(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        now: Date = Date(),
+        since: Date? = nil
+    ) -> [Int] {
+        let calendar = Calendar.current
+        let currentHour = calendar.dateInterval(of: .hour, for: now)?.start ?? now
+        let firstHour = since.flatMap { calendar.dateInterval(of: .hour, for: $0)?.start }
+            ?? calendar.date(byAdding: .hour, value: -23, to: currentHour)
+        guard let firstHour else {
+            return Array(repeating: 0, count: 24)
+        }
+        var buckets = Array(repeating: [Int](), count: 24)
+        for event in activityEvents where
+            event.kind == .codexRequest &&
+            event.connectionKind == connectionKind &&
+            (profileID == nil || event.profileID == profileID) &&
+            event.timestamp >= firstHour && event.timestamp <= now {
+            guard let duration = event.durationMilliseconds else { continue }
+            let index = calendar.dateComponents([.hour], from: firstHour, to: event.timestamp).hour ?? -1
+            if buckets.indices.contains(index) { buckets[index].append(duration) }
+        }
+        return buckets.map { values in
+            guard !values.isEmpty else { return 0 }
+            return values.reduce(0, +) / values.count
+        }
+    }
+
+    func codexRequestDailyCounts(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        days: Int,
+        now: Date = Date()
+    ) -> [Int] {
+        let calendar = Calendar.current
+        let count = max(days, 1)
+        let today = calendar.startOfDay(for: now)
+        guard let firstDay = calendar.date(byAdding: .day, value: -(count - 1), to: today) else {
+            return Array(repeating: 0, count: count)
+        }
+        var buckets = Array(repeating: 0, count: count)
+        for event in activityEvents where
+            event.kind == .codexRequest &&
+            event.connectionKind == connectionKind &&
+            (profileID == nil || event.profileID == profileID) &&
+            event.timestamp >= firstDay &&
+            event.timestamp <= now {
+            let index = calendar.dateComponents([.day], from: firstDay, to: event.timestamp).day ?? -1
+            if buckets.indices.contains(index) { buckets[index] += 1 }
+        }
+        return buckets
+    }
+
+    func codexResponseDailyAverages(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        days: Int,
+        now: Date = Date()
+    ) -> [Int] {
+        let calendar = Calendar.current
+        let count = max(days, 1)
+        let today = calendar.startOfDay(for: now)
+        guard let firstDay = calendar.date(byAdding: .day, value: -(count - 1), to: today) else {
+            return Array(repeating: 0, count: count)
+        }
+        var buckets = Array(repeating: [Int](), count: count)
+        for event in activityEvents where
+            event.kind == .codexRequest &&
+            event.connectionKind == connectionKind &&
+            (profileID == nil || event.profileID == profileID) &&
+            event.timestamp >= firstDay &&
+            event.timestamp <= now {
+            guard let duration = event.durationMilliseconds else { continue }
+            let index = calendar.dateComponents([.day], from: firstDay, to: event.timestamp).day ?? -1
+            if buckets.indices.contains(index) { buckets[index].append(duration) }
+        }
+        return buckets.map { values in
+            guard !values.isEmpty else { return 0 }
+            return values.reduce(0, +) / values.count
+        }
+    }
+
+    /// Average Codex request duration for each of the last seven calendar days.
+    func codexResponseDailyAverages(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        now: Date = Date()
+    ) -> [Int] {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: now)
+        guard let firstDay = calendar.date(byAdding: .day, value: -6, to: today) else {
+            return Array(repeating: 0, count: 7)
+        }
+        var buckets = Array(repeating: [Int](), count: 7)
+        for event in activityEvents where
+            event.kind == .codexRequest &&
+            event.connectionKind == connectionKind &&
+            (profileID == nil || event.profileID == profileID) &&
+            event.timestamp >= firstDay && event.timestamp <= now {
+            guard let duration = event.durationMilliseconds else { continue }
+            let index = calendar.dateComponents([.day], from: firstDay, to: event.timestamp).day ?? -1
+            if buckets.indices.contains(index) { buckets[index].append(duration) }
+        }
+        return buckets.map { values in
+            guard !values.isEmpty else { return 0 }
+            return values.reduce(0, +) / values.count
+        }
+    }
+
+    func codexTokenHourlyCounts(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        now: Date = Date(),
+        since: Date? = nil
+    ) -> [Int] {
+        let calendar = Calendar.current
+        let currentHour = calendar.dateInterval(of: .hour, for: now)?.start ?? now
+        let firstHour = since.flatMap { calendar.dateInterval(of: .hour, for: $0)?.start }
+            ?? calendar.date(byAdding: .hour, value: -23, to: currentHour)
+        guard let firstHour else {
+            return Array(repeating: 0, count: 24)
+        }
+        let tokenByID = Dictionary(uniqueKeysWithValues: codexTokenUsageRecords.map { ($0.id, $0) })
+        var counts = Array(repeating: 0, count: 24)
+        // Use the request event's timestamp for bucketing. Token records can be
+        // emitted a little later by the rollout monitor; bucketing on their own
+        // timestamp made request and token curves drift into different hours.
+        for event in activityEvents where
+            event.kind == .codexRequest &&
+            event.connectionKind == connectionKind &&
+            (profileID == nil || event.profileID == profileID) &&
+            event.timestamp >= firstHour && event.timestamp <= now {
+            guard let sourceID = event.sourceID, let record = tokenByID[sourceID] else { continue }
+            let index = calendar.dateComponents([.hour], from: firstHour, to: event.timestamp).hour ?? -1
+            if counts.indices.contains(index) { counts[index] += record.totalTokens }
+        }
+        return counts
+    }
+
+    func codexTokenDailyCounts(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        now: Date = Date()
+    ) -> [Int] {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: now)
+        guard let firstDay = calendar.date(byAdding: .day, value: -6, to: today) else {
+            return Array(repeating: 0, count: 7)
+        }
+        let tokenByID = Dictionary(uniqueKeysWithValues: codexTokenUsageRecords.map { ($0.id, $0) })
+        var counts = Array(repeating: 0, count: 7)
+        for event in activityEvents where
+            event.kind == .codexRequest &&
+            event.connectionKind == connectionKind &&
+            (profileID == nil || event.profileID == profileID) &&
+            event.timestamp >= firstDay && event.timestamp <= now {
+            guard let sourceID = event.sourceID, let record = tokenByID[sourceID] else { continue }
+            let index = calendar.dateComponents([.day], from: firstDay, to: event.timestamp).day ?? -1
+            if counts.indices.contains(index) { counts[index] += record.totalTokens }
+        }
+        return counts
+    }
+
+    func codexTokenDailyCounts(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        days: Int,
+        now: Date = Date()
+    ) -> [Int] {
+        let calendar = Calendar.current
+        let count = max(days, 1)
+        let today = calendar.startOfDay(for: now)
+        guard let firstDay = calendar.date(byAdding: .day, value: -(count - 1), to: today) else {
+            return Array(repeating: 0, count: count)
+        }
+        let tokenByID = Dictionary(uniqueKeysWithValues: codexTokenUsageRecords.map { ($0.id, $0) })
+        var buckets = Array(repeating: 0, count: count)
+        for event in activityEvents where
+            event.kind == .codexRequest &&
+            event.connectionKind == connectionKind &&
+            (profileID == nil || event.profileID == profileID) &&
+            event.timestamp >= firstDay &&
+            event.timestamp <= now {
+            guard let sourceID = event.sourceID, let record = tokenByID[sourceID] else { continue }
+            let index = calendar.dateComponents([.day], from: firstDay, to: event.timestamp).day ?? -1
+            if buckets.indices.contains(index) { buckets[index] += record.totalTokens }
+        }
+        return buckets
+    }
+
+    private func startCodexRequestMonitor() {
+        guard requestMonitorTask == nil else { return }
+        requestMonitorTask = Task { [weak self] in
+            guard let self else { return }
+            var shouldSeed = self.observedCodexTurnIDs.isEmpty
+            while !Task.isCancelled {
+                let tokenRecords = await self.tokenUsageMonitor.recentUsage()
+                self.ingestRelayRecords()
+                let mergedTokenRecords = Dictionary(
+                    (tokenRecords + self.relayTokenUsageRecords).map { ($0.id, $0) },
+                    uniquingKeysWith: { _, newest in newest }
+                ).values.sorted { $0.timestamp < $1.timestamp }
+                if self.codexTokenUsageRecords != mergedTokenRecords {
+                    self.codexTokenUsageRecords = mergedTokenRecords
+                }
+                self.ingestTokenUsageRecords(tokenRecords)
+                await self.pollCodexRequests(seedOnly: shouldSeed)
+                shouldSeed = false
+                do {
+                    try await Task.sleep(for: .seconds(3))
+                } catch {
+                    break
+                }
+            }
+        }
+    }
+
+    private func pollCodexRequests(seedOnly: Bool) async {
+        let monitor = requestMonitor
+        let records = (try? await Task.detached(priority: .utility) {
+            try monitor.recentTurns()
+        }.value) ?? []
+        guard !records.isEmpty else { return }
+
+        if seedOnly {
+            // Do not seed in-progress turns. They must be observed again after
+            // completion so the request is counted exactly once.
+            let terminalIDs = records.filter(\.isTerminal).map(\.id)
+            observedCodexTurnIDs.formUnion(terminalIDs)
+            records.filter { !$0.isTerminal }.forEach { observedCodexTurnIDs.remove($0.id) }
+            persistRequestMonitorState()
+            return
+        }
+
+        // Capture the connection at turn start. A user may switch Harbor
+        // connections while a Codex turn is running; attribution should stay
+        // with the connection that actually started that turn.
+        if let snapshot = liveConnectionSnapshot {
+            for record in records where !record.isTerminal {
+                if activeCodexTurnSnapshots[record.id] == nil {
+                    activeCodexTurnSnapshots[record.id] = CodexRequestConnectionSnapshot(
+                        kind: snapshot.kind,
+                        profileID: snapshot.profileID
+                    )
+                }
+                observedCodexTurnIDs.remove(record.id)
+            }
+        }
+
+        var didAdd = false
+        for record in records.reversed() where record.isTerminal {
+            guard !observedCodexTurnIDs.contains(record.id) else { continue }
+            observedCodexTurnIDs.insert(record.id)
+            let startedAt = record.startedAt ?? record.completedAt ?? Date()
+            let snapshot = activeCodexTurnSnapshots.removeValue(forKey: record.id)
+                ?? liveConnectionSnapshot.map { CodexRequestConnectionSnapshot(kind: $0.kind, profileID: $0.profileID) }
+            guard let snapshot else { continue }
+            guard snapshot.kind != .apiKey else { continue }
+            recordActivity(
+                .codexRequest,
+                connectionKind: snapshot.kind,
+                profileID: snapshot.profileID,
+                succeeded: record.status == "completed",
+                startedAt: startedAt,
+                durationMilliseconds: record.durationMilliseconds,
+                sourceID: record.id
+            )
+            didAdd = true
+        }
+        if didAdd { persistRequestMonitorState() }
+    }
+
+    /// Token usage records are written to rollout JSONL slightly before the
+    /// SQLite projection is updated. Ingesting them as a fallback keeps the
+    /// dashboard live without waiting for the projection, while the startup
+    /// timestamp prevents historical records from being backfilled.
+    private func ingestTokenUsageRecords(_ records: [CodexTokenUsageRecord]) {
+        guard let snapshot = liveConnectionSnapshot else { return }
+        guard snapshot.kind != .apiKey else { return }
+        let existingSources = Set(activityEvents.compactMap { event -> String? in
+            guard event.kind == .codexRequest else { return nil }
+            return event.sourceID
+        })
+        for record in records where
+            record.timestamp >= requestMonitorStartedAt &&
+            !existingSources.contains(record.id) &&
+            !observedCodexTurnIDs.contains(record.id) {
+            observedCodexTurnIDs.insert(record.id)
+            recordActivity(
+                .codexRequest,
+                connectionKind: snapshot.kind,
+                profileID: snapshot.profileID,
+                succeeded: true,
+                startedAt: record.timestamp,
+                durationMilliseconds: nil,
+                sourceID: record.id
+            )
+        }
+        persistRequestMonitorState()
+    }
+
+    private func ingestRelayRecords() {
+        guard let records = try? relayActivityStore.load() else { return }
+        let existingSources = Set(activityEvents.compactMap(\.sourceID))
+        var changed = false
+        var tokenRecords: [CodexTokenUsageRecord] = []
+        for record in records {
+            if !existingSources.contains(record.id) {
+                let event = ConnectionActivityEvent(
+                    timestamp: record.startedAt,
+                    connectionKind: .apiKey,
+                    profileID: record.profileID,
+                    kind: .codexRequest,
+                    succeeded: record.succeeded,
+                    durationMilliseconds: record.durationMilliseconds,
+                    sourceID: record.id
+                )
+                if let updated = try? activityStore.append(event, to: activityEvents) {
+                    activityEvents = updated
+                    changed = true
+                }
+            }
+            guard record.usage.source != .unavailable else { continue }
+            tokenRecords.append(CodexTokenUsageRecord(
+                id: record.id,
+                timestamp: record.startedAt,
+                inputTokens: record.usage.inputTokens,
+                cachedInputTokens: record.usage.cachedInputTokens,
+                outputTokens: record.usage.outputTokens,
+                reasoningOutputTokens: record.usage.reasoningOutputTokens,
+                totalTokens: record.usage.totalTokens
+            ))
+        }
+        relayTokenUsageRecords = tokenRecords
+        if changed { objectWillChange.send() }
+    }
+
+    private var liveConnectionSnapshot: (kind: CodexConnectionKind, profileID: UUID?)? {
+        switch environment.activeMode {
+        case .chatGPT:
+            return (.account, selectedAccountProfileID)
+        case .harbor:
+            guard let activeProfileID,
+                  let profile = profiles.first(where: { $0.id == activeProfileID }) else { return nil }
+            return (profile.kind.connectionKind, activeProfileID)
+        case nil:
+            return nil
+        }
+    }
+
+    private func persistRequestMonitorState() {
+        let state = CodexRequestMonitorState(
+            observedTurnIDs: Array(observedCodexTurnIDs.suffix(2_000))
+        )
+        guard let data = try? JSONEncoder().encode(state) else { return }
+        let url = CodexPaths.live().requestMonitorStateURL
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: url, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    private func recordActivity(
+        _ kind: ConnectionActivityKind,
+        connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        succeeded: Bool,
+        startedAt: Date,
+        durationMilliseconds: Int? = nil,
+        sourceID: String? = nil
+    ) {
+        let event = ConnectionActivityEvent(
+            connectionKind: connectionKind,
+            profileID: profileID,
+            kind: kind,
+            succeeded: succeeded,
+            durationMilliseconds: durationMilliseconds ?? elapsedMilliseconds(since: startedAt),
+            sourceID: sourceID
+        )
+        if let updatedEvents = try? activityStore.append(event, to: activityEvents) {
+            activityEvents = updatedEvents
+        }
+    }
+
+    private func elapsedMilliseconds(since startDate: Date) -> Int {
+        max(0, Int(Date().timeIntervalSince(startDate) * 1000))
     }
 
     private func appendLog(_ message: String, level: HarborLogEntry.Level = .info) {

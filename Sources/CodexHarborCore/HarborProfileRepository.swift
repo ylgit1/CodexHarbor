@@ -28,7 +28,7 @@ public actor HarborProfileRepository {
     }
 
     public func profiles() throws -> [HarborProfile] {
-        try load().profiles.sorted { $0.createdAt < $1.createdAt }
+        try load().profiles
     }
 
     public func selectedProfileID() throws -> UUID? {
@@ -82,6 +82,7 @@ public actor HarborProfileRepository {
         models: [String] = [],
         modelsVerified: Bool = false,
         provider: CustomAPIProvider = .openAICompatible,
+        relayProtocol: HarborRelayProtocol? = nil,
         select: Bool = false
     ) throws -> HarborProfile {
         let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -89,6 +90,7 @@ public actor HarborProfileRepository {
         guard !name.isEmpty, !key.isEmpty else { throw HarborError.invalidConfiguration("自定义连接名称和 API Key 不能为空") }
         var catalog = try load()
         let fingerprint = Self.fingerprint(key)
+        let resolvedRelayProtocol = relayProtocol ?? Self.defaultRelayProtocol(provider: provider, url: apiBaseURL)
         let profile: HarborProfile
         if let index = catalog.profiles.firstIndex(where: { $0.keyFingerprint == fingerprint }) {
             catalog.profiles[index].name = name
@@ -99,6 +101,7 @@ public actor HarborProfileRepository {
             catalog.profiles[index].modelsVerified = modelsVerified
             catalog.profiles[index].kind = .customResponses
             catalog.profiles[index].provider = provider
+            catalog.profiles[index].relayProtocol = resolvedRelayProtocol
             catalog.profiles[index].expiresAt = nil
             profile = catalog.profiles[index]
         } else {
@@ -109,6 +112,7 @@ public actor HarborProfileRepository {
                 model: model,
                 kind: .customResponses,
                 provider: provider,
+                relayProtocol: resolvedRelayProtocol,
                 models: models,
                 modelsUpdatedAt: models.isEmpty ? nil : Date(),
                 modelsVerified: modelsVerified,
@@ -132,6 +136,38 @@ public actor HarborProfileRepository {
         catalog.profiles[index].models = models
         catalog.profiles[index].modelsUpdatedAt = models.isEmpty ? nil : Date()
         catalog.profiles[index].modelsVerified = true
+        try persist(catalog)
+    }
+
+    public func rename(_ identifier: UUID, to rawName: String) throws {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw HarborError.invalidConfiguration("连接名称不能为空") }
+        var catalog = try load()
+        guard let index = catalog.profiles.firstIndex(where: { $0.id == identifier }) else { return }
+        catalog.profiles[index].name = name
+        try persist(catalog)
+    }
+
+    public func moveToBoundary(_ identifier: UUID, toFront: Bool) throws {
+        var catalog = try load()
+        guard let index = catalog.profiles.firstIndex(where: { $0.id == identifier }) else { return }
+        let profile = catalog.profiles.remove(at: index)
+        if toFront {
+            catalog.profiles.insert(profile, at: 0)
+        } else {
+            catalog.profiles.append(profile)
+        }
+        try persist(catalog)
+    }
+
+    public func reorder(moving identifier: UUID, before target: UUID) throws {
+        var catalog = try load()
+        guard identifier != target,
+              let sourceIndex = catalog.profiles.firstIndex(where: { $0.id == identifier }),
+              let targetIndex = catalog.profiles.firstIndex(where: { $0.id == target }) else { return }
+        let profile = catalog.profiles.remove(at: sourceIndex)
+        let adjustedTargetIndex = catalog.profiles.firstIndex(where: { $0.id == target }) ?? targetIndex
+        catalog.profiles.insert(profile, at: adjustedTargetIndex)
         try persist(catalog)
     }
 
@@ -233,5 +269,17 @@ public actor HarborProfileRepository {
 
     private static func fingerprint(_ activationKey: String) -> String {
         SHA256.hash(data: Data(activationKey.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func defaultRelayProtocol(provider: CustomAPIProvider, url: URL) -> HarborRelayProtocol {
+        if provider == .openAI { return .responses }
+        switch ProviderCatalog.identity(for: url).brand {
+        case .kimi, .qwen, .deepSeek, .zhipu, .miniMax, .siliconFlow:
+            return .chatCompletions
+        case .openAI, .openRouter:
+            return .responses
+        case .custom:
+            return .automatic
+        }
     }
 }

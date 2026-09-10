@@ -18,6 +18,75 @@ struct CodexConfigurationManagerTests {
         #expect(usage.expiresAt == "2026-09-01T09:03:45")
     }
 
+    @Test("Connection activity summaries stay scoped to profile and week")
+    func summarizesConnectionActivity() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let store = ConnectionActivityStore(paths: fixture.paths)
+        let profileID = UUID()
+        let otherProfileID = UUID()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let events = [
+            ConnectionActivityEvent(
+                timestamp: now.addingTimeInterval(-60 * 60),
+                connectionKind: .harborKey,
+                profileID: profileID,
+                kind: .healthCheck,
+                succeeded: true,
+                durationMilliseconds: 100
+            ),
+            ConnectionActivityEvent(
+                timestamp: now.addingTimeInterval(-2 * 24 * 60 * 60),
+                connectionKind: .harborKey,
+                profileID: profileID,
+                kind: .usageQuery,
+                succeeded: false,
+                durationMilliseconds: 200
+            ),
+            ConnectionActivityEvent(
+                timestamp: now.addingTimeInterval(-8 * 24 * 60 * 60),
+                connectionKind: .harborKey,
+                profileID: profileID,
+                kind: .healthCheck,
+                succeeded: true,
+                durationMilliseconds: 50
+            ),
+            ConnectionActivityEvent(
+                timestamp: now.addingTimeInterval(-30 * 60),
+                connectionKind: .harborKey,
+                profileID: otherProfileID,
+                kind: .healthCheck,
+                succeeded: true,
+                durationMilliseconds: 80
+            ),
+            ConnectionActivityEvent(
+                timestamp: now.addingTimeInterval(-30 * 60),
+                connectionKind: .account,
+                profileID: profileID,
+                kind: .healthCheck,
+                succeeded: true,
+                durationMilliseconds: 70
+            )
+        ]
+
+        try store.persist(events)
+        let loadedEvents = try store.load()
+        let summary = ConnectionActivitySummary.make(
+            from: loadedEvents,
+            connectionKind: .harborKey,
+            profileID: profileID,
+            now: now
+        )
+
+        #expect(summary.eventsLast24Hours == 1)
+        #expect(summary.eventsLast7Days == 2)
+        #expect(summary.successfulEventsLast7Days == 1)
+        #expect(summary.failedEventsLast7Days == 1)
+        #expect(summary.averageDurationMilliseconds == 150)
+        #expect(summary.p95DurationMilliseconds == 200)
+        #expect(summary.dailyCounts.map(\.count).reduce(0, +) == 2)
+    }
+
     @Test("Codex account auth is recognized from its OPENAI_API_KEY field")
     func recognizesCodexAccountAuth() async throws {
         let fixture = try Fixture()
@@ -60,6 +129,33 @@ struct CodexConfigurationManagerTests {
         #expect(firstCredentials.token == "token-first")
         #expect(secondCredentials.activationKey == "activation-second-2222")
         #expect(secondCredentials.token == "token-second")
+    }
+
+    @Test("Connection profile names and order stay local to Harbor")
+    func renamesAndReordersProfiles() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let repository = HarborProfileRepository(paths: fixture.paths, store: fixture.store)
+        let first = try await repository.save(
+            activationKey: "activation-first-1111",
+            token: "token-first",
+            apiBaseURL: URL(string: "https://first.example.com/v1")!,
+            model: "gpt-5.6-sol",
+            expiresAt: nil
+        )
+        let second = try await repository.save(
+            activationKey: "activation-second-2222",
+            token: "token-second",
+            apiBaseURL: URL(string: "https://second.example.com/v1")!,
+            model: "gpt-5.6-sol",
+            expiresAt: nil
+        )
+
+        try await repository.rename(first.id, to: "工作密钥")
+        try await repository.moveToBoundary(first.id, toFront: false)
+        let profiles = try await repository.profiles()
+        #expect(profiles.map(\.name) == [second.name, "工作密钥"])
+        #expect(profiles.last?.apiBaseURL == first.apiBaseURL)
     }
 
     @Test("Custom Responses profiles keep their endpoint, model, and API key")
@@ -675,6 +771,34 @@ struct CodexConfigurationManagerTests {
         #expect(try String(contentsOf: validURL, encoding: .utf8) == valid)
         #expect(!FileManager.default.fileExists(atPath: fixture.paths.taskMigrationsURL.path))
     }
+
+    @Test("External sessions never leak back into a native connection group")
+    func isolatesMixedExternalSessions() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let nativeID = "native-task"
+        let externalID = "external-task"
+        let databaseURL = fixture.paths.codexHome.appendingPathComponent("state_visibility.sqlite")
+        try createVisibilityDatabase(
+            at: databaseURL,
+            records: [
+                (nativeID, "gpt-5.6-sol"),
+                (externalID, "kimi-k2")
+            ]
+        )
+
+        let manager = CodexTaskVisibilityManager(paths: fixture.paths)
+        let enteringCustom = try manager.switchTo(.customAPI, externalModelIDs: ["kimi-k2"])
+        #expect(enteringCustom.hiddenTaskCount == 2)
+
+        // Simulate an older Codex index that ignored the archive flag and
+        // exposed the mixed list again before the user switched back.
+        try setArchivedForVisibilityTest(false, ids: [nativeID, externalID], in: databaseURL)
+        let returningNative = try manager.switchTo(.account, externalModelIDs: ["kimi-k2"])
+        #expect(returningNative.shownTaskCount == 1)
+        #expect(try visibilityArchiveState(for: nativeID, in: databaseURL) == false)
+        #expect(try visibilityArchiveState(for: externalID, in: databaseURL) == true)
+    }
 }
 
 private func createThreadDatabase(
@@ -727,6 +851,93 @@ private func threadRouting(in url: URL, taskID: String) throws -> (provider: Str
     let provider = String(cString: providerText)
     let model = sqlite3_column_text(statement, 1).map { String(cString: $0) }
     return (provider, model)
+}
+
+private func createVisibilityDatabase(
+    at url: URL,
+    records: [(id: String, model: String)]
+) throws {
+    var database: OpaquePointer?
+    guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else {
+        throw HarborError.invalidConfiguration("测试可见性数据库创建失败")
+    }
+    defer { sqlite3_close(database) }
+    let schema = """
+    CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        model_provider TEXT NOT NULL,
+        model TEXT,
+        archived INTEGER NOT NULL DEFAULT 0,
+        archived_at REAL
+    );
+    """
+    guard sqlite3_exec(database, schema, nil, nil, nil) == SQLITE_OK else {
+        throw HarborError.invalidConfiguration("测试可见性数据库初始化失败")
+    }
+    let statementSQL = "INSERT INTO threads (id, model_provider, model, archived) VALUES (?, 'codex_harbor', ?, 0)"
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(database, statementSQL, -1, &statement, nil) == SQLITE_OK,
+          let statement else {
+        throw HarborError.invalidConfiguration("测试可见性记录创建失败")
+    }
+    defer { sqlite3_finalize(statement) }
+    for record in records {
+        sqlite3_reset(statement)
+        sqlite3_clear_bindings(statement)
+        sqlite3_bind_text(statement, 1, record.id, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_text(statement, 2, record.model, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw HarborError.invalidConfiguration("测试可见性记录写入失败")
+        }
+    }
+}
+
+private func setArchivedForVisibilityTest(_ archived: Bool, ids: [String], in url: URL) throws {
+    var database: OpaquePointer?
+    guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else {
+        throw HarborError.invalidConfiguration("测试可见性数据库打开失败")
+    }
+    defer { sqlite3_close(database) }
+    var statement: OpaquePointer?
+    let sql = "UPDATE threads SET archived = ?, archived_at = ? WHERE id = ?"
+    guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK,
+          let statement else {
+        throw HarborError.invalidConfiguration("测试可见性状态更新失败")
+    }
+    defer { sqlite3_finalize(statement) }
+    for id in ids {
+        sqlite3_reset(statement)
+        sqlite3_clear_bindings(statement)
+        sqlite3_bind_int(statement, 1, archived ? 1 : 0)
+        if archived {
+            sqlite3_bind_double(statement, 2, Date().timeIntervalSince1970)
+        } else {
+            sqlite3_bind_null(statement, 2)
+        }
+        sqlite3_bind_text(statement, 3, id, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw HarborError.invalidConfiguration("测试可见性状态提交失败")
+        }
+    }
+}
+
+private func visibilityArchiveState(for id: String, in url: URL) throws -> Bool {
+    var database: OpaquePointer?
+    guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let database else {
+        throw HarborError.invalidConfiguration("测试可见性数据库读取失败")
+    }
+    defer { sqlite3_close(database) }
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(database, "SELECT archived FROM threads WHERE id = ?", -1, &statement, nil) == SQLITE_OK,
+          let statement else {
+        throw HarborError.invalidConfiguration("测试可见性状态查询失败")
+    }
+    defer { sqlite3_finalize(statement) }
+    sqlite3_bind_text(statement, 1, id, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+    guard sqlite3_step(statement) == SQLITE_ROW else {
+        throw HarborError.invalidConfiguration("测试可见性任务不存在")
+    }
+    return sqlite3_column_int(statement, 0) != 0
 }
 
 private final class MemorySecretStore: SecretStore, @unchecked Sendable {

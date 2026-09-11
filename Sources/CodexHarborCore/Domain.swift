@@ -486,6 +486,11 @@ public struct CodexAccountProfile: Identifiable, Codable, Equatable, Sendable {
     public var name: String
     public var method: CodexAccountMethod
     public var credentialFingerprint: String
+    /// Subscription metadata reported by the ChatGPT identity token. This is
+    /// separate from JWT `exp`, which describes token validity rather than the
+    /// user's Plus/Pro billing period.
+    public var subscriptionPlan: String?
+    public var subscriptionExpiresAt: String?
     public var createdAt: Date
     public var lastUsedAt: Date
 
@@ -494,6 +499,8 @@ public struct CodexAccountProfile: Identifiable, Codable, Equatable, Sendable {
         name: String,
         method: CodexAccountMethod,
         credentialFingerprint: String,
+        subscriptionPlan: String? = nil,
+        subscriptionExpiresAt: String? = nil,
         createdAt: Date = Date(),
         lastUsedAt: Date = Date()
     ) {
@@ -501,8 +508,22 @@ public struct CodexAccountProfile: Identifiable, Codable, Equatable, Sendable {
         self.name = name
         self.method = method
         self.credentialFingerprint = credentialFingerprint
+        self.subscriptionPlan = subscriptionPlan
+        self.subscriptionExpiresAt = subscriptionExpiresAt
         self.createdAt = createdAt
         self.lastUsedAt = lastUsedAt
+    }
+
+    public var subscriptionPlanTitle: String? {
+        guard let subscriptionPlan, !subscriptionPlan.isEmpty else { return nil }
+        switch subscriptionPlan.lowercased() {
+        case "plus": return "Plus"
+        case "pro": return "Pro"
+        case "team": return "Team"
+        case "business": return "Business"
+        case "enterprise": return "Enterprise"
+        default: return subscriptionPlan
+        }
     }
 
     public var connectionKind: CodexConnectionKind { .account }

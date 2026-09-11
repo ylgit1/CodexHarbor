@@ -1085,6 +1085,7 @@ struct RootView: View {
             tint = .green
             metadata = [
                 profile?.method.title,
+                profile.flatMap { accountSubscriptionText($0) },
                 profile.map { "最近使用 \(relativeTime($0.lastUsedAt))" }
             ].compactMap { $0 }.joined(separator: " · ")
         case .harborKey:
@@ -1249,6 +1250,12 @@ struct RootView: View {
             since: monthStart
         ).totalTokens
         return total > 0 ? formatTokenCount(total) : "暂无记录"
+    }
+
+    private func accountSubscriptionText(_ profile: CodexAccountProfile) -> String? {
+        guard let expiry = profile.subscriptionExpiresAt, !expiry.isEmpty else { return nil }
+        let plan = profile.subscriptionPlanTitle ?? "订阅"
+        return "\(plan) 到期 \(displayExpiry(expiry))"
     }
 
     private var hostedConnectionMetadata: String {
@@ -2137,6 +2144,21 @@ struct RootView: View {
                     }
                 }
             )
+
+            if let subscription = accountSubscriptionText(profile) {
+                HStack(spacing: 7) {
+                    Image(systemName: "calendar.badge.checkmark")
+                        .foregroundStyle(.green)
+                    Text(subscription)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color.green.opacity(0.055), in: Capsule())
+                .overlay(Capsule().stroke(Color.green.opacity(0.14)))
+            }
 
             statisticsRangeControl(accent: .green)
 

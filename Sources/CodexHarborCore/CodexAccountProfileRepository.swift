@@ -89,6 +89,7 @@ public actor CodexAccountProfileRepository {
         let method = try Self.authenticationMethod(in: authentication)
         let fingerprint = try Self.identityFingerprint(in: authentication)
         let detectedName = Self.accountDisplayName(in: authentication, method: method, fingerprint: fingerprint)
+        let subscription = Self.subscriptionDetails(in: authentication)
         var catalog = try load()
         let trimmedName = rawName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let profile: CodexAccountProfile
@@ -99,13 +100,17 @@ public actor CodexAccountProfileRepository {
                 catalog.profiles[index].name = detectedName
             }
             catalog.profiles[index].method = method
+            catalog.profiles[index].subscriptionPlan = subscription.plan
+            catalog.profiles[index].subscriptionExpiresAt = subscription.expiresAt
             catalog.profiles[index].lastUsedAt = Date()
             profile = catalog.profiles[index]
         } else {
             profile = CodexAccountProfile(
                 name: trimmedName.isEmpty ? detectedName : trimmedName,
                 method: method,
-                credentialFingerprint: fingerprint
+                credentialFingerprint: fingerprint,
+                subscriptionPlan: subscription.plan,
+                subscriptionExpiresAt: subscription.expiresAt
             )
             catalog.profiles.append(profile)
         }
@@ -251,6 +256,25 @@ public actor CodexAccountProfileRepository {
     private nonisolated static func jwtSubject(in token: String) -> String? {
         guard let payload = jwtPayload(in: token) else { return nil }
         return (payload["sub"] as? String) ?? (payload["email"] as? String)
+    }
+
+    private nonisolated static func subscriptionDetails(in data: Data) -> (plan: String?, expiresAt: String?) {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = object["tokens"] as? [String: Any] else {
+            return (nil, nil)
+        }
+
+        // The identity token is the source Codex receives for ChatGPT account
+        // identity metadata. Access tokens currently expose the plan type too,
+        // so use it only as a fallback for older/rotated token sets.
+        let idToken = tokens["id_token"] as? String
+        let accessToken = tokens["access_token"] as? String
+        let idAuth = idToken.flatMap(jwtPayload(in:))?["https://api.openai.com/auth"] as? [String: Any]
+        let accessAuth = accessToken.flatMap(jwtPayload(in:))?["https://api.openai.com/auth"] as? [String: Any]
+        let plan = (idAuth?["chatgpt_plan_type"] as? String)
+            ?? (accessAuth?["chatgpt_plan_type"] as? String)
+        let expiry = idAuth?["chatgpt_subscription_active_until"] as? String
+        return (plan, expiry)
     }
 
     private nonisolated static func jwtPayload(in token: String) -> [String: Any]? {

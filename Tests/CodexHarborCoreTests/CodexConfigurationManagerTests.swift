@@ -235,6 +235,35 @@ struct CodexConfigurationManagerTests {
         #expect(profile.name == "developer@example.com")
     }
 
+    @Test("ChatGPT subscription expiry is captured from the identity token")
+    func detectsChatGPTSubscriptionExpiry() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "https://api.openai.com/auth": [
+                "chatgpt_plan_type": "plus",
+                "chatgpt_subscription_active_until": "2026-09-20T09:47:33+00:00"
+            ]
+        ])
+        let encoded = payload.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        try fixture.writeAuth(try JSONSerialization.data(withJSONObject: [
+            "tokens": [
+                "account_id": "plus-account",
+                "access_token": "access-token",
+                "id_token": "header.\(encoded).signature"
+            ]
+        ]))
+
+        let repository = CodexAccountProfileRepository(paths: fixture.paths, store: fixture.store)
+        let profile = try await repository.saveCurrentLogin(name: nil)
+        #expect(profile.subscriptionPlan == "plus")
+        #expect(profile.subscriptionPlanTitle == "Plus")
+        #expect(profile.subscriptionExpiresAt == "2026-09-20T09:47:33+00:00")
+    }
+
     @Test("Account health distinguishes renewable and expired credentials")
     func detectsAccountCredentialHealth() async throws {
         let fixture = try Fixture()

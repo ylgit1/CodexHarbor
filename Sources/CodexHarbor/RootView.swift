@@ -2130,6 +2130,7 @@ struct RootView: View {
                 color: .green,
                 health: health,
                 isActive: isActive,
+                inlineStatus: accountSubscriptionText(profile),
                 checkAction: {
                     Task {
                         await model.refreshEnvironment()
@@ -2144,21 +2145,6 @@ struct RootView: View {
                     }
                 }
             )
-
-            if let subscription = accountSubscriptionText(profile) {
-                HStack(spacing: 7) {
-                    Image(systemName: "calendar.badge.checkmark")
-                        .foregroundStyle(.green)
-                    Text(subscription)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.green)
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(Color.green.opacity(0.055), in: Capsule())
-                .overlay(Capsule().stroke(Color.green.opacity(0.14)))
-            }
 
             statisticsRangeControl(accent: .green)
 
@@ -2273,6 +2259,7 @@ struct RootView: View {
         isActive: Bool,
         usage: UsageSnapshot? = nil,
         usageExpiry: String? = nil,
+        inlineStatus: String? = nil,
         usageQueryAction: (() -> Void)? = nil,
         isQueryingUsage: Bool = false,
         checkAction: @escaping () -> Void,
@@ -2310,6 +2297,21 @@ struct RootView: View {
             HStack(spacing: 8) {
                 if usage != nil || usageExpiry != nil {
                     hostedInlineUsage(usage: usage, expiry: usageExpiry)
+                } else if let inlineStatus {
+                    HStack(spacing: 7) {
+                        Image(systemName: "calendar.badge.checkmark")
+                            .foregroundStyle(.green)
+                        Text(inlineStatus)
+                            .foregroundStyle(.green)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.72)
+                    }
+                    .font(.system(size: 9, weight: .semibold))
+                    .padding(.horizontal, 8)
+                    .frame(width: 292, height: 24, alignment: .leading)
+                    .background(Color.green.opacity(0.055), in: Capsule())
+                    .overlay(Capsule().stroke(Color.green.opacity(0.14)))
+                    .help("ChatGPT 订阅到期时间")
                 } else {
                     Color.clear
                         .frame(width: 292, height: 24)

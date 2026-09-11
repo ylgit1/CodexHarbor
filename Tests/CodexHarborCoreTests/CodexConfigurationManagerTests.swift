@@ -266,6 +266,28 @@ struct CodexConfigurationManagerTests {
         #expect(profile.subscriptionExpiryState(now: expiry.addingTimeInterval(-86_401)) == .active)
         #expect(profile.subscriptionExpiryState(now: expiry.addingTimeInterval(-86_400)) == .expiringSoon)
         #expect(profile.subscriptionExpiryState(now: expiry) == .expired)
+
+        let renewedPayload = try JSONSerialization.data(withJSONObject: [
+            "https://api.openai.com/auth": [
+                "chatgpt_plan_type": "plus",
+                "chatgpt_subscription_active_until": "2026-10-20T09:47:33+00:00"
+            ]
+        ])
+        let renewedEncoded = renewedPayload.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        try fixture.writeAuth(try JSONSerialization.data(withJSONObject: [
+            "tokens": [
+                "account_id": "plus-account",
+                "access_token": "renewed-access-token",
+                "id_token": "header.\(renewedEncoded).signature"
+            ]
+        ]))
+        try await repository.synchronizeCurrentLoginIfPresent()
+        let renewed = try #require(try await repository.profiles().first(where: { $0.id == profile.id }))
+        #expect(renewed.subscriptionExpiresAt == "2026-10-20T09:47:33+00:00")
+        #expect(renewed.lastUsedAt == profile.lastUsedAt)
     }
 
     @Test("Account health distinguishes renewable and expired credentials")

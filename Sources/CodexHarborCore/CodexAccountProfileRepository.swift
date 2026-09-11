@@ -60,7 +60,7 @@ public actor CodexAccountProfileRepository {
         let authentication = try currentAuthenticationData()
         let method = try Self.authenticationMethod(in: authentication)
         guard method == .chatGPT || method == .apiKey else { return }
-        _ = try saveCurrentLogin(name: nil)
+        _ = try saveAuthentication(authentication, name: nil, select: true, markUsed: false)
     }
 
     @discardableResult
@@ -84,7 +84,8 @@ public actor CodexAccountProfileRepository {
     private func saveAuthentication(
         _ authentication: Data,
         name rawName: String?,
-        select: Bool
+        select: Bool,
+        markUsed: Bool = true
     ) throws -> CodexAccountProfile {
         let method = try Self.authenticationMethod(in: authentication)
         let fingerprint = try Self.identityFingerprint(in: authentication)
@@ -102,7 +103,9 @@ public actor CodexAccountProfileRepository {
             catalog.profiles[index].method = method
             catalog.profiles[index].subscriptionPlan = subscription.plan
             catalog.profiles[index].subscriptionExpiresAt = subscription.expiresAt
-            catalog.profiles[index].lastUsedAt = Date()
+            if markUsed {
+                catalog.profiles[index].lastUsedAt = Date()
+            }
             profile = catalog.profiles[index]
         } else {
             profile = CodexAccountProfile(

@@ -1,5 +1,6 @@
 import CodexHarborCore
 import AppKit
+import CryptoKit
 import Darwin
 import Foundation
 import UserNotifications
@@ -88,6 +89,7 @@ final class AppModel: ObservableObject {
     private var accountBeforeLoginID: UUID?
     private var accountLoginHomeURL: URL?
     private var requestMonitorTask: Task<Void, Never>?
+    private var observedAuthenticationDigest: SHA256.Digest?
     private var observedCodexTurnIDs: Set<String>
     private var activeCodexTurnSnapshots: [String: CodexRequestConnectionSnapshot] = [:]
     private let requestMonitorStartedAt = Date()
@@ -110,6 +112,7 @@ final class AppModel: ObservableObject {
         relayConfigurationStore = RelayConfigurationStore()
         relayActivityStore = RelayActivityStore()
         providerUsageAdapter = ProviderUsageAdapterClient()
+        observedAuthenticationDigest = Self.authenticationDigest(at: CodexPaths.live().authURL)
         if let data = try? Data(contentsOf: CodexPaths.live().requestMonitorStateURL),
            let state = try? JSONDecoder().decode(CodexRequestMonitorState.self, from: data) {
             observedCodexTurnIDs = Set(state.observedTurnIDs)
@@ -1203,7 +1206,10 @@ final class AppModel: ObservableObject {
 
     private func refreshAccountProfiles() async throws {
         let profiles = try await accountProfileRepository.profiles()
-        accountProfiles = profiles.filter { $0.method == .chatGPT || $0.method == .apiKey }
+        let visibleProfiles = profiles.filter { $0.method == .chatGPT || $0.method == .apiKey }
+        if accountProfiles != visibleProfiles {
+            accountProfiles = visibleProfiles
+        }
         accountProfileHealth = accountProfileHealth.filter { key, _ in
             accountProfiles.contains(where: { $0.id == key })
         }
@@ -1214,7 +1220,10 @@ final class AppModel: ObservableObject {
             accountProfileHealth[profile.id] = .unchecked
         }
         let selected = try await accountProfileRepository.selectedProfileID()
-        selectedAccountProfileID = accountProfiles.contains(where: { $0.id == selected }) ? selected : nil
+        let visibleSelection = accountProfiles.contains(where: { $0.id == selected }) ? selected : nil
+        if selectedAccountProfileID != visibleSelection {
+            selectedAccountProfileID = visibleSelection
+        }
     }
 
     private func refreshEnvironment(recoverInterruptedDeployment: Bool) async throws {
@@ -1224,6 +1233,7 @@ final class AppModel: ObservableObject {
         environment = try await manager.inspect()
         try await profileRepository.migrateLegacyProfileIfNeeded(environment: environment)
         try await accountProfileRepository.synchronizeCurrentLoginIfPresent()
+        observedAuthenticationDigest = Self.authenticationDigest(at: CodexPaths.live().authURL)
         try await refreshProfiles()
         try await refreshAccountProfiles()
         if environment.activeMode != .harbor || activeCustomProfile == nil {
@@ -1830,6 +1840,7 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             var shouldSeed = self.observedCodexTurnIDs.isEmpty
             while !Task.isCancelled {
+                await self.synchronizeAccountProfileIfAuthenticationChanged()
                 let tokenRecords = await self.tokenUsageMonitor.recentUsage()
                 self.ingestRelayRecords()
                 let mergedTokenRecords = Dictionary(
@@ -1849,6 +1860,27 @@ final class AppModel: ObservableObject {
                 }
             }
         }
+    }
+
+    private func synchronizeAccountProfileIfAuthenticationChanged() async {
+        let authURL = CodexPaths.live().authURL
+        let latestDigest = Self.authenticationDigest(at: authURL)
+        guard latestDigest != observedAuthenticationDigest else { return }
+        observedAuthenticationDigest = latestDigest
+        guard latestDigest != nil else { return }
+
+        do {
+            try await accountProfileRepository.synchronizeCurrentLoginIfPresent()
+            try await refreshAccountProfiles()
+            appendLog("检测到 Codex 登录凭据更新，账户档案已同步", level: .success)
+        } catch {
+            appendLog("Codex 登录凭据更新暂未同步：\(redacted(error.localizedDescription))", level: .error)
+        }
+    }
+
+    private nonisolated static func authenticationDigest(at url: URL) -> SHA256.Digest? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return SHA256.hash(data: data)
     }
 
     private func pollCodexRequests(seedOnly: Bool) async {

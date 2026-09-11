@@ -1253,9 +1253,31 @@ struct RootView: View {
     }
 
     private func accountSubscriptionText(_ profile: CodexAccountProfile) -> String? {
-        guard let expiry = profile.subscriptionExpiresAt, !expiry.isEmpty else { return nil }
+        accountSubscriptionPresentation(profile)?.text
+    }
+
+    private func accountSubscriptionPresentation(
+        _ profile: CodexAccountProfile
+    ) -> (text: String, color: Color, icon: String, pulses: Bool)? {
+        guard let rawExpiry = profile.subscriptionExpiresAt, !rawExpiry.isEmpty else { return nil }
         let plan = profile.subscriptionPlanTitle ?? "订阅"
-        return "\(plan) 到期 \(displayExpiry(expiry))"
+        let expiry = profile.subscriptionExpiryDate().map(accountSubscriptionDateText) ?? displayExpiry(rawExpiry)
+        switch profile.subscriptionExpiryState() {
+        case .expiringSoon:
+            return ("\(plan) 即将到期 · \(expiry)", .red, "exclamationmark.triangle.fill", true)
+        case .expired:
+            return ("\(plan) 已到期 · \(expiry)", .red, "exclamationmark.circle.fill", false)
+        case .active, .unknown:
+            return ("\(plan) 到期 \(expiry)", .green, "calendar.badge.checkmark", false)
+        }
+    }
+
+    private func accountSubscriptionDateText(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter.string(from: date)
     }
 
     private var hostedConnectionMetadata: String {
@@ -2114,6 +2136,7 @@ struct RootView: View {
     private func accountDetail(_ profile: CodexAccountProfile) -> some View {
         let isActive = effectiveConnectionKind == .account && model.selectedAccountProfileID == profile.id
         let health = model.accountProfileHealth[profile.id] ?? .unchecked
+        let subscription = accountSubscriptionPresentation(profile)
         let now = Date()
         let rangeStart = trendStartDate(now: now)
         let metrics = model.codexRequestMetrics(
@@ -2130,7 +2153,10 @@ struct RootView: View {
                 color: .green,
                 health: health,
                 isActive: isActive,
-                inlineStatus: accountSubscriptionText(profile),
+                inlineStatus: subscription?.text,
+                inlineStatusColor: subscription?.color ?? .green,
+                inlineStatusIcon: subscription?.icon ?? "calendar.badge.checkmark",
+                inlineStatusPulses: subscription?.pulses ?? false,
                 checkAction: {
                     Task {
                         await model.refreshEnvironment()
@@ -2260,6 +2286,9 @@ struct RootView: View {
         usage: UsageSnapshot? = nil,
         usageExpiry: String? = nil,
         inlineStatus: String? = nil,
+        inlineStatusColor: Color = .green,
+        inlineStatusIcon: String = "calendar.badge.checkmark",
+        inlineStatusPulses: Bool = false,
         usageQueryAction: (() -> Void)? = nil,
         isQueryingUsage: Bool = false,
         checkAction: @escaping () -> Void,
@@ -2299,18 +2328,23 @@ struct RootView: View {
                     hostedInlineUsage(usage: usage, expiry: usageExpiry)
                 } else if let inlineStatus {
                     HStack(spacing: 7) {
-                        Image(systemName: "calendar.badge.checkmark")
-                            .foregroundStyle(.green)
+                        if inlineStatusPulses {
+                            BreathingStatusDot(color: inlineStatusColor, active: true)
+                                .frame(width: 14, height: 14)
+                        } else {
+                            Image(systemName: inlineStatusIcon)
+                                .foregroundStyle(inlineStatusColor)
+                        }
                         Text(inlineStatus)
-                            .foregroundStyle(.green)
+                            .foregroundStyle(inlineStatusColor)
                             .lineLimit(1)
                             .minimumScaleFactor(0.72)
                     }
                     .font(.system(size: 9, weight: .semibold))
                     .padding(.horizontal, 8)
                     .frame(width: 292, height: 24, alignment: .leading)
-                    .background(Color.green.opacity(0.055), in: Capsule())
-                    .overlay(Capsule().stroke(Color.green.opacity(0.14)))
+                    .background(inlineStatusColor.opacity(inlineStatusPulses ? 0.09 : 0.055), in: Capsule())
+                    .overlay(Capsule().stroke(inlineStatusColor.opacity(inlineStatusPulses ? 0.30 : 0.14)))
                     .help("ChatGPT 订阅到期时间")
                 } else {
                     Color.clear

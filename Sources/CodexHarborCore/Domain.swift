@@ -481,6 +481,13 @@ public enum CodexAccountMethod: String, Codable, Sendable {
     }
 }
 
+public enum CodexSubscriptionExpiryState: Equatable, Sendable {
+    case active
+    case expiringSoon
+    case expired
+    case unknown
+}
+
 public struct CodexAccountProfile: Identifiable, Codable, Equatable, Sendable {
     public let id: UUID
     public var name: String
@@ -524,6 +531,30 @@ public struct CodexAccountProfile: Identifiable, Codable, Equatable, Sendable {
         case "enterprise": return "Enterprise"
         default: return subscriptionPlan
         }
+    }
+
+    public func subscriptionExpiryState(now: Date = Date()) -> CodexSubscriptionExpiryState {
+        guard let subscriptionExpiresAt,
+              let expiry = Self.subscriptionDate(subscriptionExpiresAt) else {
+            return .unknown
+        }
+        let remaining = expiry.timeIntervalSince(now)
+        if remaining <= 0 { return .expired }
+        if remaining <= 24 * 60 * 60 { return .expiringSoon }
+        return .active
+    }
+
+    public func subscriptionExpiryDate() -> Date? {
+        guard let subscriptionExpiresAt else { return nil }
+        return Self.subscriptionDate(subscriptionExpiresAt)
+    }
+
+    private static func subscriptionDate(_ value: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: value) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
     }
 
     public var connectionKind: CodexConnectionKind { .account }

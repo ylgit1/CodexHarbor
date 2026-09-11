@@ -262,6 +262,10 @@ struct CodexConfigurationManagerTests {
         #expect(profile.subscriptionPlan == "plus")
         #expect(profile.subscriptionPlanTitle == "Plus")
         #expect(profile.subscriptionExpiresAt == "2026-09-20T09:47:33+00:00")
+        let expiry = try #require(ISO8601DateFormatter().date(from: "2026-09-20T09:47:33+00:00"))
+        #expect(profile.subscriptionExpiryState(now: expiry.addingTimeInterval(-86_401)) == .active)
+        #expect(profile.subscriptionExpiryState(now: expiry.addingTimeInterval(-86_400)) == .expiringSoon)
+        #expect(profile.subscriptionExpiryState(now: expiry) == .expired)
     }
 
     @Test("Account health distinguishes renewable and expired credentials")

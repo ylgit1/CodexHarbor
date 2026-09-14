@@ -209,6 +209,24 @@ private enum TrendMetric: String, CaseIterable {
     }
 }
 
+private struct HarborMetricSummary: Identifiable {
+    let title: String
+    let value: String
+    let detail: String?
+    let icon: String
+    let color: Color
+
+    var id: String { title }
+}
+
+private struct HarborHealthRow: Identifiable {
+    let title: String
+    let value: String
+    let color: Color
+
+    var id: String { title }
+}
+
 private struct MonthlyTokenSummaryBadge: View {
     let total: Int
     let accountTokens: Int
@@ -219,33 +237,28 @@ private struct MonthlyTokenSummaryBadge: View {
     @State private var pulse = false
 
     var body: some View {
-        HStack(spacing: 7) {
+        HStack(spacing: 8) {
             Image(systemName: "number")
-                .font(.system(size: 11, weight: .bold))
+                .font(.system(size: 12, weight: .bold))
                 .foregroundStyle(.purple)
-                .frame(width: 24, height: 24)
-                .background(Color.purple.opacity(0.11), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .frame(width: 26, height: 26)
+                .background(Color.purple.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .scaleEffect(pulse && !reduceMotion ? 1.08 : 1)
                 .rotationEffect(.degrees(pulse && !reduceMotion ? 3 : 0))
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text("全部模式 · 本月")
-                    .font(.system(size: 9, weight: .medium))
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("全部模式 · 本月 Token")
+                    .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
                 Text(formatTokenCount(total))
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .font(.system(size: 14, weight: .semibold, design: .rounded))
                     .foregroundStyle(.purple)
                     .lineLimit(1)
                     .contentTransition(.numericText(value: Double(total)))
             }
         }
-        .padding(.horizontal, 8)
-        .frame(minWidth: 118, minHeight: 38, maxHeight: 38, alignment: .leading)
-        .background(Color.purple.opacity(0.045), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.purple.opacity(0.12), lineWidth: 1)
-        )
+        .padding(.horizontal, 10)
+        .frame(minWidth: 150, minHeight: 34, maxHeight: 34, alignment: .leading)
         .help(
             "本月全部模式合计：账户 \(formatTokenCount(accountTokens)) · 托管 \(formatTokenCount(harborTokens)) · 自定义 API \(formatTokenCount(apiTokens))"
         )
@@ -349,6 +362,9 @@ private struct HarborTrendChart: View {
             let width = proxy.size.width
             let height = proxy.size.height
             let plotHeight = max(1, height - 22)
+            let plotLeft: CGFloat = 42
+            let plotRight: CGFloat = 4
+            let plotWidth = max(1, width - plotLeft - plotRight)
             let normalizedSeries = normalizedSeries(length: chartLength)
             let currentHourIndex = currentFraction.map {
                 min(max(Int(floor($0 * 24)), 0), max(0, chartLength - 1))
@@ -359,24 +375,63 @@ private struct HarborTrendChart: View {
             }
             let maxValue = max(1, visibleValues.max() ?? 0)
             let allPoints = normalizedSeries.map { item in
-                (series: item, points: points(for: item.values, visibleIndices: visibleIndices, currentHourIndex: currentHourIndex, currentFraction: currentFraction, width: width, plotHeight: plotHeight, maxValue: maxValue))
+                (series: item, points: points(for: item.values, visibleIndices: visibleIndices, currentHourIndex: currentHourIndex, currentFraction: currentFraction, xOffset: plotLeft, width: plotWidth, plotHeight: plotHeight, maxValue: maxValue))
             }
 
             ZStack(alignment: .bottomLeading) {
-                VStack(spacing: 0) {
-                    ForEach(0..<3, id: \.self) { index in
+                ForEach(0..<3, id: \.self) { index in
+                    let ratio = CGFloat(index) / 2
+                    let y = 10 + ratio * max(1, plotHeight - 18)
+                    HStack(spacing: 7) {
+                        Text(axisValue(maxValue: maxValue, ratio: ratio))
+                            .font(.system(size: 9.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 35, alignment: .trailing)
                         Rectangle()
                             .fill(Color.primary.opacity(index == 2 ? 0.10 : 0.05))
                             .frame(height: 1)
-                        if index < 2 { Spacer(minLength: 0) }
                     }
+                    .frame(width: width)
+                    .position(x: width / 2, y: y)
+                    .allowsHitTesting(false)
                 }
-                .frame(height: plotHeight)
 
-                ForEach(allPoints, id: \.series.id) { item in
+                ForEach(Array(allPoints.enumerated()), id: \.element.series.id) { seriesIndex, item in
                     let points = item.points
+                    let positivePointIndices = points.indices.filter {
+                        visibleIndices.indices.contains($0)
+                            && item.series.values[visibleIndices[$0]] > 0
+                    }
                     if points.count > 1 {
-                        if normalizedSeries.count == 1 {
+                        if metric == .requests {
+                            let groupWidth = min(28, max(8, plotWidth / CGFloat(max(visibleIndices.count, 1)) * 0.68))
+                            let spacing = normalizedSeries.count > 1 ? CGFloat(2) : 0
+                            let barWidth = max(2, (groupWidth - spacing * CGFloat(max(0, normalizedSeries.count - 1))) / CGFloat(max(1, normalizedSeries.count)))
+                            let groupOffset = (CGFloat(seriesIndex) - CGFloat(normalizedSeries.count - 1) / 2) * (barWidth + spacing)
+                            ForEach(Array(points.enumerated()), id: \.offset) { pointIndex, point in
+                                if visibleIndices.indices.contains(pointIndex),
+                                   item.series.values[visibleIndices[pointIndex]] > 0 {
+                                    let baseY = plotHeight - 8
+                                    let barHeight = max(2, baseY - point.y)
+                                    RoundedRectangle(cornerRadius: min(4, barWidth / 2), style: .continuous)
+                                        .fill(item.series.color.opacity(seriesIndex == 0 ? 0.86 : 0.66))
+                                        .frame(width: barWidth, height: barHeight)
+                                        .position(x: point.x + groupOffset, y: baseY - barHeight / 2)
+                                        .allowsHitTesting(false)
+                                }
+                            }
+                        } else if positivePointIndices.count <= 1 {
+                            if let pointIndex = positivePointIndices.first {
+                                Circle()
+                                    .fill(Color(nsColor: .windowBackgroundColor))
+                                    .frame(width: 9, height: 9)
+                                    .overlay(Circle().stroke(item.series.color, lineWidth: 2.5))
+                                    .shadow(color: item.series.color.opacity(0.24), radius: 4, y: 2)
+                                    .position(points[pointIndex])
+                                    .allowsHitTesting(false)
+                            }
+                        } else {
+                        if normalizedSeries.count == 1, metric == .token {
                             Path { path in
                                 path.move(to: CGPoint(x: points[0].x, y: plotHeight))
                                 path.addLine(to: points[0])
@@ -443,6 +498,18 @@ private struct HarborTrendChart: View {
                                     .allowsHitTesting(false)
                             }
                         }
+                        if metric == .token,
+                           let peakIndex = positivePointIndices.max(by: {
+                               item.series.values[visibleIndices[$0]] < item.series.values[visibleIndices[$1]]
+                           }) {
+                            Circle()
+                                .fill(Color(nsColor: .windowBackgroundColor))
+                                .frame(width: 8, height: 8)
+                                .overlay(Circle().stroke(item.series.color, lineWidth: 2))
+                                .position(points[peakIndex])
+                                .allowsHitTesting(false)
+                        }
+                        }
                     } else if let point = points.first {
                         Circle()
                             .fill(item.series.color)
@@ -487,7 +554,7 @@ private struct HarborTrendChart: View {
 
                 HoverLocationReader { point in
                     guard width > 0, !visibleIndices.isEmpty else { return }
-                    let x = min(max(point.x, 0), width)
+                    let x = min(max(point.x, plotLeft), plotLeft + plotWidth)
                     let samplePoints = allPoints.first?.points ?? []
                     guard x <= (samplePoints.last?.x ?? width) + 8 else {
                         hoverX = nil
@@ -516,9 +583,10 @@ private struct HarborTrendChart: View {
                         if index < labels.count - 1 { Spacer() }
                     }
                 }
-                .font(.system(size: 9))
-                .foregroundStyle(.tertiary)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
                 .frame(height: 14)
+                .padding(.leading, plotLeft)
             }
         }
         .clipped()
@@ -571,6 +639,7 @@ private struct HarborTrendChart: View {
         visibleIndices: [Int],
         currentHourIndex: Int?,
         currentFraction: Double?,
+        xOffset: CGFloat,
         width: CGFloat,
         plotHeight: CGFloat,
         maxValue: Int
@@ -578,13 +647,13 @@ private struct HarborTrendChart: View {
         visibleIndices.enumerated().map { displayIndex, sourceIndex in
             let x: CGFloat
             if let currentFraction, sourceIndex == currentHourIndex {
-                x = width * CGFloat(min(max(currentFraction, 0), 1))
+                x = xOffset + width * CGFloat(min(max(currentFraction, 0), 1))
             } else if currentFraction != nil {
-                x = width * CGFloat(sourceIndex) / 24
+                x = xOffset + width * CGFloat(sourceIndex) / 24
             } else {
                 x = visibleIndices.count <= 1
-                    ? width / 2
-                    : width * CGFloat(displayIndex) / CGFloat(visibleIndices.count - 1)
+                    ? xOffset + width / 2
+                    : xOffset + width * CGFloat(displayIndex) / CGFloat(visibleIndices.count - 1)
             }
             return CGPoint(
                 x: x,
@@ -593,9 +662,9 @@ private struct HarborTrendChart: View {
         }
     }
 
-    /// Draw a smooth Catmull–Rom style curve through the hourly points.
-    /// This keeps the chart light while giving the detail panel the gentle,
-    /// breathing arc requested by the UI direction.
+    /// Draw a smooth curve while keeping each Bezier segment inside the range
+    /// formed by its two values. This preserves the soft shape without making
+    /// zero-valued Token data appear negative.
     private func appendSmoothCurve(to path: inout Path, points: [CGPoint]) {
         guard let first = points.first else { return }
         path.move(to: first)
@@ -617,7 +686,21 @@ private struct HarborTrendChart: View {
                 x: p2.x - (p3.x - p1.x) / 6,
                 y: p2.y - (p3.y - p1.y) / 6
             )
-            path.addCurve(to: p2, control1: c1, control2: c2)
+            let minX = min(p1.x, p2.x)
+            let maxX = max(p1.x, p2.x)
+            let minY = min(p1.y, p2.y)
+            let maxY = max(p1.y, p2.y)
+            path.addCurve(
+                to: p2,
+                control1: CGPoint(
+                    x: min(max(c1.x, minX), maxX),
+                    y: min(max(c1.y, minY), maxY)
+                ),
+                control2: CGPoint(
+                    x: min(max(c2.x, minX), maxX),
+                    y: min(max(c2.y, minY), maxY)
+                )
+            )
         }
     }
 
@@ -625,6 +708,20 @@ private struct HarborTrendChart: View {
         if value >= 100_000_000 { return "\((Double(value) / 100_000_000).formatted(.number.precision(.fractionLength(1))))亿" }
         if value >= 10_000 { return "\((Double(value) / 10_000).formatted(.number.precision(.fractionLength(1))))万" }
         return "\(value.formatted(.number)) 个"
+    }
+
+    private func axisValue(maxValue: Int, ratio: CGFloat) -> String {
+        let value = Int((Double(maxValue) * Double(1 - ratio)).rounded())
+        switch metric {
+        case .token:
+            if value >= 100_000_000 { return "\((Double(value) / 100_000_000).formatted(.number.precision(.fractionLength(1))))亿" }
+            if value >= 10_000 { return "\((Double(value) / 10_000).formatted(.number.precision(.fractionLength(1))))万" }
+            return "\(value)"
+        case .requests:
+            return "\(value)"
+        case .latency:
+            return formatDuration(value)
+        }
     }
 
     private func tooltipView(index: Int, series: [HarborTrendSeries]) -> some View {
@@ -643,7 +740,7 @@ private struct HarborTrendChart: View {
                     Text(metricValueText(value: item.values[safe: index] ?? 0, requests: item.requestCounts[safe: index] ?? 0))
                         .foregroundStyle(.primary)
                 }
-                .font(.system(size: 9, weight: .medium))
+                .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.secondary)
             }
         }
@@ -660,9 +757,18 @@ private struct HarborTrendChart: View {
         switch metric {
         case .token: valueText = "Token \(formatCompactToken(value))"
         case .requests: valueText = "请求 \(value) 次"
-        case .latency: valueText = "平均响应 \(value)ms"
+        case .latency: valueText = "平均响应 \(formatDuration(value))"
         }
         return metric == .requests ? valueText : "\(valueText) · \(requests) 次"
+    }
+
+    private func formatDuration(_ milliseconds: Int) -> String {
+        let seconds = max(0, milliseconds) / 1_000
+        if seconds < 1 { return "<1 秒" }
+        if seconds < 60 { return "\(seconds) 秒" }
+        let minutes = seconds / 60
+        let remainder = seconds % 60
+        return remainder == 0 ? "\(minutes) 分" : "\(minutes) 分 \(remainder) 秒"
     }
 
     private func axisLabel(for index: Int, label: String) -> String {
@@ -957,53 +1063,72 @@ struct RootView: View {
     }
 
     private var content: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            header
-            currentConnectionStrip
-            HStack(alignment: .top, spacing: 16) {
-                sidebarPanel
-                    .frame(width: 318)
+        HStack(alignment: .top, spacing: 0) {
+            sidebarPanel
+                .frame(minWidth: 270, idealWidth: 286, maxWidth: 300)
+            Divider()
+                .opacity(0.65)
+            VStack(spacing: 0) {
+                workspaceToolbar
                 currentConnectionCard
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
         }
-        .padding(.top, 48)
-        .padding(.horizontal, 28)
-        .padding(.bottom, 22)
-        .frame(minWidth: 980, minHeight: 640, alignment: .top)
+        .frame(minWidth: 900, minHeight: 620, alignment: .top)
     }
 
     private var sidebarPanel: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 0) {
+            sidebarBrandHeader
+            Divider()
+                .opacity(0.55)
             modeBar
+            Divider()
+                .opacity(0.55)
             profileLibrary
+            sidebarUsageSummary
         }
         .frame(maxHeight: .infinity, alignment: .top)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.52))
     }
 
-    private var header: some View {
-        HStack(spacing: 14) {
+    private var sidebarBrandHeader: some View {
+        HStack(spacing: 12) {
             Image(nsImage: NSApplication.shared.applicationIconImage)
                 .resizable()
                 .interpolation(.high)
                 .antialiased(true)
-            .frame(width: 52, height: 52)
+                .frame(width: 42, height: 42)
 
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 9) {
-                    Text("Codex Harbor")
-                        .font(.title2.weight(.bold))
-                    Text(effectiveMode == nil ? "等待连接" : "Codex 已就绪")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.blue)
-                }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Codex Harbor")
+                    .font(.system(size: 17, weight: .bold, design: .rounded))
+                Text(effectiveMode == nil ? "等待连接" : "Codex 已连接")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(effectiveMode == nil ? Color.secondary : Color.blue)
             }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 34)
+        .frame(height: 118)
+    }
 
-            Spacer(minLength: 20)
-            monthlyTokenSummaryBadge
-            Spacer(minLength: 18)
-            statusPill
-            Menu {
+    private var workspaceToolbar: some View {
+        HStack(spacing: 10) {
+            Spacer(minLength: 0)
+            if model.requiresCodexReload {
+                reloadStatusButton
+            }
+            globalConnectionMenu
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 34)
+        .frame(height: 78)
+    }
+
+    private var globalConnectionMenu: some View {
+        Menu {
                 Button {
                     Task {
                         await model.refreshEnvironment()
@@ -1025,157 +1150,107 @@ struct RootView: View {
                     get: { model.notificationsEnabled },
                     set: { enabled in Task { await model.setNotificationsEnabled(enabled) } }
                 ))
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.body.weight(.semibold))
-                    .frame(width: 30, height: 30)
-                    .background(Color(nsColor: .controlBackgroundColor), in: Circle())
+        } label: {
+            HStack(spacing: 7) {
+                BreathingStatusDot(
+                    color: effectiveMode == nil ? .secondary : .green,
+                    active: effectiveMode != nil
+                )
+                Text(effectiveMode == nil ? "未连接" : "已连接")
+                    .font(.caption.weight(.semibold))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.secondary)
             }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("更多操作")
+            .padding(.horizontal, 11)
+            .frame(height: 30)
+            .background(Color(nsColor: .controlBackgroundColor).opacity(0.72), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.primary.opacity(0.08)))
         }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("连接与配置操作")
     }
 
     private var modeBar: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack {
-                Text("连接类型")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text("仅浏览列表")
-                    .font(.system(size: 9.5, weight: .medium))
-                    .foregroundStyle(.tertiary)
-            }
+        VStack(alignment: .leading, spacing: 8) {
+            Text("连接")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
             HStack(spacing: 5) {
                 modeSelector(mode: .account, title: "账户", icon: "person.crop.circle.fill")
                 modeSelector(mode: .harborKey, title: "托管", icon: "key.fill")
                 modeSelector(mode: .apiKey, title: "API", icon: "network")
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 9)
-        .background(Color.primary.opacity(0.032), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .stroke(Color.primary.opacity(0.085))
-        )
+        .padding(.horizontal, 12)
+        .padding(.top, 12)
+        .padding(.bottom, 11)
     }
 
-    /// A compact, read-only reflection of Codex's live connection. Browsing a
-    /// category below never changes this strip; it updates only after the
-    /// configuration transaction succeeds and `environment` is re-inspected.
-    private var currentConnectionStrip: some View {
-        let kind = effectiveConnectionKind
-        let profileName: String
-        let kindTitle: String
-        let status: ConnectionHealth
-        let icon: String
-        let tint: Color
-        let metadata: String
-
-        switch kind {
-        case .account:
-            let profile = model.accountProfiles.first(where: { $0.id == model.selectedAccountProfileID })
-            profileName = profile?.name ?? "账户登录"
-            kindTitle = "账户登录"
-            status = profile.map { model.accountProfileHealth[$0.id] ?? .unchecked } ?? .unchecked
-            icon = "person.crop.circle.fill"
-            tint = .green
-            metadata = [
-                profile?.method.title,
-                profile.flatMap { accountSubscriptionText($0) },
-                profile.map { "最近使用 \(relativeTime($0.lastUsedAt))" }
-            ].compactMap { $0 }.joined(separator: " · ")
-        case .harborKey:
-            let profile = activeHarborProfile
-            profileName = profile?.name ?? "托管密钥"
-            kindTitle = "托管密钥"
-            status = profile.map { model.apiProfileHealth[$0.id] ?? .unchecked } ?? .unchecked
-            icon = "key.fill"
-            tint = .blue
-            metadata = hostedConnectionMetadata
-        case .apiKey:
-            let profile = activeHarborProfile
-            profileName = profile?.name ?? "自定义 API"
-            kindTitle = "自定义 API"
-            status = profile.map { model.apiProfileHealth[$0.id] ?? .unchecked } ?? .unchecked
-            icon = "network"
-            tint = .purple
-            metadata = profile.map {
-                let identity = ProviderCatalog.identity(for: $0.apiBaseURL)
-                return "\(identity.brand.title) · \(identity.protocolTitle)"
-            } ?? "Responses API 兼容连接"
-        case nil:
-            profileName = "当前没有连接"
-            kindTitle = ""
-            status = .unchecked
-            icon = "link.badge.plus"
-            tint = .secondary
-            metadata = "等待连接"
+    private var sidebarUsageSummary: some View {
+        let calendar = Calendar.current
+        let now = Date()
+        let monthStart = calendar.dateInterval(of: .month, for: now)?.start
+        let tokens = CodexConnectionKind.allCases.reduce(0) { total, kind in
+            total + model.codexTokenSummary(for: kind, profileID: nil, since: monthStart).totalTokens
         }
-
-        return HStack(spacing: 14) {
-            Image(systemName: icon)
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(tint)
-                .frame(width: 38, height: 38)
-                .background(tint.opacity(0.10), in: Circle())
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text("当前连接")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
-                HStack(spacing: 8) {
-                    Text(profileName)
-                        .font(.callout.weight(.semibold))
-                        .lineLimit(1)
-                }
-                Text(metadata)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-
-            Spacer(minLength: 20)
-
-            currentConnectionField(
-                label: "模式",
-                value: kindTitle.isEmpty ? "未连接" : kindTitle,
-                color: tint
-            )
-
-            Divider().frame(height: 34)
-
-            currentConnectionField(
-                label: "当前模型",
-                value: currentConnectionModel(for: kind),
-                color: tint
-            )
-
-            Divider().frame(height: 34)
-
-            currentConnectionField(
-                label: "本月 Token",
-                value: currentConnectionTokenText(for: kind),
-                color: .purple
-            )
-
-            HStack(spacing: 5) {
-                BreathingStatusDot(color: healthColor(status), active: kind != nil)
-                Text(kind == nil ? "未连接" : healthTitle(status))
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(healthColor(status))
-            }
+        return VStack(alignment: .leading, spacing: 0) {
+            Text("全局信息")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 7)
+            sidebarGlobalRow("当前模型", value: model.environment.model ?? "暂无", color: .green)
+            Divider().opacity(0.5)
+            sidebarGlobalRow("本月总 Token", value: tokens > 0 ? formatTokenCount(tokens) : "暂无", color: .purple)
+            Divider().opacity(0.5)
+            sidebarGlobalRow("已连接时长", value: activeConnectionDurationText(now: now), color: .primary)
         }
-        .padding(.horizontal, 16)
-        .frame(height: 58)
-        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(tint.opacity(0.18))
-        )
+        .padding(11)
+        .frame(height: 134, alignment: .topLeading)
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.84), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(Color.primary.opacity(0.08)))
+        .padding(12)
+    }
+
+    private func sidebarGlobalRow(_ title: String, value: String, color: Color) -> some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 6)
+            Text(value)
+                .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                .foregroundStyle(color)
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+        }
+        .frame(height: 25)
+    }
+
+    private func activeConnectionDurationText(now: Date) -> String {
+        guard let effectiveConnectionKind else { return "暂无" }
+        let profileID: UUID? = switch effectiveConnectionKind {
+        case .account: model.selectedAccountProfileID
+        case .harborKey, .apiKey: model.activeProfileID
+        }
+        let latestSwitch = model.activityEvents
+            .filter {
+                $0.kind == .connectionSwitch
+                    && $0.succeeded
+                    && $0.connectionKind == effectiveConnectionKind
+                    && (profileID == nil || $0.profileID == profileID)
+            }
+            .max(by: { $0.timestamp < $1.timestamp })
+        guard let switchedAt = latestSwitch?.timestamp else { return "暂无" }
+        return workDurationText(max(0, Int(now.timeIntervalSince(switchedAt) * 1_000)))
+    }
+
+    private var sidebarSummaryDivider: some View {
+        Rectangle()
+            .fill(Color.primary.opacity(0.065))
+            .frame(width: 1, height: 26)
+            .padding(.horizontal, 7)
     }
 
     private var monthlyTokenSummaryBadge: some View {
@@ -1206,56 +1281,6 @@ struct RootView: View {
         )
     }
 
-    private func currentConnectionField(label: String, value: String, color: Color) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(label)
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(color)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: 150, alignment: .leading)
-        }
-    }
-
-    private func currentConnectionModel(for kind: CodexConnectionKind?) -> String {
-        switch kind {
-        case .account:
-            return model.environment.model ?? CodexDefaults.model
-        case .harborKey:
-            return CodexDefaults.model
-        case .apiKey:
-            return activeHarborProfile?.model ?? "未设置"
-        case nil:
-            return "—"
-        }
-    }
-
-    private func currentConnectionTokenText(for kind: CodexConnectionKind?) -> String {
-        guard let kind else { return "—" }
-        let calendar = Calendar.current
-        let monthStart = calendar.dateInterval(of: .month, for: Date())?.start
-        let profileID: UUID?
-        switch kind {
-        case .account:
-            profileID = model.selectedAccountProfileID
-        case .harborKey, .apiKey:
-            profileID = model.activeProfileID
-        }
-        let total = model.codexTokenSummary(
-            for: kind,
-            profileID: profileID,
-            since: monthStart
-        ).totalTokens
-        return total > 0 ? formatTokenCount(total) : "暂无记录"
-    }
-
-    private func accountSubscriptionText(_ profile: CodexAccountProfile) -> String? {
-        accountSubscriptionPresentation(profile)?.text
-    }
-
     private func accountSubscriptionPresentation(
         _ profile: CodexAccountProfile
     ) -> (text: String, color: Color, icon: String, pulses: Bool)? {
@@ -1280,13 +1305,6 @@ struct RootView: View {
         return formatter.string(from: date)
     }
 
-    private var hostedConnectionMetadata: String {
-        guard let usage = model.usage else { return "托管认证 · 用量待查询" }
-        let remaining = formatCurrency(usage.remaining)
-        let expiry = displayExpiry(usage.expiresAt ?? model.expiresAt)
-        return "剩余 \(remaining) · 有效期 \(expiry)"
-    }
-
     private var effectiveMode: CodexMode? {
         model.environment.activeMode
             ?? (model.environment.chatGPTSessionExists ? .chatGPT : nil)
@@ -1304,17 +1322,13 @@ struct RootView: View {
         let selected = libraryMode == mode
         let active = effectiveConnectionKind == mode
         let hovered = hoveredMode == mode
-        let tint: Color = switch mode {
-        case .account: .green
-        case .harborKey: .blue
-        case .apiKey: .purple
-        }
+        let tint = Color.blue
         return Button {
             withAnimation(reduceMotion ? .linear(duration: 0.01) : .spring(response: 0.28, dampingFraction: 0.82)) {
                 libraryMode = mode
             }
         } label: {
-            VStack(spacing: 4) {
+            HStack(spacing: 6) {
                 Image(systemName: icon)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(selected ? tint : Color.primary.opacity(0.72))
@@ -1322,16 +1336,16 @@ struct RootView: View {
                     .font(.system(size: 10.5, weight: .semibold))
                     .foregroundStyle(selected ? tint : Color.primary.opacity(0.78))
             }
-            .frame(maxWidth: .infinity, minHeight: 42)
+            .frame(maxWidth: .infinity, minHeight: 34)
             .contentShape(Rectangle())
             .background(
                 selected
                     ? tint.opacity(0.11)
                     : (hovered ? tint.opacity(0.055) : Color.clear)
             )
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
                     .stroke(selected ? tint.opacity(0.44) : Color.clear, lineWidth: selected ? 1 : 0)
             )
             .overlay(alignment: .topTrailing) {
@@ -1345,7 +1359,7 @@ struct RootView: View {
             }
         }
         .buttonStyle(.plain)
-        .frame(maxWidth: .infinity, minHeight: 46, maxHeight: 46)
+        .frame(maxWidth: .infinity, minHeight: 36, maxHeight: 36)
         .contentShape(Rectangle())
         .onHover { isHovering in
             withAnimation(.easeOut(duration: 0.14)) {
@@ -1739,26 +1753,26 @@ struct RootView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text(profileListTitle)
-                    .font(.headline)
+                    .font(.callout.weight(.semibold))
                 Spacer()
                 Button(action: showAddSheet) {
                     Image(systemName: "plus")
-                        .font(.body.weight(.medium))
-                        .frame(width: 30, height: 30)
-                        .background(Color.accentColor.opacity(0.09), in: RoundedRectangle(cornerRadius: 9))
+                        .font(.callout.weight(.semibold))
+                        .frame(width: 28, height: 28)
+                        .background(Color.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.blue)
                 .disabled(model.isBusy)
                 .help("添加\(libraryMode.title)")
             }
-            .padding(.horizontal, 18)
-            .frame(height: 58)
+            .padding(.horizontal, 14)
+            .frame(height: 46)
 
             Divider()
 
             ScrollView {
-                LazyVStack(spacing: 10) {
+                LazyVStack(spacing: 6) {
                 if libraryMode == .account {
                     if model.accountProfiles.isEmpty {
                         profileEmptyState(
@@ -1868,14 +1882,14 @@ struct RootView: View {
                     }
                 }
             }
-                .padding(14)
+                .padding(10)
             }
             .scrollIndicators(.automatic)
             .frame(maxHeight: .infinity)
 
         }
         .frame(maxHeight: .infinity, alignment: .top)
-        .background(Color.accentColor.opacity(0.018))
+        .background(Color.clear)
     }
 
     private var profileListTitle: String {
@@ -1936,6 +1950,13 @@ struct RootView: View {
         action: @escaping () -> Void
     ) -> some View {
         let hovered = hoveredProfileID == target.profileID
+        let statusColor = pending ? Color.blue : healthColor(health)
+        let statusText = pending ? "切换中" : healthTitle(health)
+        let statusIcon = pending ? "arrow.triangle.2.circlepath" : healthIcon(health)
+        let latency = diagnosticLatencySuffix(diagnostic).trimmingCharacters(in: .whitespacesAndNewlines)
+        let rowHelp = latency.isEmpty
+            ? (active ? "当前正在使用；点击查看详情" : "查看连接详情")
+            : "\(active ? "当前正在使用" : "连接") · 响应\(latency)"
         return HStack(spacing: 2) {
             Button(action: action) {
                 HStack(spacing: 9) {
@@ -1952,36 +1973,25 @@ struct RootView: View {
                     Text(subtitle).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer(minLength: 4)
-                VStack(alignment: .trailing, spacing: 3) {
+                HStack(spacing: 4) {
                     if pending {
-                        HStack(spacing: 5) {
-                            ProgressView().controlSize(.mini)
-                            Text("切换中")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.blue)
-                        }
-                    } else if active {
-                        HStack(spacing: 4) {
-                            Circle().fill(.green).frame(width: 7, height: 7)
-                            Text("当前")
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(.green)
-                        }
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: statusIcon)
+                            .font(.system(size: 9, weight: .semibold))
                     }
-                    HStack(spacing: 4) {
-                        Circle().fill(healthColor(health)).frame(width: 6, height: 6)
-                        Text(healthTitle(health) + diagnosticLatencySuffix(diagnostic))
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(healthColor(health))
-                    }
+                    Text(statusText)
+                        .font(.caption2.weight(.semibold))
+                        .lineLimit(1)
                 }
+                .foregroundStyle(statusColor)
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(model.isBusy && !pending)
             .accessibilityAddTraits(selected ? .isSelected : [])
-            .help(active ? "当前正在使用；点击查看详情" : "查看连接详情")
+            .help(rowHelp)
 
             Menu {
                 Button("重命名") { renameAction() }
@@ -2006,21 +2016,27 @@ struct RootView: View {
         }
         .padding(.leading, 10)
         .padding(.trailing, 6)
-        .padding(.vertical, 9)
+        .padding(.vertical, 7)
         .frame(maxWidth: .infinity)
-        .frame(minHeight: 62)
+        .frame(minHeight: 54)
         .background(
             selected
-                ? color.opacity(0.11)
-                : (hovered ? color.opacity(0.045) : Color(nsColor: .textBackgroundColor)),
-            in: RoundedRectangle(cornerRadius: 12)
+                ? Color.blue.opacity(0.085)
+                : (hovered ? Color.blue.opacity(0.035) : Color(nsColor: .textBackgroundColor).opacity(0.74)),
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(selected ? color.opacity(0.72) : Color.primary.opacity(0.10), lineWidth: selected ? 1.5 : 1)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(selected ? Color.blue.opacity(0.48) : Color.primary.opacity(0.075), lineWidth: 1)
         )
-        .shadow(color: selected ? color.opacity(0.08) : Color.black.opacity(hovered ? 0.045 : 0.025), radius: hovered ? 10 : 8, y: hovered ? 4 : 3)
-        .scaleEffect(hovered && !selected ? 1.008 : 1)
+        .overlay(alignment: .leading) {
+            if selected {
+                Capsule()
+                    .fill(Color.blue)
+                    .frame(width: 3, height: 24)
+                    .padding(.leading, 1)
+            }
+        }
         .onHover { isHovering in
             withAnimation(.easeOut(duration: 0.14)) {
                 hoveredProfileID = isHovering ? target.profileID : nil
@@ -2056,6 +2072,16 @@ struct RootView: View {
         case .available: .green
         case .expired: .orange
         case .unavailable: .red
+        }
+    }
+
+    private func healthIcon(_ health: ConnectionHealth) -> String {
+        switch health {
+        case .unchecked: "questionmark.circle"
+        case .checking: "arrow.triangle.2.circlepath"
+        case .available: "checkmark.circle.fill"
+        case .expired: "exclamationmark.triangle.fill"
+        case .unavailable: "xmark.circle.fill"
         }
     }
 
@@ -2137,6 +2163,7 @@ struct RootView: View {
         let isActive = effectiveConnectionKind == .account && model.selectedAccountProfileID == profile.id
         let health = model.accountProfileHealth[profile.id] ?? .unchecked
         let subscription = accountSubscriptionPresentation(profile)
+        let diagnostic = model.accountProfileDiagnostics[profile.id]
         let now = Date()
         let rangeStart = trendStartDate(now: now)
         let metrics = model.codexRequestMetrics(
@@ -2145,17 +2172,23 @@ struct RootView: View {
             since: rangeStart,
             now: now
         )
-        return VStack(alignment: .leading, spacing: 14) {
+        return VStack(alignment: .leading, spacing: 12) {
             connectionHero(
                 title: profile.name,
                 subtitle: profile.method.title,
+                titleBadge: profile.subscriptionPlanTitle,
                 icon: "person.crop.circle.fill",
-                color: .green,
+                color: .blue,
                 health: health,
                 isActive: isActive,
-                inlineStatus: subscription?.text,
-                inlineStatusColor: subscription?.color ?? .green,
-                inlineStatusIcon: subscription?.icon ?? "calendar.badge.checkmark",
+                inlineStatus: [
+                    profile.subscriptionExpiryDate().map { "到期 \(accountSubscriptionDateText($0))" },
+                    "最近使用 \(relativeTime(profile.lastUsedAt))"
+                ]
+                    .compactMap { $0 }
+                    .joined(separator: " · "),
+                inlineStatusColor: subscription?.color ?? .secondary,
+                inlineStatusIcon: subscription?.icon ?? "clock",
                 inlineStatusPulses: subscription?.pulses ?? false,
                 checkAction: {
                     Task {
@@ -2172,32 +2205,31 @@ struct RootView: View {
                 }
             )
 
-            statisticsRangeControl(accent: .green)
-
-            Divider()
-
-            VStack(spacing: 14) {
-                requestMetricsRow(
-                    kind: .account,
-                    metrics: metrics,
-                    workDuration: model.codexWorkDurationMilliseconds(
-                        for: .account,
-                        profileID: nil,
-                        since: rangeStart
-                    ),
-                    accent: .green
-                )
-                requestTrendPanel(kind: .account, accent: .green)
-            }
+            analyticsWorkspace(
+                kind: .account,
+                profileID: profile.id,
+                metrics: metrics,
+                workDuration: model.codexWorkDurationMilliseconds(
+                    for: .account,
+                    profileID: nil,
+                    since: rangeStart
+                ),
+                health: health,
+                isActive: isActive,
+                diagnostic: diagnostic,
+                rows: accountHealthRows(profile: profile, health: health, isActive: isActive, diagnostic: diagnostic),
+                accent: .blue
+            )
 
             Spacer(minLength: 0)
         }
-        .padding(14)
+        .padding(16)
     }
 
     private func apiDetail(_ profile: HarborProfile) -> some View {
         let identity = ProviderCatalog.identity(for: profile.apiBaseURL)
         let health = model.apiProfileHealth[profile.id] ?? .unchecked
+        let diagnostic = model.apiProfileDiagnostics[profile.id]
         let isActive = effectiveConnectionKind == profile.kind.connectionKind && model.activeProfileID == profile.id
         let now = Date()
         let rangeStart = trendStartDate(now: now)
@@ -2207,17 +2239,24 @@ struct RootView: View {
             since: rangeStart,
             now: now
         )
-        return VStack(alignment: .leading, spacing: 14) {
+        return VStack(alignment: .leading, spacing: 12) {
             connectionHero(
                 title: profile.name,
                 subtitle: profile.kind == .harbor ? "托管密钥" : identity.brand.title,
                 icon: profile.kind == .harbor ? "key.fill" : profile.provider.icon,
-                color: profile.kind == .harbor ? .blue : identity.brand.tint,
+                color: .blue,
                 health: health,
                 providerIdentity: profile.kind == .customResponses ? identity : nil,
                 isActive: isActive,
                 usage: profile.kind == .harbor ? (model.usageByProfileID[profile.id] ?? (isActive ? model.usage : nil)) : nil,
                 usageExpiry: profile.kind == .harbor ? displayExpiry(model.usageByProfileID[profile.id]?.expiresAt ?? profile.expiresAt) : nil,
+                inlineStatus: profile.kind == .customResponses
+                    ? [identity.host, identity.protocolTitle, diagnostic?.latencyMilliseconds.map { "延迟 \(durationText($0))" }]
+                        .compactMap { $0 }
+                        .joined(separator: " · ")
+                    : nil,
+                inlineStatusColor: .secondary,
+                inlineStatusIcon: "network",
                 usageQueryAction: profile.kind == .harbor ? {
                     queryingUsageProfileID = profile.id
                     Task {
@@ -2238,46 +2277,38 @@ struct RootView: View {
                 }
             )
 
-            statisticsRangeControl(accent: profile.kind == .harbor ? .blue : identity.brand.tint)
-
-            Divider()
-
-            if profile.kind == .harbor {
-                requestMetricsRow(
-                    kind: .harborKey,
-                    metrics: metrics,
-                    workDuration: model.codexWorkDurationMilliseconds(
-                        for: .harborKey,
-                        profileID: nil,
-                        since: rangeStart
-                    ),
-                    accent: .blue
-                )
-                requestTrendPanel(kind: .harborKey, accent: .blue)
-            } else {
-                VStack(spacing: 14) {
-                    requestMetricsRow(
-                        kind: .apiKey,
-                        metrics: metrics,
-                        workDuration: model.codexWorkDurationMilliseconds(
-                            for: .apiKey,
-                            profileID: nil,
-                            since: rangeStart
-                        ),
-                        accent: identity.brand.tint
-                    )
-                    requestTrendPanel(kind: .apiKey, accent: identity.brand.tint)
-                }
-            }
+            let detailKind: CodexConnectionKind = profile.kind == .harbor ? .harborKey : .apiKey
+            analyticsWorkspace(
+                kind: detailKind,
+                profileID: profile.id,
+                metrics: metrics,
+                workDuration: model.codexWorkDurationMilliseconds(
+                    for: detailKind,
+                    profileID: nil,
+                    since: rangeStart
+                ),
+                health: health,
+                isActive: isActive,
+                diagnostic: diagnostic,
+                rows: apiHealthRows(
+                    profile: profile,
+                    identity: identity,
+                    health: health,
+                    isActive: isActive,
+                    diagnostic: diagnostic
+                ),
+                accent: .blue
+            )
 
             Spacer(minLength: 0)
         }
-        .padding(14)
+        .padding(16)
     }
 
     private func connectionHero(
         title: String,
         subtitle: String,
+        titleBadge: String? = nil,
         icon: String,
         color: Color,
         health: ConnectionHealth,
@@ -2294,127 +2325,148 @@ struct RootView: View {
         checkAction: @escaping () -> Void,
         switchAction: @escaping () -> Void
     ) -> some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 14) {
+        HStack(spacing: 16) {
+            HStack(spacing: 12) {
                 if let providerIdentity {
-                    ProviderIconView(identity: providerIdentity, size: 48)
+                    ProviderIconView(identity: providerIdentity, size: 52)
                 } else {
                     Image(systemName: icon)
-                        .font(.system(size: 25, weight: .semibold))
+                        .font(.system(size: 23, weight: .semibold))
                         .foregroundStyle(color)
-                        .frame(width: 48, height: 48)
-                        .background(color.opacity(0.11), in: Circle())
+                        .frame(width: 52, height: 52)
+                        .background(color.opacity(0.09), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(title)
-                        .font(.system(size: 19, weight: .semibold))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 8) {
+                        Text(title)
+                            .font(.system(size: 20, weight: .semibold, design: .rounded))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if let titleBadge, !titleBadge.isEmpty {
+                            Text(titleBadge)
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.purple)
+                                .padding(.horizontal, 7)
+                                .frame(height: 22)
+                                .background(Color.purple.opacity(0.09), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(Color.purple.opacity(0.18)))
+                        }
+                    }
                     Text(subtitle)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                }
-                .layoutPriority(1)
-
-                Spacer(minLength: 10)
-
-                connectionHeroMeta(isActive: isActive, health: health)
-                    .frame(minWidth: 94, alignment: .trailing)
-            }
-
-            HStack(spacing: 8) {
-                if usage != nil || usageExpiry != nil {
-                    hostedInlineUsage(usage: usage, expiry: usageExpiry)
-                } else if let inlineStatus {
                     HStack(spacing: 7) {
-                        if inlineStatusPulses {
-                            BreathingStatusDot(color: inlineStatusColor, active: true)
-                                .frame(width: 14, height: 14)
-                        } else {
-                            Image(systemName: inlineStatusIcon)
-                                .foregroundStyle(inlineStatusColor)
-                        }
-                        Text(inlineStatus)
-                            .foregroundStyle(inlineStatusColor)
+                        connectionActiveBadge(isActive: isActive)
+                        connectionHeroMeta(isActive: isActive, health: health)
+                        if usage != nil || usageExpiry != nil {
+                            hostedInlineUsage(usage: usage, expiry: usageExpiry)
+                        } else if let inlineStatus {
+                            HStack(spacing: 5) {
+                                if inlineStatusPulses {
+                                    BreathingStatusDot(color: inlineStatusColor, active: true)
+                                        .frame(width: 12, height: 12)
+                                } else {
+                                    Image(systemName: inlineStatusIcon)
+                                        .foregroundStyle(inlineStatusColor)
+                                }
+                                Text(inlineStatus)
+                                    .foregroundStyle(inlineStatusColor)
+                            }
+                            .font(.system(size: 10, weight: .medium))
                             .lineLimit(1)
                             .minimumScaleFactor(0.72)
-                    }
-                    .font(.system(size: 9, weight: .semibold))
-                    .padding(.horizontal, 8)
-                    .frame(width: 292, height: 24, alignment: .leading)
-                    .background(inlineStatusColor.opacity(inlineStatusPulses ? 0.09 : 0.055), in: Capsule())
-                    .overlay(Capsule().stroke(inlineStatusColor.opacity(inlineStatusPulses ? 0.30 : 0.14)))
-                    .help("ChatGPT 订阅到期时间")
-                } else {
-                    Color.clear
-                        .frame(width: 292, height: 24)
-                }
-
-                Spacer(minLength: 8)
-
-                if let usageQueryAction {
-                    Button(action: usageQueryAction) {
-                        ZStack {
-                            Label("查询", systemImage: "arrow.clockwise")
-                                .opacity(isQueryingUsage ? 0 : 1)
-                            ProgressView()
-                                .controlSize(.small)
-                                .opacity(isQueryingUsage ? 1 : 0)
+                            .help(inlineStatusPulses ? "ChatGPT 订阅到期时间" : inlineStatus)
                         }
+                    }
+                }
+                .layoutPriority(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 7) {
+                    Spacer(minLength: 0)
+                    if let usageQueryAction {
+                        Button(action: usageQueryAction) {
+                            ZStack {
+                                Label("查询", systemImage: "arrow.clockwise")
+                                    .opacity(isQueryingUsage ? 0 : 1)
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .opacity(isQueryingUsage ? 1 : 0)
+                            }
+                        }
+                        .buttonStyle(HarborActionButtonStyle(tint: .blue, prominence: .secondary))
+                        .help("查询托管用量")
+                        .disabled(model.isBusy || isQueryingUsage)
+                    }
+
+                    Button(action: checkAction) {
+                        Label("检查", systemImage: "checkmark.shield")
                     }
                     .buttonStyle(HarborActionButtonStyle(tint: .blue, prominence: .secondary))
-                    .help("查询托管用量")
-                    .disabled(model.isBusy || isQueryingUsage)
-                }
+                    .disabled(model.isBusy || model.isCheckingConnectionHealth)
 
-                Button(action: checkAction) {
-                    Label("检查", systemImage: "checkmark.shield")
-                }
-                .buttonStyle(HarborActionButtonStyle(tint: .blue, prominence: .secondary))
-                .disabled(model.isBusy || model.isCheckingConnectionHealth)
-
-                if isActive {
-                    Label("已连接", systemImage: "checkmark.circle.fill")
-                        .font(.callout.weight(.semibold))
-                        .foregroundStyle(.green)
-                        .frame(minWidth: 76)
-                } else {
-                    Button(action: switchAction) {
-                        HStack(spacing: 7) {
-                            if pendingConnectionID != nil {
-                                ProgressView().controlSize(.small)
+                    if isActive {
+                        Label("使用中", systemImage: "checkmark")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .frame(minWidth: 82, minHeight: 32)
+                            .background(Color.blue, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                            .shadow(color: Color.blue.opacity(0.18), radius: 5, y: 2)
+                    } else {
+                        Button(action: switchAction) {
+                            HStack(spacing: 7) {
+                                if pendingConnectionID != nil {
+                                    ProgressView().controlSize(.small)
+                                }
+                                Text("切换")
                             }
-                            Text("切换")
+                            .frame(minWidth: 54)
                         }
-                        .frame(minWidth: 76)
+                        .buttonStyle(HarborActionButtonStyle(tint: .blue, prominence: .prominent))
+                        .disabled(model.isBusy)
                     }
-                    .buttonStyle(HarborActionButtonStyle(tint: .blue, prominence: .prominent))
-                    .disabled(model.isBusy)
-                }
             }
+            .frame(width: 258, alignment: .trailing)
+            .layoutPriority(2)
         }
-        .frame(height: 92)
+        .padding(.horizontal, 14)
+        .frame(minHeight: 108, maxHeight: 108)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.34), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.primary.opacity(0.075), lineWidth: 1)
+        )
+    }
+
+    private func connectionActiveBadge(isActive: Bool) -> some View {
+        Label(isActive ? "当前连接" : "未使用", systemImage: isActive ? "link.circle.fill" : "circle")
+            .font(.system(size: 10.5, weight: .semibold))
+            .foregroundStyle(isActive ? Color.green : Color.secondary)
+            .lineLimit(1)
+            .padding(.horizontal, 8)
+            .frame(height: 24)
+            .background((isActive ? Color.green : Color.secondary).opacity(0.08), in: Capsule())
     }
 
     private func connectionHeroMeta(
         isActive: Bool,
         health: ConnectionHealth
     ) -> some View {
-        HStack(spacing: 6) {
-            BreathingStatusDot(
-                color: healthColor(health),
-                active: healthIsAvailable(health)
-            )
-            Text(isActive ? "当前连接" : "连接详情")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.secondary)
+        Label {
             Text(healthTitle(health))
+                .font(.system(size: 10.5, weight: .semibold))
+        } icon: {
+            Image(systemName: healthIcon(health))
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(healthColor(health))
         }
+        .foregroundStyle(healthColor(health))
         .lineLimit(1)
-        .help("连接健康状态；托管连接会在此显示已用、剩余和有效期")
+        .padding(.horizontal, 8)
+        .frame(height: 24)
+        .background(healthColor(health).opacity(0.08), in: Capsule())
+        .help(isActive ? "当前连接状态：\(healthTitle(health))" : "连接状态：\(healthTitle(health))")
     }
 
     private func healthIsAvailable(_ health: ConnectionHealth) -> Bool {
@@ -2423,7 +2475,7 @@ struct RootView: View {
     }
 
     private func hostedInlineUsage(usage: UsageSnapshot?, expiry: String?) -> some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 7) {
             Text("已用 " + formatCurrency(usage?.used))
                 .foregroundStyle(.orange)
             Text("余 " + formatCurrency(usage?.remaining))
@@ -2434,72 +2486,63 @@ struct RootView: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.62)
         }
-        .font(.system(size: 9, weight: .semibold))
+        .font(.system(size: 10, weight: .semibold))
         .lineLimit(1)
-        .padding(.horizontal, 8)
-        .frame(width: 292, height: 24, alignment: .leading)
-        .background(Color.blue.opacity(0.055), in: Capsule())
-        .overlay(Capsule().stroke(Color.blue.opacity(0.12)))
         .help("托管用量与有效期")
     }
 
-    private func analyticsMetricsStrip(_ rows: [(String, String, String, Color)]) -> some View {
-        HStack(spacing: 0) {
-            ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+    private func analyticsMetricsStrip(_ rows: [HarborMetricSummary]) -> some View {
+        HStack(spacing: 8) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
                 analyticsMetric(row)
-                if index < rows.count - 1 {
-                    Rectangle()
-                        .fill(Color.primary.opacity(0.075))
-                        .frame(width: 1, height: 42)
-                }
             }
-        }
-        .padding(.vertical, 7)
-        .overlay(alignment: .top) {
-            Rectangle()
-                .fill(Color.primary.opacity(0.075))
-                .frame(height: 1)
-        }
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(Color.primary.opacity(0.075))
-                .frame(height: 1)
         }
     }
 
-    private func analyticsMetric(_ row: (String, String, String, Color)) -> some View {
-        let isHovered = hoveredDetailKey == row.0
-        return VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 8) {
-                Image(systemName: row.2)
+    private func analyticsMetric(_ row: HarborMetricSummary) -> some View {
+        let isHovered = hoveredDetailKey == row.id
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Image(systemName: row.icon)
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(row.3)
-                    .frame(width: 22, height: 22)
-                    .background(row.3.opacity(isHovered ? 0.16 : 0.09), in: Circle())
-                Text(row.0)
-                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(row.color)
+                    .frame(width: 24, height: 24)
+                    .background(row.color.opacity(0.09), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                Text(row.title)
+                    .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-            Text(row.1)
-                .font(.system(size: 17, weight: .semibold, design: .rounded))
-                .foregroundStyle(isHovered ? row.3 : Color.primary)
+            Text(row.value)
+                .font(.system(size: 19, weight: .semibold, design: .rounded))
+                .foregroundStyle(isHovered ? row.color : Color.primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .minimumScaleFactor(0.72)
                 .textSelection(.enabled)
+            if let detail = row.detail {
+                Text(detail)
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+            }
         }
-        .padding(.horizontal, 13)
-        .padding(.vertical, 7)
-        .frame(maxWidth: .infinity, minHeight: 62, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, minHeight: 92, alignment: .leading)
         .background(
-            Rectangle()
-                .fill(isHovered ? row.3.opacity(0.045) : Color.clear)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(isHovered ? row.color.opacity(0.055) : Color(nsColor: .textBackgroundColor).opacity(0.88))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(isHovered ? row.color.opacity(0.18) : Color.primary.opacity(0.07), lineWidth: 1)
         )
         .contentShape(Rectangle())
         .onHover { hovering in
             withAnimation(detailHoverAnimation) {
-                hoveredDetailKey = hovering ? row.0 : nil
+                hoveredDetailKey = hovering ? row.id : nil
             }
         }
         .animation(detailHoverAnimation, value: isHovered)
@@ -2535,70 +2578,433 @@ struct RootView: View {
             profileID: nil,
             since: rangeStart
         )
-        let billedTokens = model.providerBilledTokenTotal(
-            for: kind,
-            profileID: nil,
-            since: rangeStart
-        )
         let requestLabel = trendRange == .today ? "今日请求" : "\(trendRange.rawValue)请求"
         let durationLabel = trendRange == .today ? "今日工作时长" : "\(trendRange.rawValue)工作时长"
-        var rows: [(String, String, String, Color)] = [
-            (requestLabel, "\(metrics.count)", "arrow.up.right.circle.fill", accent),
-            ("请求 Token", tokenSummary.totalTokens > 0 ? formatTokenCount(tokenSummary.totalTokens) : "暂无记录", "number", .purple),
-            ("平均响应", durationText(metrics.averageDurationMilliseconds), "speedometer", latencyColor(metrics.averageDurationMilliseconds ?? 0)),
-            ("成功率", percentText(metrics.successRate), "checkmark.seal.fill", successRateColor(metrics.successRate)),
-            (durationLabel, workDurationText(workDuration), "clock.fill", .blue)
-        ]
-        if billedTokens > 0 {
-            rows.append(("计费 Token", formatTokenCount(billedTokens), "creditcard.fill", .orange))
-        }
-        return analyticsMetricsStrip(rows)
-            .animation(
-                reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.20),
-                value: trendRange
+        let rows: [HarborMetricSummary] = [
+            HarborMetricSummary(
+                title: requestLabel,
+                value: "\(metrics.count)",
+                detail: metrics.count > 0 ? "\(metrics.successfulCount) 次成功" : nil,
+                icon: "arrow.up.right.circle.fill",
+                color: accent
+            ),
+            HarborMetricSummary(
+                title: "请求 Token",
+                value: tokenSummary.totalTokens > 0 ? formatTokenCount(tokenSummary.totalTokens) : "暂无记录",
+                detail: tokenSummary.totalTokens > 0
+                    ? "输入 \(formatTokenCount(tokenSummary.inputTokens)) · 输出 \(formatTokenCount(tokenSummary.outputTokens))"
+                    : nil,
+                icon: "number",
+                color: .purple
+            ),
+            HarborMetricSummary(
+                title: "平均响应",
+                value: durationText(metrics.averageDurationMilliseconds),
+                detail: metrics.p95DurationMilliseconds.map { "P95 \(durationText($0))" },
+                icon: "speedometer",
+                color: latencyColor(metrics.averageDurationMilliseconds ?? 0)
+            ),
+            HarborMetricSummary(
+                title: "成功率",
+                value: percentText(metrics.successRate),
+                detail: metrics.count > 0 ? "成功 \(metrics.successfulCount) / \(metrics.count)" : nil,
+                icon: "checkmark.seal.fill",
+                color: successRateColor(metrics.successRate)
+            ),
+            HarborMetricSummary(
+                title: durationLabel,
+                value: workDurationText(workDuration),
+                detail: workDuration == nil ? nil : "请求耗时累计",
+                icon: "clock.fill",
+                color: .blue
             )
+        ]
+        return VStack(spacing: 9) {
+            HStack(spacing: 12) {
+                Text("使用概览")
+                    .font(.callout.weight(.semibold))
+                Text("（\(trendRange.rawValue)）")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 12)
+                statisticsRangeControl(accent: .blue)
+            }
+            .frame(height: 28)
+
+            analyticsMetricsStrip(rows)
+        }
+        .padding(12)
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.82), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.primary.opacity(0.075)))
+        .animation(
+            reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.20),
+            value: trendRange
+        )
+    }
+
+    private func analyticsWorkspace(
+        kind: CodexConnectionKind,
+        profileID: UUID?,
+        metrics: AppModel.CodexRequestMetrics,
+        workDuration: Int?,
+        health: ConnectionHealth,
+        isActive: Bool,
+        diagnostic: ConnectionDiagnostic?,
+        rows: [HarborHealthRow],
+        accent: Color
+    ) -> some View {
+        VStack(spacing: 12) {
+            requestMetricsRow(
+                kind: kind,
+                metrics: metrics,
+                workDuration: workDuration,
+                accent: accent
+            )
+
+            GeometryReader { proxy in
+                if proxy.size.width >= 780 {
+                    HStack(alignment: .top, spacing: 12) {
+                        requestTrendPanel(kind: kind, accent: accent)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        connectionHealthPanel(
+                            kind: kind,
+                            profileID: profileID,
+                            health: health,
+                            isActive: isActive,
+                            diagnostic: diagnostic,
+                            metrics: metrics,
+                            rows: rows
+                        )
+                        .frame(width: min(278, max(238, proxy.size.width * 0.26)))
+                    }
+                } else {
+                    VStack(spacing: 12) {
+                        requestTrendPanel(kind: kind, accent: accent)
+                            .frame(minHeight: 240)
+                        connectionHealthPanel(
+                            kind: kind,
+                            profileID: profileID,
+                            health: health,
+                            isActive: isActive,
+                            diagnostic: diagnostic,
+                            metrics: metrics,
+                            rows: rows
+                        )
+                    }
+                }
+            }
+        }
+        .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    private func connectionHealthPanel(
+        kind: CodexConnectionKind,
+        profileID: UUID?,
+        health: ConnectionHealth,
+        isActive: Bool,
+        diagnostic: ConnectionDiagnostic?,
+        metrics: AppModel.CodexRequestMetrics,
+        rows: [HarborHealthRow]
+    ) -> some View {
+        let summary = connectionHealthSummary(health: health, metrics: metrics)
+        let warning = connectionHealthWarning(kind: kind, health: health, metrics: metrics, diagnostic: diagnostic)
+        let recentEvents = recentConnectionActivity(kind: kind, profileID: profileID)
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 9) {
+                Image(systemName: "waveform.path.ecg")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(summary.color)
+                    .frame(width: 28, height: 28)
+                    .background(summary.color.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("连接健康")
+                        .font(.callout.weight(.semibold))
+                    Text(summary.title)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(summary.color)
+                }
+                Spacer(minLength: 4)
+                Image(systemName: summary.icon)
+                    .foregroundStyle(summary.color)
+                    .accessibilityLabel(summary.title)
+            }
+            .padding(.bottom, 12)
+
+            Rectangle()
+                .fill(Color.primary.opacity(0.07))
+                .frame(height: 1)
+
+            VStack(spacing: 0) {
+                ForEach(rows) { row in
+                    HStack(spacing: 10) {
+                        Text(row.title)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(row.color)
+                                .frame(width: 6, height: 6)
+                            Text(row.value)
+                                .foregroundStyle(row.color)
+                                .fontWeight(.semibold)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.72)
+                        }
+                    }
+                    .font(.caption)
+                    .frame(minHeight: 34)
+                    if row.id != rows.last?.id {
+                        Rectangle()
+                            .fill(Color.primary.opacity(0.045))
+                            .frame(height: 1)
+                    }
+                }
+            }
+
+            if let warning {
+                HStack(alignment: .top, spacing: 7) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                    Text(warning)
+                        .font(.caption2.weight(.medium))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .padding(.top, 12)
+            }
+
+            if !recentEvents.isEmpty {
+                Rectangle()
+                    .fill(Color.primary.opacity(0.07))
+                    .frame(height: 1)
+                    .padding(.top, 12)
+
+                Text("最近活动")
+                    .font(.caption.weight(.semibold))
+                    .padding(.top, 12)
+                    .padding(.bottom, 5)
+
+                VStack(spacing: 0) {
+                    ForEach(recentEvents) { event in
+                        HStack(spacing: 8) {
+                            Image(systemName: activityIcon(event))
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(activityColor(event))
+                                .frame(width: 18, height: 18)
+                                .background(activityColor(event).opacity(0.09), in: Circle())
+                            Text(activityTitle(event))
+                                .font(.system(size: 10.5, weight: .medium))
+                                .lineLimit(1)
+                            Spacer(minLength: 4)
+                            Text(event.timestamp.formatted(date: .omitted, time: .shortened))
+                                .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        .frame(minHeight: 28)
+                    }
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.30), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.primary.opacity(0.075)))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("连接健康：\(summary.title)")
+    }
+
+    private func recentConnectionActivity(
+        kind: CodexConnectionKind,
+        profileID: UUID?
+    ) -> [ConnectionActivityEvent] {
+        Array(
+            model.activityEvents
+                .filter {
+                    $0.connectionKind == kind
+                        && (profileID == nil || $0.profileID == profileID)
+                }
+                .sorted { $0.timestamp > $1.timestamp }
+                .prefix(4)
+        )
+    }
+
+    private func activityTitle(_ event: ConnectionActivityEvent) -> String {
+        switch event.kind {
+        case .codexRequest:
+            return event.succeeded ? "请求完成" : "请求失败"
+        case .healthCheck:
+            return event.succeeded ? "检查连接成功" : "检查连接失败"
+        case .usageQuery:
+            return event.succeeded ? "用量查询成功" : "用量查询失败"
+        case .connectionSwitch:
+            return event.succeeded ? "切换连接成功" : "切换连接失败"
+        case .profileCreate:
+            return event.succeeded ? "新增连接成功" : "新增连接失败"
+        case .modelRefresh:
+            return event.succeeded ? "更新模型成功" : "更新模型失败"
+        case .codexReload:
+            return event.succeeded ? "重载 Codex" : "重载失败"
+        }
+    }
+
+    private func activityIcon(_ event: ConnectionActivityEvent) -> String {
+        switch event.kind {
+        case .codexRequest: "paperplane.fill"
+        case .healthCheck: "checkmark.shield.fill"
+        case .usageQuery: "chart.bar.fill"
+        case .connectionSwitch: "arrow.left.arrow.right"
+        case .profileCreate: "plus"
+        case .modelRefresh: "arrow.clockwise"
+        case .codexReload: "arrow.triangle.2.circlepath"
+        }
+    }
+
+    private func activityColor(_ event: ConnectionActivityEvent) -> Color {
+        event.succeeded ? .blue : .red
+    }
+
+    private func connectionHealthSummary(
+        health: ConnectionHealth,
+        metrics: AppModel.CodexRequestMetrics
+    ) -> (title: String, color: Color, icon: String) {
+        switch health {
+        case .unavailable:
+            return ("异常", .red, "xmark.circle.fill")
+        case .expired:
+            return ("需要关注", .orange, "exclamationmark.triangle.fill")
+        case .checking:
+            return ("检查中", .blue, "arrow.triangle.2.circlepath")
+        case .unchecked:
+            return ("待检查", .secondary, "questionmark.circle")
+        case .available:
+            if metrics.count >= 3, let successRate = metrics.successRate, successRate < 0.90 {
+                return ("需要关注", .orange, "exclamationmark.triangle.fill")
+            }
+            if let latency = metrics.averageDurationMilliseconds, latency >= 10_000 {
+                return ("需要关注", .orange, "exclamationmark.triangle.fill")
+            }
+            return ("正常", .green, "checkmark.circle.fill")
+        }
+    }
+
+    private func connectionHealthWarning(
+        kind: CodexConnectionKind,
+        health: ConnectionHealth,
+        metrics: AppModel.CodexRequestMetrics,
+        diagnostic: ConnectionDiagnostic?
+    ) -> String? {
+        switch health {
+        case .expired:
+            return kind == .harborKey ? "当前托管密钥已过期" : (healthDetail(health) ?? "当前连接已过期")
+        case .unavailable:
+            return diagnostic?.failureReason ?? healthDetail(health) ?? "当前连接不可用"
+        default:
+            break
+        }
+        if metrics.count >= 3, let successRate = metrics.successRate, successRate < 0.90 {
+            return "\(trendRange.rawValue)成功率仅 \(percentText(successRate))"
+        }
+        if let latency = metrics.averageDurationMilliseconds, latency >= 10_000 {
+            return "\(trendRange.rawValue)平均响应达到 \(durationText(latency))"
+        }
+        return nil
+    }
+
+    private func accountHealthRows(
+        profile: CodexAccountProfile,
+        health: ConnectionHealth,
+        isActive: Bool,
+        diagnostic: ConnectionDiagnostic?
+    ) -> [HarborHealthRow] {
+        var rows = [
+            HarborHealthRow(title: "Codex", value: isActive ? "当前连接" : "未使用", color: isActive ? .green : .secondary),
+            HarborHealthRow(title: "账户", value: healthTitle(health), color: healthColor(health))
+        ]
+        if let expiry = profile.subscriptionExpiryDate() {
+            let presentation = accountSubscriptionPresentation(profile)
+            rows.append(
+                HarborHealthRow(
+                    title: profile.subscriptionPlanTitle ?? "订阅",
+                    value: subscriptionRemainingText(expiry),
+                    color: presentation?.color ?? .secondary
+                )
+            )
+        }
+        if let checkedAt = diagnostic?.checkedAt {
+            rows.append(HarborHealthRow(title: "最近检查", value: relativeTime(checkedAt), color: .secondary))
+        }
+        if isActive, let currentModel = model.environment.model, !currentModel.isEmpty {
+            rows.append(HarborHealthRow(title: "当前模型", value: currentModel, color: .green))
+        }
+        return rows
+    }
+
+    private func apiHealthRows(
+        profile: HarborProfile,
+        identity: ProviderIdentity,
+        health: ConnectionHealth,
+        isActive: Bool,
+        diagnostic: ConnectionDiagnostic?
+    ) -> [HarborHealthRow] {
+        var rows = [
+            HarborHealthRow(title: "Codex", value: isActive ? "当前连接" : "未使用", color: isActive ? .green : .secondary),
+            HarborHealthRow(
+                title: profile.kind == .harbor ? "密钥" : "API",
+                value: healthTitle(health),
+                color: healthColor(health)
+            )
+        ]
+        if profile.kind == .harbor {
+            let usage = model.usageByProfileID[profile.id] ?? (isActive ? model.usage : nil)
+            if let remaining = usage?.remaining {
+                rows.append(HarborHealthRow(title: "余额", value: formatCurrency(remaining), color: remaining > 0 ? .green : .orange))
+            }
+            if let rawExpiry = usage?.expiresAt ?? profile.expiresAt, !rawExpiry.isEmpty {
+                rows.append(HarborHealthRow(title: "到期", value: displayExpiry(rawExpiry), color: healthColor(health)))
+            }
+        } else {
+            if let latency = diagnostic?.latencyMilliseconds {
+                rows.append(HarborHealthRow(title: "延迟", value: durationText(latency), color: latencyColor(latency)))
+            }
+            rows.append(HarborHealthRow(title: "Provider", value: identity.brand.title, color: identity.brand.tint))
+        }
+        if let checkedAt = diagnostic?.checkedAt {
+            rows.append(HarborHealthRow(title: "最近检查", value: relativeTime(checkedAt), color: .secondary))
+        }
+        let currentModel = isActive ? model.environment.model : profile.model
+        if let currentModel, !currentModel.isEmpty {
+            rows.append(HarborHealthRow(title: "当前模型", value: currentModel, color: isActive ? .green : .secondary))
+        }
+        return rows
+    }
+
+    private func subscriptionRemainingText(_ expiry: Date, now: Date = Date()) -> String {
+        let calendar = Calendar.current
+        let days = calendar.dateComponents(
+            [.day],
+            from: calendar.startOfDay(for: now),
+            to: calendar.startOfDay(for: expiry)
+        ).day ?? 0
+        if days < 0 { return "已到期" }
+        if days == 0 { return "今天到期" }
+        return "剩余 \(days) 天"
     }
 
     private func statisticsRangeControl(accent: Color) -> some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 7) {
-                Image(systemName: "calendar")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(accent)
-                    .frame(width: 25, height: 25)
-                    .background(accent.opacity(0.11), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                Text("统计范围")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.primary)
-            }
-
-            Spacer(minLength: 10)
-
-            HStack(spacing: 3) {
-                statisticsRangeButton("今日", range: .today, accent: accent)
-                statisticsRangeButton("7日", range: .sevenDays, accent: accent)
-                statisticsRangeButton("当月", range: .month, accent: accent)
-            }
-            .padding(3)
-            .background(Color.primary.opacity(0.045), in: Capsule())
+        HStack(spacing: 3) {
+            statisticsRangeButton("今日", range: .today, accent: accent)
+            statisticsRangeButton("7日", range: .sevenDays, accent: accent)
+            statisticsRangeButton("当月", range: .month, accent: accent)
         }
-        .padding(.horizontal, 10)
-        .frame(maxWidth: .infinity, minHeight: 42)
-        .background(
-            LinearGradient(
-                colors: [
-                    accent.opacity(0.055),
-                    Color(nsColor: .controlBackgroundColor).opacity(0.28)
-                ],
-                startPoint: .leading,
-                endPoint: .trailing
-            ),
-            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(accent.opacity(0.11), lineWidth: 1)
-        )
+        .padding(3)
+        .background(Color.primary.opacity(0.045), in: Capsule())
         .animation(
             reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.18),
             value: trendRange
@@ -2619,7 +3025,7 @@ struct RootView: View {
             Text(title)
                 .font(.system(size: 10.5, weight: .semibold))
                 .foregroundStyle(selected ? accent : .secondary)
-                .frame(width: 45, height: 27)
+                .frame(width: 46, height: 25)
                 .background(selected ? accent.opacity(0.14) : Color.clear, in: Capsule())
                 .overlay(
                     Capsule()
@@ -2703,36 +3109,48 @@ struct RootView: View {
             labels = dailyTrendLabels(days: days, now: now)
             currentFraction = nil
         }
-        return VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("\(trendRange.rawValue)\(trendMetric == .token ? " Token 使用趋势" : " \(trendMetric.rawValue)趋势")")
-                        .font(.callout.weight(.semibold))
-                        .help("按上方统计范围展示")
-                }
+        let hasData = series.contains { $0.values.contains(where: { $0 > 0 }) }
+        let summary = trendSummary(series: series, labels: labels)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 12) {
+                Text("使用趋势")
+                    .font(.callout.weight(.semibold))
+                    .help("按上方统计范围展示")
                 Spacer()
-                HStack(spacing: 4) {
-                    trendFilterButton("Token", selected: trendMetric == .token, tint: accent) {
-                        withAnimation(reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.16)) {
-                            trendMetric = .token
-                        }
-                    }
-                    trendFilterButton("请求", selected: trendMetric == .requests, tint: accent) {
-                        withAnimation(reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.16)) {
-                            trendMetric = .requests
-                        }
-                    }
-                    trendFilterButton("耗时", selected: trendMetric == .latency, tint: accent) {
-                        withAnimation(reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.16)) {
-                            trendMetric = .latency
-                        }
-                    }
-                    Text(trendMetric.unit)
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(.tertiary)
-                        .padding(.leading, 3)
-                }
+                trendMetricSelector(accent: accent)
+                statisticsRangeControl(accent: accent)
             }
+
+            HStack(alignment: .firstTextBaseline, spacing: 18) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(summary.value)
+                        .font(.system(size: 21, weight: .semibold, design: .rounded))
+                        .contentTransition(.numericText())
+                    Text(summary.label)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+                if let peak = summary.peak {
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.08))
+                        .frame(width: 1, height: 28)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(trendMetric == .latency ? "最高" : "峰值")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.secondary)
+                        Text(peak)
+                            .font(.caption.weight(.semibold))
+                            .lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(minHeight: 40)
+
+            Rectangle()
+                .fill(Color.primary.opacity(0.065))
+                .frame(height: 1)
+
             HarborTrendChart(
                 series: series,
                 labels: labels,
@@ -2740,25 +3158,91 @@ struct RootView: View {
                 accent: accent,
                 currentFraction: currentFraction
             )
-                .frame(height: 158)
+                .frame(minHeight: 176, maxHeight: .infinity)
+                .overlay {
+                    if !hasData {
+                        VStack(spacing: 5) {
+                            Image(systemName: "chart.xyaxis.line")
+                                .font(.title3)
+                                .foregroundStyle(.tertiary)
+                            Text("暂无趋势数据")
+                                .font(.caption.weight(.semibold))
+                            Text("当前时间范围内尚无使用记录")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
             if kind == .apiKey, series.count > 1 {
                 trendLegend(series)
             }
         }
-        .padding(.horizontal, 13)
+        .padding(.horizontal, 14)
         .padding(.vertical, 12)
-        .background(
-            LinearGradient(
-                colors: [
-                    accent.opacity(0.045),
-                    Color(nsColor: .controlBackgroundColor).opacity(0.42)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            ),
-            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
-        )
-        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(accent.opacity(0.10)))
+        .frame(maxHeight: .infinity, alignment: .top)
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.82), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.primary.opacity(0.075)))
+    }
+
+    private func trendMetricSelector(accent: Color) -> some View {
+        HStack(spacing: 3) {
+            trendFilterButton("Token", icon: "number", selected: trendMetric == .token, tint: accent) {
+                withAnimation(reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.16)) {
+                    trendMetric = .token
+                }
+            }
+            trendFilterButton("请求", icon: "chart.bar.fill", selected: trendMetric == .requests, tint: accent) {
+                withAnimation(reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.16)) {
+                    trendMetric = .requests
+                }
+            }
+            trendFilterButton("耗时", icon: "clock", selected: trendMetric == .latency, tint: accent) {
+                withAnimation(reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.16)) {
+                    trendMetric = .latency
+                }
+            }
+        }
+        .padding(3)
+        .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func trendSummary(
+        series: [HarborTrendSeries],
+        labels: [String]
+    ) -> (value: String, label: String, peak: String?) {
+        let entries = series.flatMap { item in
+            item.values.enumerated().map { (series: item, index: $0.offset, value: $0.element) }
+        }
+        let positiveEntries = entries.filter { $0.value > 0 }
+        let value: String
+        let label: String
+        switch trendMetric {
+        case .token:
+            value = formatTokenCount(entries.reduce(0) { $0 + $1.value })
+            label = "\(trendRange.rawValue) Token"
+        case .requests:
+            value = "\(entries.reduce(0) { $0 + $1.value }) 次"
+            label = "\(trendRange.rawValue)请求"
+        case .latency:
+            let weighted = entries.reduce(into: (duration: 0, requests: 0)) { result, entry in
+                let count = entry.series.requestCounts[safe: entry.index] ?? 0
+                result.duration += entry.value * count
+                result.requests += count
+            }
+            value = durationText(weighted.requests > 0 ? weighted.duration / weighted.requests : nil)
+            label = "平均响应"
+        }
+        guard let peak = positiveEntries.max(by: { $0.value < $1.value }) else {
+            return (value, label, nil)
+        }
+        let peakValue: String = switch trendMetric {
+        case .token: formatTokenCount(peak.value)
+        case .requests: "\(peak.value) 次"
+        case .latency: durationText(peak.value)
+        }
+        let peakLabel = labels[safe: peak.index] ?? ""
+        let seriesLabel = series.count > 1 ? " · \(peak.series.title)" : ""
+        return (value, label, "\(peakValue) · \(peakLabel)\(seriesLabel)")
     }
 
     private func trendSeries(
@@ -2771,7 +3255,7 @@ struct RootView: View {
     ) -> [HarborTrendSeries] {
         if kind == .apiKey {
             let apiProfiles = model.profiles.filter { $0.kind.connectionKind == .apiKey }
-            let palette: [Color] = [.purple, .orange, .teal, .pink, .indigo, .cyan]
+            let palette: [Color] = [.orange, .teal, .pink, .indigo, .cyan, .mint]
             return apiProfiles.enumerated().map { index, profile in
                 let requests = requestValues(profile.id)
                 let values: [Int] = switch trendMetric {
@@ -2785,8 +3269,10 @@ struct RootView: View {
                     title: profile.name,
                     values: values,
                     requestCounts: requests,
-                    color: index < palette.count ? palette[index] : identity.brand.tint,
-                    dash: trendDashStyle(index: index)
+                    color: profile.id == previewAPIProfileID
+                        ? accent
+                        : (index < palette.count ? palette[index].opacity(0.78) : identity.brand.tint.opacity(0.78)),
+                    dash: profile.id == previewAPIProfileID ? [] : trendDashStyle(index: index + 1)
                 )
             }
         }
@@ -2870,18 +3356,28 @@ struct RootView: View {
         }
     }
 
-    private func trendFilterButton(_ title: String, selected: Bool, tint: Color, action: @escaping () -> Void) -> some View {
+    private func trendFilterButton(
+        _ title: String,
+        icon: String,
+        selected: Bool,
+        tint: Color,
+        action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
-            Text(title)
+            Label(title, systemImage: icon)
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(selected ? tint : .secondary)
-                .padding(.horizontal, 7)
-                .frame(height: 22)
-                .background(selected ? tint.opacity(0.12) : Color.clear, in: Capsule())
-                .overlay(Capsule().stroke(selected ? tint.opacity(0.26) : Color.clear, lineWidth: 1))
+                .frame(width: 64, height: 30)
+                .background(selected ? tint.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(selected ? tint.opacity(0.26) : Color.clear, lineWidth: 1)
+                )
+                .shadow(color: selected ? tint.opacity(0.10) : .clear, radius: 3, y: 1)
         }
         .buttonStyle(.plain)
-        .contentShape(Capsule())
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .help("查看\(title)趋势")
     }
 
     private func formatTokenCount(_ value: Int) -> String {
@@ -3046,7 +3542,15 @@ struct RootView: View {
 
     private func durationText(_ milliseconds: Int?) -> String {
         guard let milliseconds else { return "暂无" }
-        return "\(milliseconds)ms"
+        let totalSeconds = max(0, milliseconds) / 1_000
+        if totalSeconds < 1 { return "<1 秒" }
+        if totalSeconds < 60 { return "\(totalSeconds) 秒" }
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        if minutes < 60 { return seconds == 0 ? "\(minutes) 分" : "\(minutes) 分 \(seconds) 秒" }
+        let hours = minutes / 60
+        let remainingMinutes = minutes % 60
+        return remainingMinutes == 0 ? "\(hours) 小时" : "\(hours) 小时 \(remainingMinutes) 分"
     }
 
     private func insightChip(_ title: String, icon: String, color: Color) -> some View {
@@ -3827,31 +4331,15 @@ struct RootView: View {
         return String(normalized.prefix(19))
     }
 
-    private var statusPill: some View {
-        let connected = effectiveMode != nil
-        return HStack(spacing: 7) {
-            BreathingStatusDot(
-                color: connected ? .green : .secondary,
-                active: connected
-            )
-            Text(connected ? "已连接" : "未连接")
-                .font(.caption.weight(.semibold))
-            if model.requiresCodexReload {
-                Divider().frame(height: 14)
-                Button {
-                    Task { await model.reloadCodex() }
-                } label: {
-                    Label("重新载入", systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(HarborActionButtonStyle(tint: .orange, prominence: .secondary))
-                .disabled(model.isBusy)
-                .help("连接已切换，点击重新载入 Codex")
-            }
+    private var reloadStatusButton: some View {
+        Button {
+            Task { await model.reloadCodex() }
+        } label: {
+            Label("重新载入", systemImage: "arrow.clockwise")
         }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 7)
-        .background(Color(nsColor: .windowBackgroundColor), in: Capsule())
-        .overlay(Capsule().stroke(.quaternary))
+        .buttonStyle(HarborActionButtonStyle(tint: .orange, prominence: .secondary))
+        .disabled(model.isBusy)
+        .help("连接已切换，点击重新载入 Codex")
     }
 
     private var activationCard: some View {

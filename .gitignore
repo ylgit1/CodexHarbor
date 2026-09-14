@@ -1,4 +1,5 @@
 .build/
+.impeccable/
 .swiftpm/
 DerivedData/
 *.xcuserstate

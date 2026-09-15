@@ -42,7 +42,9 @@ struct CodexHarborApp: App {
     var body: some Scene {
         WindowGroup("Codex Harbor", id: "main") {
             RootView(model: model)
-                .frame(minWidth: 900, minHeight: 680)
+                // Match the adaptive shell's minimum without forcing a tall
+                // window that crowds the trend and health sections.
+                .frame(minWidth: 900, minHeight: 560)
                 .task { await model.bootstrap() }
         }
         .defaultSize(width: 1080, height: 760)

@@ -2,33 +2,30 @@
 
 ## Reference and viewport
 
-- Visual reference: `.impeccable/review/reference.png` (1536 × 1024 px)
-- Implementation screenshots:
-  - `.impeccable/review/account-high-fidelity.png`
-  - `.impeccable/review/hosted-high-fidelity.png`
-  - `.impeccable/review/api-high-fidelity.png`
-- Side-by-side comparison: `.impeccable/review/reference-vs-account.png`
-- Native window inspected at approximately 1360 × 840 pt, within the requested 1440 × 900 class; Retina captures are 2852 × 1812 px including the window shadow.
-- Comparison state: account connection, Token metric, recent 7-day range.
+- 唯一视觉基准：用户确认的 1536 × 1024 目标稿。
+- 实际验证：已构建并安装 `/Applications/Codex Harbor.app`，在约 1360 × 840 pt 的原生窗口中检查；该尺寸比目标稿更紧，主要信息仍完整保留在首屏。
+- 验证模式：账户、托管密钥、自定义 API。
+- 验证范围：今日、7 日、当月共用同一状态；Token、请求、耗时使用不同图表实现。
 
-## Full-view comparison
+## 对照结果
 
-The implementation follows the reference skeleton: fixed narrow connection sidebar, compact workspace toolbar, horizontal current-object header, five-card metrics overview, and a 72/28 trend/health split. The main content stays on the first screen without scrolling. Account, hosted key, and custom API reuse the same geometry, so switching only changes real metadata, actions, metrics, and health rows.
+1. **页面骨架通过。** 左侧连接栏约 304 pt；右侧严格保持 Object Header → 五项 KPI → Trend 72% / Health 28% 的三级结构，三种模式切换不改变几何骨架。
+2. **Object Header 通过。** 高度固定 120 pt。名称、Badge、副标题、状态、Metadata 分层；账户、托管、API 的操作区宽度固定，托管查询结果出现后不会推动按钮或改变高度。
+3. **KPI Overview 通过。** 五个卡片固定顺序和高度，均包含 Icon、Label、主数值、真实环比或辅助信息、Mini Sparkline。没有上一周期真实数据时不显示伪造百分比。
+4. **Trend 通过。** Token 为渐变 Area、请求为 Bar、耗时为 Line；指标和日期选择器均为完整点击区域。摘要、坐标轴、网格、Hover Crosshair、Tooltip、峰值与底部总计/均值/最高/最低已实现。
+5. **零值时间桶通过。** 今日使用从本地零点到当前小时；7 日含今天及前 6 日；当月从 1 日到今天。托管/API 只有一个非零日时会画出真实的 `0 → 峰值 → 0`，不再退化为孤立点。
+6. **API 多 Provider 通过。** 所有自定义连接共用同一 X 轴，按档案显示独立颜色与线型，并在底部显示图例；不在终点堆叠冗余名称标签。
+7. **Health 通过。** 只显示真实状态行，不再出现黄色大警告卡或虚假健康分；连续相同事件聚合为 `×N`，最多显示 4 组。
+8. **首屏密度通过。** 在更紧的实测窗口中，Header、KPI、Trend、Health 与 Footer Stats 均无需纵向滚动即可完整展示。
 
-## Focused findings
+## 数据真实性
 
-1. **Sidebar and object header — passed.** Sidebar remains within the 270–300 pt target. The object icon, title, type, status badges, metadata, and right-aligned actions use stable slots across all three connection types.
-2. **Metrics overview — passed.** Five equal KPI cards maintain a fixed height. Primary values are visually dominant; auxiliary text appears only when backed by real records.
-3. **Trend area — passed.** Token uses an area chart, requests use bars, and latency uses a line. Metric and time-range controls keep fixed dimensions. The chart and health panel align vertically and the current-day series stops at the actual current time.
-4. **Connection health — passed.** The side panel uses only real connection, subscription, balance, expiry, provider, latency, model, check, and activity data. Missing values are hidden rather than mocked.
-5. **Mode consistency — passed.** Account, hosted key, and custom API screenshots show the same page hierarchy and no first-screen overflow, clipping, or duplicated status blocks.
+- KPI、Sparkline、主图、Tooltip 与 Footer 使用同一批 Codex 活动与 Token 记录。
+- 月范围按本月 1 日开始，不再错误取“最近 30/31 天”。
+- 今日曲线只绘制到当前时间；24:00 仅作为时间轴终点，不制造未来数据。
+- 环比采用昨日同期、上一个 7 日、上月同期；上一周期为零或缺失时不显示百分比。
+- 缺少余额、到期、延迟或订阅数据时直接隐藏对应字段，不在生产界面 Mock。
 
-## Intentional data-driven differences from the visual reference
+## 最终结论
 
-- Sparkline deltas and period comparisons are omitted when the project has no verified comparison value.
-- The account shown has one saved profile, so the sidebar does not fabricate the additional profiles visible in the reference.
-- Health state and recent activity reflect the current local records, including warnings, rather than the reference image's example state.
-
-## Final result
-
-Passed. No P0, P1, or P2 visual/layout blockers remain in the three verified modes.
+通过。当前实现与目标稿使用同一页面比例、组件层级和交互结构；未发现 P0、P1 或 P2 级布局、溢出、对齐、重复状态或数据伪造问题。

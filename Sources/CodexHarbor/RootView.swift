@@ -215,8 +215,178 @@ private struct HarborMetricSummary: Identifiable {
     let detail: String?
     let icon: String
     let color: Color
+    let sparkline: [Int]
+    let delta: HarborMetricDelta?
 
     var id: String { title }
+}
+
+private struct HarborMetricDelta {
+    let text: String
+    let color: Color
+}
+
+private struct HarborHeroMetadata: Identifiable {
+    let label: String
+    let value: String
+    let icon: String
+    let color: Color
+
+    var id: String { "\(label)-\(value)" }
+}
+
+private struct HarborTrendFooterItem: Identifiable {
+    let title: String
+    let value: String
+    let color: Color
+
+    var id: String { title }
+}
+
+private struct HarborMetricBuckets {
+    let requests: [Int]
+    let tokens: [Int]
+    let latency: [Int]
+    let success: [Int]
+    let workDuration: [Int]
+}
+
+private struct HarborComparisonPeriod {
+    let currentStart: Date
+    let currentEnd: Date
+    let previousStart: Date
+    let previousEnd: Date
+}
+
+private struct HarborActivityGroup: Identifiable {
+    let event: ConnectionActivityEvent
+    let count: Int
+
+    var id: UUID { event.id }
+}
+
+private struct HarborMiniSparkline: View {
+    let values: [Int]
+    let color: Color
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var reveal = false
+
+    var body: some View {
+        GeometryReader { proxy in
+            let points = sparklinePoints(size: proxy.size)
+            ZStack {
+                Path { path in
+                    path.move(to: CGPoint(x: 0, y: proxy.size.height - 3))
+                    path.addLine(to: CGPoint(x: proxy.size.width, y: proxy.size.height - 3))
+                }
+                .stroke(color.opacity(0.10), lineWidth: 1)
+
+                if points.count > 1 {
+                    Path { path in
+                        guard let first = points.first else { return }
+                        path.move(to: first)
+                        for point in points.dropFirst() { path.addLine(to: point) }
+                    }
+                    .trim(from: 0, to: reveal || reduceMotion ? 1 : 0)
+                    .stroke(color.opacity(0.92), style: StrokeStyle(lineWidth: 1.7, lineCap: .round, lineJoin: .round))
+                } else if let point = points.first {
+                    Circle()
+                        .fill(color)
+                        .frame(width: 5, height: 5)
+                        .position(point)
+                }
+            }
+        }
+        .frame(width: 56, height: 24)
+        .allowsHitTesting(false)
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.easeOut(duration: 0.34)) { reveal = true }
+        }
+        .onChange(of: values) { _, _ in
+            guard !reduceMotion else { return }
+            reveal = false
+            withAnimation(.easeOut(duration: 0.28)) { reveal = true }
+        }
+    }
+
+    private func sparklinePoints(size: CGSize) -> [CGPoint] {
+        guard !values.isEmpty else { return [] }
+        let maximum = max(1, values.max() ?? 0)
+        return values.enumerated().map { index, value in
+            CGPoint(
+                x: values.count == 1 ? size.width - 3 : CGFloat(index) / CGFloat(values.count - 1) * size.width,
+                y: size.height - 3 - CGFloat(value) / CGFloat(maximum) * max(1, size.height - 7)
+            )
+        }
+    }
+}
+
+private struct HarborSegmentPressStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.975 : 1)
+            .brightness(configuration.isPressed ? -0.025 : 0)
+            .animation(reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+private struct HarborSegmentButton: View {
+    let title: String
+    let icon: String?
+    let selected: Bool
+    let tint: Color
+    let width: CGFloat
+    let height: CGFloat
+    let radius: CGFloat
+    let helpText: String
+    let action: () -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var hovered = false
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                if let icon {
+                    Image(systemName: icon)
+                        .font(.system(size: 10, weight: .semibold))
+                }
+                Text(title)
+            }
+            .font(.system(size: 10.5, weight: .semibold))
+            .foregroundStyle(selected ? tint : .secondary)
+            .frame(width: width, height: height)
+            .contentShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .background(
+                selected
+                    ? tint.opacity(0.13)
+                    : (hovered ? tint.opacity(0.065) : Color.clear),
+                in: RoundedRectangle(cornerRadius: radius, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .stroke(
+                        focused ? tint.opacity(0.48) : (selected ? tint.opacity(0.25) : Color.clear),
+                        lineWidth: focused ? 1.5 : 1
+                    )
+            )
+        }
+        .buttonStyle(HarborSegmentPressStyle())
+        .focused($focused)
+        .contentShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+        .onHover { value in
+            withAnimation(reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.13)) {
+                hovered = value
+            }
+        }
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .help(helpText)
+    }
 }
 
 private struct HarborHealthRow: Identifiable {
@@ -339,6 +509,8 @@ private struct HarborTrendSeries: Identifiable {
     let title: String
     let values: [Int]
     let requestCounts: [Int]
+    let latencyValues: [Int]
+    let successRates: [Int]
     let color: Color
     let dash: [CGFloat]
 }
@@ -348,6 +520,8 @@ private struct HarborTrendChart: View {
     let labels: [String]
     let metric: TrendMetric
     let accent: Color
+    let selectedSeriesID: String?
+    let focusedSeriesID: String?
     /// Position of the real current time within a full-day chart. Keeping the
     /// 24-hour axis makes gaps visible while the curve still ends at the
     /// actual current time.
@@ -398,125 +572,139 @@ private struct HarborTrendChart: View {
 
                 ForEach(Array(allPoints.enumerated()), id: \.element.series.id) { seriesIndex, item in
                     let points = item.points
+                    let emphasis = seriesEmphasis(for: item.series.id, seriesCount: normalizedSeries.count)
                     let positivePointIndices = points.indices.filter {
                         visibleIndices.indices.contains($0)
                             && item.series.values[visibleIndices[$0]] > 0
                     }
-                    if points.count > 1 {
-                        if metric == .requests {
-                            let groupWidth = min(28, max(8, plotWidth / CGFloat(max(visibleIndices.count, 1)) * 0.68))
-                            let spacing = normalizedSeries.count > 1 ? CGFloat(2) : 0
-                            let barWidth = max(2, (groupWidth - spacing * CGFloat(max(0, normalizedSeries.count - 1))) / CGFloat(max(1, normalizedSeries.count)))
-                            let groupOffset = (CGFloat(seriesIndex) - CGFloat(normalizedSeries.count - 1) / 2) * (barWidth + spacing)
-                            ForEach(Array(points.enumerated()), id: \.offset) { pointIndex, point in
-                                if visibleIndices.indices.contains(pointIndex),
-                                   item.series.values[visibleIndices[pointIndex]] > 0 {
-                                    let baseY = plotHeight - 8
-                                    let barHeight = max(2, baseY - point.y)
-                                    RoundedRectangle(cornerRadius: min(4, barWidth / 2), style: .continuous)
-                                        .fill(item.series.color.opacity(seriesIndex == 0 ? 0.86 : 0.66))
-                                        .frame(width: barWidth, height: barHeight)
-                                        .position(x: point.x + groupOffset, y: baseY - barHeight / 2)
+                    Group {
+                        if points.count > 1 {
+                            if metric == .requests {
+                                let groupWidth = min(28, max(8, plotWidth / CGFloat(max(visibleIndices.count, 1)) * 0.68))
+                                let spacing = normalizedSeries.count > 1 ? CGFloat(2) : 0
+                                let barWidth = max(2, (groupWidth - spacing * CGFloat(max(0, normalizedSeries.count - 1))) / CGFloat(max(1, normalizedSeries.count)))
+                                let groupOffset = (CGFloat(seriesIndex) - CGFloat(normalizedSeries.count - 1) / 2) * (barWidth + spacing)
+                                ForEach(Array(points.enumerated()), id: \.offset) { pointIndex, point in
+                                    if visibleIndices.indices.contains(pointIndex),
+                                       item.series.values[visibleIndices[pointIndex]] > 0 {
+                                        let baseY = plotHeight - 8
+                                        let barHeight = max(2, baseY - point.y)
+                                        RoundedRectangle(cornerRadius: min(4, barWidth / 2), style: .continuous)
+                                            .fill(item.series.color.opacity(emphasis.opacity))
+                                            .frame(width: barWidth, height: barHeight)
+                                            .shadow(
+                                                color: emphasis.isPrimary ? item.series.color.opacity(0.14) : .clear,
+                                                radius: 3,
+                                                y: 1
+                                            )
+                                            .position(x: point.x + groupOffset, y: baseY - barHeight / 2)
+                                            .allowsHitTesting(false)
+                                    }
+                                }
+                            } else {
+                                if metric == .token,
+                                   normalizedSeries.count == 1 || item.series.id == selectedSeriesID {
+                                    Path { path in
+                                        path.move(to: CGPoint(x: points[0].x, y: plotHeight))
+                                        path.addLine(to: points[0])
+                                        appendSmoothCurveSegments(to: &path, points: points)
+                                        path.addLine(to: CGPoint(x: points[points.count - 1].x, y: plotHeight))
+                                        path.closeSubpath()
+                                    }
+                                    .fill(
+                                        LinearGradient(
+                                            stops: [
+                                                .init(color: item.series.color.opacity(normalizedSeries.count == 1 ? 0.24 : 0.16), location: 0),
+                                                .init(color: item.series.color.opacity(normalizedSeries.count == 1 ? 0.075 : 0.045), location: 0.55),
+                                                .init(color: item.series.color.opacity(0.008), location: 1)
+                                            ],
+                                            startPoint: .top,
+                                            endPoint: .bottom
+                                        )
+                                    )
+                                    .opacity(reveal || reduceMotion ? 1 : 0)
+                                }
+
+                                Path { path in
+                                    appendSmoothCurve(to: &path, points: points)
+                                }
+                                .trim(from: 0, to: reveal || reduceMotion ? 1 : 0)
+                                .stroke(
+                                    item.series.color.opacity(emphasis.isPrimary ? 0.14 : 0.06),
+                                    style: StrokeStyle(
+                                        lineWidth: emphasis.isPrimary ? 8 : 5,
+                                        lineCap: .round,
+                                        lineJoin: .round,
+                                        dash: item.series.dash
+                                    )
+                                )
+                                .blur(radius: 5)
+
+                                Path { path in
+                                    appendSmoothCurve(to: &path, points: points)
+                                }
+                                .trim(from: 0, to: reveal || reduceMotion ? 1 : 0)
+                                .stroke(
+                                    item.series.color.opacity(emphasis.opacity),
+                                    style: StrokeStyle(
+                                        lineWidth: emphasis.lineWidth,
+                                        lineCap: .round,
+                                        lineJoin: .round,
+                                        dash: item.series.dash
+                                    )
+                                )
+
+                                if let endpoint = points.last {
+                                    Circle()
+                                        .fill(item.series.color.opacity(emphasis.isPrimary ? 0.13 : 0.055))
+                                        .frame(
+                                            width: emphasis.isPrimary ? 18 : 12,
+                                            height: emphasis.isPrimary ? 18 : 12
+                                        )
+                                        .position(endpoint)
+                                        .allowsHitTesting(false)
+                                    Circle()
+                                        .fill(Color(nsColor: .windowBackgroundColor))
+                                        .frame(
+                                            width: emphasis.isPrimary ? 9 : 6,
+                                            height: emphasis.isPrimary ? 9 : 6
+                                        )
+                                        .overlay(
+                                            Circle().stroke(
+                                                item.series.color.opacity(emphasis.opacity),
+                                                lineWidth: emphasis.isPrimary ? 2.3 : 1.5
+                                            )
+                                        )
+                                        .shadow(
+                                            color: emphasis.isPrimary ? item.series.color.opacity(0.22) : .clear,
+                                            radius: 4,
+                                            y: 1
+                                        )
+                                        .position(endpoint)
+                                        .allowsHitTesting(false)
+                                }
+                                if metric == .token,
+                                   emphasis.isPrimary,
+                                   let peakIndex = positivePointIndices.max(by: {
+                                       item.series.values[visibleIndices[$0]] < item.series.values[visibleIndices[$1]]
+                                   }) {
+                                    Circle()
+                                        .fill(Color(nsColor: .windowBackgroundColor))
+                                        .frame(width: 8, height: 8)
+                                        .overlay(Circle().stroke(item.series.color, lineWidth: 2))
+                                        .position(points[peakIndex])
                                         .allowsHitTesting(false)
                                 }
                             }
-                        } else if positivePointIndices.count <= 1 {
-                            if let pointIndex = positivePointIndices.first {
-                                Circle()
-                                    .fill(Color(nsColor: .windowBackgroundColor))
-                                    .frame(width: 9, height: 9)
-                                    .overlay(Circle().stroke(item.series.color, lineWidth: 2.5))
-                                    .shadow(color: item.series.color.opacity(0.24), radius: 4, y: 2)
-                                    .position(points[pointIndex])
-                                    .allowsHitTesting(false)
-                            }
-                        } else {
-                        if normalizedSeries.count == 1, metric == .token {
-                            Path { path in
-                                path.move(to: CGPoint(x: points[0].x, y: plotHeight))
-                                path.addLine(to: points[0])
-                                appendSmoothCurveSegments(to: &path, points: points)
-                                path.addLine(to: CGPoint(x: points[points.count - 1].x, y: plotHeight))
-                                path.closeSubpath()
-                            }
-                            .fill(
-                                LinearGradient(
-                                    stops: [
-                                        .init(color: item.series.color.opacity(0.24), location: 0),
-                                        .init(color: item.series.color.opacity(0.075), location: 0.55),
-                                        .init(color: item.series.color.opacity(0.008), location: 1)
-                                    ],
-                                    startPoint: .top,
-                                    endPoint: .bottom
-                                )
-                            )
-                            .opacity(reveal || reduceMotion ? 1 : 0)
-                        }
-
-                        Path { path in
-                            appendSmoothCurve(to: &path, points: points)
-                        }
-                        .trim(from: 0, to: reveal || reduceMotion ? 1 : 0)
-                        .stroke(item.series.color.opacity(0.16), style: StrokeStyle(lineWidth: 8, lineCap: .round, lineJoin: .round, dash: item.series.dash))
-                        .blur(radius: 5)
-
-                        Path { path in
-                            appendSmoothCurve(to: &path, points: points)
-                        }
-                        .trim(from: 0, to: reveal || reduceMotion ? 1 : 0)
-                        .stroke(
-                            item.series.color.opacity(0.90),
-                            style: StrokeStyle(lineWidth: normalizedSeries.count == 1 ? 2.6 : 2.25, lineCap: .round, lineJoin: .round, dash: item.series.dash)
-                        )
-
-                        if let endpoint = points.last {
+                        } else if let point = points.first {
                             Circle()
-                                .fill(item.series.color.opacity(0.12))
-                                .frame(width: normalizedSeries.count == 1 ? 20 : 15, height: normalizedSeries.count == 1 ? 20 : 15)
-                                .position(endpoint)
-                                .allowsHitTesting(false)
-                            Circle()
-                                .fill(Color(nsColor: .windowBackgroundColor))
-                                .frame(width: 8, height: 8)
-                                .overlay(Circle().stroke(item.series.color, lineWidth: 2))
-                                .shadow(color: item.series.color.opacity(0.26), radius: 4)
-                                .position(endpoint)
-                                .allowsHitTesting(false)
-
-                            if normalizedSeries.count > 1 {
-                                Text(item.series.title)
-                                    .font(.system(size: 9, weight: .semibold))
-                                    .foregroundStyle(item.series.color)
-                                    .lineLimit(1)
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 2)
-                                    .background(.regularMaterial, in: Capsule())
-                                    .position(
-                                        x: min(max(endpoint.x + 22, 32), max(32, width - 32)),
-                                        y: min(max(endpoint.y - 10, 12), max(12, plotHeight - 8))
-                                    )
-                                    .allowsHitTesting(false)
-                            }
-                        }
-                        if metric == .token,
-                           let peakIndex = positivePointIndices.max(by: {
-                               item.series.values[visibleIndices[$0]] < item.series.values[visibleIndices[$1]]
-                           }) {
-                            Circle()
-                                .fill(Color(nsColor: .windowBackgroundColor))
-                                .frame(width: 8, height: 8)
-                                .overlay(Circle().stroke(item.series.color, lineWidth: 2))
-                                .position(points[peakIndex])
+                                .fill(item.series.color.opacity(emphasis.opacity))
+                                .frame(width: emphasis.isPrimary ? 7 : 5, height: emphasis.isPrimary ? 7 : 5)
+                                .position(point)
                                 .allowsHitTesting(false)
                         }
-                        }
-                    } else if let point = points.first {
-                        Circle()
-                            .fill(item.series.color)
-                            .frame(width: 6, height: 6)
-                            .position(point)
-                            .allowsHitTesting(false)
                     }
+                    .zIndex(emphasis.zIndex)
                 }
 
                 if let hoveredIndex,
@@ -524,20 +712,29 @@ private struct HarborTrendChart: View {
                     let sourceIndex = visibleIndices[hoveredIndex]
                     ForEach(allPoints, id: \.series.id) { item in
                         if item.points.indices.contains(hoveredIndex) {
+                            let emphasis = seriesEmphasis(for: item.series.id, seriesCount: normalizedSeries.count)
                             Circle()
                                 .fill(Color(nsColor: .windowBackgroundColor))
-                                .frame(width: 9, height: 9)
-                                .overlay(Circle().stroke(item.series.color, lineWidth: 2))
+                                .frame(
+                                    width: emphasis.isPrimary ? 10 : 7,
+                                    height: emphasis.isPrimary ? 10 : 7
+                                )
+                                .overlay(
+                                    Circle().stroke(
+                                        item.series.color.opacity(emphasis.opacity),
+                                        lineWidth: emphasis.isPrimary ? 2.4 : 1.5
+                                    )
+                                )
                                 .position(item.points[hoveredIndex])
                                 .allowsHitTesting(false)
-                                .zIndex(2)
+                                .zIndex(emphasis.zIndex + 2)
                         }
                     }
 
                     tooltipView(index: sourceIndex, series: normalizedSeries)
                         .position(
-                            x: min(max(hoverX ?? width / 2, 94), max(94, width - 94)),
-                            y: 24
+                            x: min(max(hoverX ?? width / 2, 106), max(106, width - 106)),
+                            y: normalizedSeries.count > 1 ? 48 : 64
                         )
                         .transition(.opacity.combined(with: .scale(scale: 0.94)))
                         .zIndex(2)
@@ -602,6 +799,19 @@ private struct HarborTrendChart: View {
         }
     }
 
+    private func seriesEmphasis(for id: String, seriesCount: Int) -> (opacity: Double, lineWidth: CGFloat, zIndex: Double, isPrimary: Bool) {
+        guard seriesCount > 1 else { return (0.90, 2.6, 1, true) }
+        if id == focusedSeriesID {
+            return (1, 3, 3, true)
+        }
+        if id == selectedSeriesID {
+            return focusedSeriesID == nil
+                ? (1, 2.85, 2, true)
+                : (0.72, 2.35, 2, true)
+        }
+        return (focusedSeriesID == nil ? 0.48 : 0.42, 1.7, 1, false)
+    }
+
     private var chartLength: Int {
         max(1, series.map { $0.values.count }.max() ?? max(1, labels.count))
     }
@@ -612,6 +822,8 @@ private struct HarborTrendChart: View {
             title: "暂无",
             values: Array(repeating: 0, count: length),
             requestCounts: Array(repeating: 0, count: length),
+            latencyValues: Array(repeating: 0, count: length),
+            successRates: Array(repeating: 0, count: length),
             color: accent,
             dash: []
         )
@@ -622,6 +834,8 @@ private struct HarborTrendChart: View {
                 title: item.title,
                 values: padded(item.values, length: length),
                 requestCounts: padded(item.requestCounts, length: length),
+                latencyValues: padded(item.latencyValues, length: length),
+                successRates: padded(item.successRates, length: length),
                 color: item.color,
                 dash: item.dash
             )
@@ -743,13 +957,37 @@ private struct HarborTrendChart: View {
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.secondary)
             }
+            if series.count == 1, let item = series.first {
+                let requests = item.requestCounts[safe: index] ?? 0
+                if requests > 0, metric != .requests {
+                    tooltipDetailRow("请求", value: "\(requests) 次")
+                }
+                if metric != .latency,
+                   let latency = item.latencyValues[safe: index], latency > 0 {
+                    tooltipDetailRow("平均响应", value: formatDuration(latency))
+                }
+                if requests > 0, let success = item.successRates[safe: index] {
+                    tooltipDetailRow("成功率", value: "\(success)%")
+                }
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
-        .frame(width: series.count > 1 ? 188 : 138, alignment: .leading)
+        .frame(width: series.count > 1 ? 202 : 170, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(accent.opacity(0.22)))
         .shadow(color: .black.opacity(0.12), radius: 4, y: 2)
+    }
+
+    private func tooltipDetailRow(_ title: String, value: String) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 6)
+            Text(value)
+                .foregroundStyle(.primary)
+        }
+        .font(.system(size: 9.5, weight: .medium))
     }
 
     private func metricValueText(value: Int, requests: Int) -> String {
@@ -759,7 +997,7 @@ private struct HarborTrendChart: View {
         case .requests: valueText = "请求 \(value) 次"
         case .latency: valueText = "平均响应 \(formatDuration(value))"
         }
-        return metric == .requests ? valueText : "\(valueText) · \(requests) 次"
+        return valueText
     }
 
     private func formatDuration(_ milliseconds: Int) -> String {
@@ -867,16 +1105,17 @@ private struct BreathingStatusDot: View {
             Circle()
                 .fill(color.opacity(0.16))
                 .frame(width: 20, height: 20)
-                .scaleEffect(active && isBreathing ? 1.22 : 0.76)
-                .opacity(active ? (isBreathing ? 0.95 : 0.30) : 0)
+                .scaleEffect(active && isBreathing ? 1.18 : 0.84)
+                .opacity(active ? (isBreathing ? 0.55 : 0.22) : 0)
             Circle()
                 .fill(color)
                 .frame(width: 8, height: 8)
+                .opacity(active && isBreathing ? 0.72 : 1)
         }
         .frame(width: 20, height: 20)
         .onAppear {
             guard active, !reduceMotion else { return }
-            withAnimation(.easeInOut(duration: 1.7).repeatForever(autoreverses: true)) {
+            withAnimation(.easeInOut(duration: 2.1).repeatForever(autoreverses: true)) {
                 isBreathing = true
             }
         }
@@ -885,7 +1124,7 @@ private struct BreathingStatusDot: View {
                 isBreathing = false
                 return
             }
-            withAnimation(.easeInOut(duration: 1.7).repeatForever(autoreverses: true)) {
+            withAnimation(.easeInOut(duration: 2.1).repeatForever(autoreverses: true)) {
                 isBreathing = true
             }
         }
@@ -944,6 +1183,7 @@ struct RootView: View {
     @State private var hoveredDetailKey: String?
     @State private var hoveredMode: CodexConnectionKind?
     @State private var hoveredProfileID: UUID?
+    @State private var hoveredTrendSeriesID: String?
     @State private var trendRange: TrendRange = .today
     @State private var trendMetric: TrendMetric = .token
 
@@ -1074,7 +1314,9 @@ struct RootView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
         }
-        .frame(minWidth: 900, minHeight: 620, alignment: .top)
+        // Keep a sensible minimum for the macOS window, while allowing the
+        // content rows below to negotiate the remaining height naturally.
+        .frame(minWidth: 900, minHeight: 560, alignment: .top)
     }
 
     private var sidebarPanel: some View {
@@ -1088,7 +1330,7 @@ struct RootView: View {
             profileLibrary
             sidebarUsageSummary
         }
-        .frame(maxHeight: .infinity, alignment: .top)
+        .frame(minHeight: 0, maxHeight: .infinity, alignment: .top)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.52))
     }
 
@@ -1111,7 +1353,7 @@ struct RootView: View {
         }
         .padding(.horizontal, 20)
         .padding(.top, 34)
-        .frame(height: 118)
+        .frame(minHeight: 96, idealHeight: 104)
     }
 
     private var workspaceToolbar: some View {
@@ -1124,52 +1366,27 @@ struct RootView: View {
         }
         .padding(.horizontal, 20)
         .padding(.top, 34)
-        .frame(height: 78)
+        .frame(minHeight: 58, idealHeight: 66)
     }
 
     private var globalConnectionMenu: some View {
-        Menu {
-                Button {
-                    Task {
-                        await model.refreshEnvironment()
-                        await model.refreshConnectionHealth()
-                    }
-                } label: {
-                    Label("检查所有连接", systemImage: "checkmark.shield")
-                }
-                if model.environment.deploymentExists {
-                    Divider()
-                    Button(role: .destructive) {
-                        Task { await model.uninstall() }
-                    } label: {
-                        Label("安全卸载配置", systemImage: "arrow.uturn.backward")
-                    }
-                }
-                Divider()
-                Toggle("到期与余额提醒", isOn: Binding(
-                    get: { model.notificationsEnabled },
-                    set: { enabled in Task { await model.setNotificationsEnabled(enabled) } }
-                ))
-        } label: {
-            HStack(spacing: 7) {
-                BreathingStatusDot(
-                    color: effectiveMode == nil ? .secondary : .green,
-                    active: effectiveMode != nil
-                )
-                Text(effectiveMode == nil ? "未连接" : "已连接")
-                    .font(.caption.weight(.semibold))
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 11)
-            .frame(height: 30)
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.72), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.primary.opacity(0.08)))
+        let isConnected = effectiveMode != nil
+        return HStack(spacing: 7) {
+            BreathingStatusDot(
+                color: isConnected ? .green : .secondary,
+                active: isConnected
+            )
+            Text(isConnected ? "已连接" : "未连接")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(isConnected ? Color.green : Color.secondary)
         }
-        .menuStyle(.borderlessButton)
+        .padding(.horizontal, 11)
+        .frame(height: 30)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.72), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.primary.opacity(0.08)))
         .fixedSize()
-        .help("连接与配置操作")
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(isConnected ? "已连接" : "未连接")
     }
 
     private var modeBar: some View {
@@ -1207,7 +1424,7 @@ struct RootView: View {
             sidebarGlobalRow("已连接时长", value: activeConnectionDurationText(now: now), color: .primary)
         }
         .padding(11)
-        .frame(height: 134, alignment: .topLeading)
+        .frame(minHeight: 118, idealHeight: 126, alignment: .topLeading)
         .background(Color(nsColor: .textBackgroundColor).opacity(0.84), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(Color.primary.opacity(0.08)))
         .padding(12)
@@ -1885,10 +2102,10 @@ struct RootView: View {
                 .padding(10)
             }
             .scrollIndicators(.automatic)
-            .frame(maxHeight: .infinity)
+            .frame(minHeight: 0, maxHeight: .infinity)
 
         }
-        .frame(maxHeight: .infinity, alignment: .top)
+        .frame(minHeight: 0, maxHeight: .infinity, alignment: .top)
         .background(Color.clear)
     }
 
@@ -2175,21 +2392,13 @@ struct RootView: View {
         return VStack(alignment: .leading, spacing: 12) {
             connectionHero(
                 title: profile.name,
-                subtitle: profile.method.title,
+                subtitle: "\(profile.method.title) · 最近使用 \(relativeTime(profile.lastUsedAt))",
                 titleBadge: profile.subscriptionPlanTitle,
                 icon: "person.crop.circle.fill",
                 color: .blue,
                 health: health,
                 isActive: isActive,
-                inlineStatus: [
-                    profile.subscriptionExpiryDate().map { "到期 \(accountSubscriptionDateText($0))" },
-                    "最近使用 \(relativeTime(profile.lastUsedAt))"
-                ]
-                    .compactMap { $0 }
-                    .joined(separator: " · "),
-                inlineStatusColor: subscription?.color ?? .secondary,
-                inlineStatusIcon: subscription?.icon ?? "clock",
-                inlineStatusPulses: subscription?.pulses ?? false,
+                metadata: accountHeroMetadata(profile: profile, diagnostic: diagnostic, subscription: subscription),
                 checkAction: {
                     Task {
                         await model.refreshEnvironment()
@@ -2215,8 +2424,6 @@ struct RootView: View {
                     since: rangeStart
                 ),
                 health: health,
-                isActive: isActive,
-                diagnostic: diagnostic,
                 rows: accountHealthRows(profile: profile, health: health, isActive: isActive, diagnostic: diagnostic),
                 accent: .blue
             )
@@ -2233,9 +2440,10 @@ struct RootView: View {
         let isActive = effectiveConnectionKind == profile.kind.connectionKind && model.activeProfileID == profile.id
         let now = Date()
         let rangeStart = trendStartDate(now: now)
+        let metricsProfileID = profile.kind == .customResponses ? profile.id : nil
         let metrics = model.codexRequestMetrics(
             for: profile.kind.connectionKind,
-            profileID: nil,
+            profileID: metricsProfileID,
             since: rangeStart,
             now: now
         )
@@ -2248,15 +2456,9 @@ struct RootView: View {
                 health: health,
                 providerIdentity: profile.kind == .customResponses ? identity : nil,
                 isActive: isActive,
-                usage: profile.kind == .harbor ? (model.usageByProfileID[profile.id] ?? (isActive ? model.usage : nil)) : nil,
-                usageExpiry: profile.kind == .harbor ? displayExpiry(model.usageByProfileID[profile.id]?.expiresAt ?? profile.expiresAt) : nil,
-                inlineStatus: profile.kind == .customResponses
-                    ? [identity.host, identity.protocolTitle, diagnostic?.latencyMilliseconds.map { "延迟 \(durationText($0))" }]
-                        .compactMap { $0 }
-                        .joined(separator: " · ")
-                    : nil,
-                inlineStatusColor: .secondary,
-                inlineStatusIcon: "network",
+                metadata: profile.kind == .harbor
+                    ? hostedHeroMetadata(profile: profile, isActive: isActive)
+                    : apiHeroMetadata(identity: identity, diagnostic: diagnostic),
                 usageQueryAction: profile.kind == .harbor ? {
                     queryingUsageProfileID = profile.id
                     Task {
@@ -2284,12 +2486,10 @@ struct RootView: View {
                 metrics: metrics,
                 workDuration: model.codexWorkDurationMilliseconds(
                     for: detailKind,
-                    profileID: nil,
+                    profileID: metricsProfileID,
                     since: rangeStart
                 ),
                 health: health,
-                isActive: isActive,
-                diagnostic: diagnostic,
                 rows: apiHealthRows(
                     profile: profile,
                     identity: identity,
@@ -2314,12 +2514,7 @@ struct RootView: View {
         health: ConnectionHealth,
         providerIdentity: ProviderIdentity? = nil,
         isActive: Bool,
-        usage: UsageSnapshot? = nil,
-        usageExpiry: String? = nil,
-        inlineStatus: String? = nil,
-        inlineStatusColor: Color = .green,
-        inlineStatusIcon: String = "calendar.badge.checkmark",
-        inlineStatusPulses: Bool = false,
+        metadata: [HarborHeroMetadata] = [],
         usageQueryAction: (() -> Void)? = nil,
         isQueryingUsage: Bool = false,
         checkAction: @escaping () -> Void,
@@ -2359,26 +2554,30 @@ struct RootView: View {
                     HStack(spacing: 7) {
                         connectionActiveBadge(isActive: isActive)
                         connectionHeroMeta(isActive: isActive, health: health)
-                        if usage != nil || usageExpiry != nil {
-                            hostedInlineUsage(usage: usage, expiry: usageExpiry)
-                        } else if let inlineStatus {
-                            HStack(spacing: 5) {
-                                if inlineStatusPulses {
-                                    BreathingStatusDot(color: inlineStatusColor, active: true)
-                                        .frame(width: 12, height: 12)
-                                } else {
-                                    Image(systemName: inlineStatusIcon)
-                                        .foregroundStyle(inlineStatusColor)
-                                }
-                                Text(inlineStatus)
-                                    .foregroundStyle(inlineStatusColor)
+                    }
+                    .frame(height: 24)
+                    HStack(spacing: 8) {
+                        ForEach(Array(metadata.enumerated()), id: \.offset) { index, item in
+                            if index > 0 {
+                                Rectangle()
+                                    .fill(Color.primary.opacity(0.09))
+                                    .frame(width: 1, height: 11)
                             }
-                            .font(.system(size: 10, weight: .medium))
+                            HStack(spacing: 4) {
+                                Image(systemName: item.icon)
+                                    .font(.system(size: 9, weight: .semibold))
+                                Text(item.label)
+                                    .foregroundStyle(.secondary)
+                                Text(item.value)
+                                    .fontWeight(.semibold)
+                                    .foregroundStyle(item.color)
+                            }
+                            .font(.system(size: 9.5, weight: .medium))
                             .lineLimit(1)
-                            .minimumScaleFactor(0.72)
-                            .help(inlineStatusPulses ? "ChatGPT 订阅到期时间" : inlineStatus)
+                            .minimumScaleFactor(0.74)
                         }
                     }
+                    .frame(height: 15, alignment: .leading)
                 }
                 .layoutPriority(1)
             }
@@ -2432,7 +2631,9 @@ struct RootView: View {
             .layoutPriority(2)
         }
         .padding(.horizontal, 14)
-        .frame(minHeight: 108, maxHeight: 108)
+        // Keep the three modes on one stable visual baseline, while allowing
+        // the header to breathe when a narrow window needs an extra line.
+        .frame(minHeight: 112, idealHeight: 120, alignment: .center)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.34), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
@@ -2474,21 +2675,60 @@ struct RootView: View {
         return false
     }
 
-    private func hostedInlineUsage(usage: UsageSnapshot?, expiry: String?) -> some View {
-        HStack(spacing: 7) {
-            Text("已用 " + formatCurrency(usage?.used))
-                .foregroundStyle(.orange)
-            Text("余 " + formatCurrency(usage?.remaining))
-                .foregroundStyle(.green)
-            Text("至 " + (expiry ?? "—"))
-                .foregroundStyle(.blue)
-                .fontDesign(.monospaced)
-                .lineLimit(1)
-                .minimumScaleFactor(0.62)
+    private func accountHeroMetadata(
+        profile: CodexAccountProfile,
+        diagnostic: ConnectionDiagnostic?,
+        subscription: (text: String, color: Color, icon: String, pulses: Bool)?
+    ) -> [HarborHeroMetadata] {
+        var items: [HarborHeroMetadata] = []
+        if let expiry = profile.subscriptionExpiryDate() {
+            items.append(
+                HarborHeroMetadata(
+                    label: "Plus 到期",
+                    value: accountSubscriptionDateText(expiry),
+                    icon: subscription?.icon ?? "calendar.badge.checkmark",
+                    color: subscription?.color ?? .secondary
+                )
+            )
         }
-        .font(.system(size: 10, weight: .semibold))
-        .lineLimit(1)
-        .help("托管用量与有效期")
+        if let checkedAt = diagnostic?.checkedAt {
+            items.append(
+                HarborHeroMetadata(
+                    label: "最近检查",
+                    value: relativeTime(checkedAt),
+                    icon: "clock",
+                    color: .secondary
+                )
+            )
+        }
+        return items
+    }
+
+    private func hostedHeroMetadata(profile: HarborProfile, isActive: Bool) -> [HarborHeroMetadata] {
+        let usage = model.usageByProfileID[profile.id] ?? (isActive ? model.usage : nil)
+        var items: [HarborHeroMetadata] = []
+        if let used = usage?.used {
+            items.append(HarborHeroMetadata(label: "已用", value: formatCurrency(used), icon: "chart.bar.fill", color: .orange))
+        }
+        if let remaining = usage?.remaining {
+            items.append(HarborHeroMetadata(label: "余额", value: formatCurrency(remaining), icon: "creditcard.fill", color: remaining > 0 ? .green : .orange))
+        }
+        if let rawExpiry = usage?.expiresAt ?? profile.expiresAt, !rawExpiry.isEmpty {
+            items.append(HarborHeroMetadata(label: "到期", value: displayExpiry(rawExpiry), icon: "calendar", color: .blue))
+        }
+        return items
+    }
+
+    private func apiHeroMetadata(identity: ProviderIdentity, diagnostic: ConnectionDiagnostic?) -> [HarborHeroMetadata] {
+        var items = [
+            HarborHeroMetadata(label: "Host", value: identity.host, icon: "network", color: .secondary),
+            HarborHeroMetadata(label: "协议", value: identity.protocolTitle, icon: "arrow.left.arrow.right", color: .secondary),
+            HarborHeroMetadata(label: "路由", value: "Relay", icon: "point.3.connected.trianglepath.dotted", color: .blue)
+        ]
+        if let latency = diagnostic?.latencyMilliseconds {
+            items.append(HarborHeroMetadata(label: "延迟", value: durationText(latency), icon: "speedometer", color: latencyColor(latency)))
+        }
+        return items
     }
 
     private func analyticsMetricsStrip(_ rows: [HarborMetricSummary]) -> some View {
@@ -2501,7 +2741,7 @@ struct RootView: View {
 
     private func analyticsMetric(_ row: HarborMetricSummary) -> some View {
         let isHovered = hoveredDetailKey == row.id
-        return VStack(alignment: .leading, spacing: 5) {
+        return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Image(systemName: row.icon)
                     .font(.system(size: 11, weight: .semibold))
@@ -2514,23 +2754,37 @@ struct RootView: View {
                     .lineLimit(1)
             }
             Text(row.value)
-                .font(.system(size: 19, weight: .semibold, design: .rounded))
+                .font(.system(size: 20, weight: .semibold, design: .rounded))
                 .foregroundStyle(isHovered ? row.color : Color.primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .minimumScaleFactor(0.72)
                 .textSelection(.enabled)
-            if let detail = row.detail {
-                Text(detail)
-                    .font(.system(size: 9.5, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
+            HStack(alignment: .bottom, spacing: 6) {
+                Group {
+                    if let delta = row.delta {
+                        Text(delta.text)
+                            .foregroundStyle(delta.color)
+                            .fontWeight(.semibold)
+                    } else if let detail = row.detail {
+                        Text(detail)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(" ")
+                    }
+                }
+                .font(.system(size: 9.5, weight: .medium))
+                .lineLimit(1)
+                .minimumScaleFactor(0.70)
+
+                Spacer(minLength: 2)
+                HarborMiniSparkline(values: row.sparkline, color: row.color)
             }
+            .frame(maxWidth: .infinity, minHeight: 24, alignment: .bottomLeading)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .frame(maxWidth: .infinity, minHeight: 92, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: 112, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(isHovered ? row.color.opacity(0.055) : Color(nsColor: .textBackgroundColor).opacity(0.88))
@@ -2568,25 +2822,47 @@ struct RootView: View {
 
     private func requestMetricsRow(
         kind: CodexConnectionKind,
+        profileID: UUID?,
         metrics: AppModel.CodexRequestMetrics,
         workDuration: Int?,
         accent: Color
     ) -> some View {
-        let rangeStart = trendStartDate()
+        let now = Date()
+        let period = comparisonPeriod(now: now)
+        let buckets = metricBuckets(kind: kind, profileID: profileID, now: now)
         let tokenSummary = model.codexTokenSummary(
             for: kind,
-            profileID: nil,
-            since: rangeStart
+            profileID: profileID,
+            since: period.currentStart,
+            until: period.currentEnd
         )
-        let requestLabel = trendRange == .today ? "今日请求" : "\(trendRange.rawValue)请求"
-        let durationLabel = trendRange == .today ? "今日工作时长" : "\(trendRange.rawValue)工作时长"
+        let previousMetrics = model.codexRequestMetrics(
+            for: kind,
+            profileID: profileID,
+            since: period.previousStart,
+            now: period.previousEnd
+        )
+        let previousTokens = model.codexTokenSummary(
+            for: kind,
+            profileID: profileID,
+            since: period.previousStart,
+            until: period.previousEnd
+        )
+        let previousWorkDuration = model.codexWorkDurationMilliseconds(
+            for: kind,
+            profileID: profileID,
+            since: period.previousStart,
+            until: period.previousEnd
+        )
         let rows: [HarborMetricSummary] = [
             HarborMetricSummary(
-                title: requestLabel,
+                title: "请求数",
                 value: "\(metrics.count)",
                 detail: metrics.count > 0 ? "\(metrics.successfulCount) 次成功" : nil,
                 icon: "arrow.up.right.circle.fill",
-                color: accent
+                color: accent,
+                sparkline: buckets.requests,
+                delta: proportionalDelta(current: metrics.count, previous: previousMetrics.count, lowerIsBetter: false)
             ),
             HarborMetricSummary(
                 title: "请求 Token",
@@ -2595,28 +2871,36 @@ struct RootView: View {
                     ? "输入 \(formatTokenCount(tokenSummary.inputTokens)) · 输出 \(formatTokenCount(tokenSummary.outputTokens))"
                     : nil,
                 icon: "number",
-                color: .purple
+                color: .purple,
+                sparkline: buckets.tokens,
+                delta: proportionalDelta(current: tokenSummary.totalTokens, previous: previousTokens.totalTokens, lowerIsBetter: false)
             ),
             HarborMetricSummary(
                 title: "平均响应",
                 value: durationText(metrics.averageDurationMilliseconds),
                 detail: metrics.p95DurationMilliseconds.map { "P95 \(durationText($0))" },
                 icon: "speedometer",
-                color: latencyColor(metrics.averageDurationMilliseconds ?? 0)
+                color: latencyColor(metrics.averageDurationMilliseconds ?? 0),
+                sparkline: buckets.latency,
+                delta: durationDelta(current: metrics.averageDurationMilliseconds, previous: previousMetrics.averageDurationMilliseconds)
             ),
             HarborMetricSummary(
                 title: "成功率",
                 value: percentText(metrics.successRate),
                 detail: metrics.count > 0 ? "成功 \(metrics.successfulCount) / \(metrics.count)" : nil,
                 icon: "checkmark.seal.fill",
-                color: successRateColor(metrics.successRate)
+                color: successRateColor(metrics.successRate),
+                sparkline: buckets.success,
+                delta: successRateDelta(current: metrics.successRate, previous: previousMetrics.successRate)
             ),
             HarborMetricSummary(
-                title: durationLabel,
+                title: "工作时长",
                 value: workDurationText(workDuration),
                 detail: workDuration == nil ? nil : "请求耗时累计",
                 icon: "clock.fill",
-                color: .blue
+                color: .blue,
+                sparkline: buckets.workDuration,
+                delta: optionalDurationDelta(current: workDuration, previous: previousWorkDuration)
             )
         ]
         return VStack(spacing: 9) {
@@ -2642,72 +2926,157 @@ struct RootView: View {
         )
     }
 
+    private func metricBuckets(kind: CodexConnectionKind, profileID: UUID?, now: Date) -> HarborMetricBuckets {
+        let calendar = Calendar.current
+        switch trendRange {
+        case .today:
+            let start = calendar.startOfDay(for: now)
+            let visibleHours = min(24, max(1, calendar.component(.hour, from: now) + 1))
+            return HarborMetricBuckets(
+                requests: Array(model.codexRequestHourlyCounts(for: kind, profileID: profileID, now: now, since: start).prefix(visibleHours)),
+                tokens: Array(model.codexTokenHourlyCounts(for: kind, profileID: profileID, now: now, since: start).prefix(visibleHours)),
+                latency: Array(model.codexResponseHourlyAverages(for: kind, profileID: profileID, now: now, since: start).prefix(visibleHours)),
+                success: Array(model.codexSuccessHourlyRates(for: kind, profileID: profileID, now: now, since: start).prefix(visibleHours)),
+                workDuration: Array(model.codexWorkDurationHourlyTotals(for: kind, profileID: profileID, now: now, since: start).prefix(visibleHours))
+            )
+        case .sevenDays:
+            return HarborMetricBuckets(
+                requests: model.codexRequestDailyCounts(for: kind, profileID: profileID, days: 7, now: now),
+                tokens: model.codexTokenDailyCounts(for: kind, profileID: profileID, days: 7, now: now),
+                latency: model.codexResponseDailyAverages(for: kind, profileID: profileID, days: 7, now: now),
+                success: model.codexSuccessDailyRates(for: kind, profileID: profileID, days: 7, now: now),
+                workDuration: model.codexWorkDurationDailyTotals(for: kind, profileID: profileID, days: 7, now: now)
+            )
+        case .month:
+            let elapsedDays = max(1, calendar.component(.day, from: now))
+            return HarborMetricBuckets(
+                requests: model.codexRequestDailyCounts(for: kind, profileID: profileID, days: elapsedDays, now: now),
+                tokens: model.codexTokenDailyCounts(for: kind, profileID: profileID, days: elapsedDays, now: now),
+                latency: model.codexResponseDailyAverages(for: kind, profileID: profileID, days: elapsedDays, now: now),
+                success: model.codexSuccessDailyRates(for: kind, profileID: profileID, days: elapsedDays, now: now),
+                workDuration: model.codexWorkDurationDailyTotals(for: kind, profileID: profileID, days: elapsedDays, now: now)
+            )
+        }
+    }
+
+    private func comparisonPeriod(now: Date) -> HarborComparisonPeriod {
+        let calendar = Calendar.current
+        let currentStart = trendStartDate(now: now)
+        let elapsed = now.timeIntervalSince(currentStart)
+        let previousStart: Date
+        let previousBoundary: Date
+        switch trendRange {
+        case .today:
+            previousStart = calendar.date(byAdding: .day, value: -1, to: currentStart) ?? currentStart
+            previousBoundary = currentStart
+        case .sevenDays:
+            previousStart = calendar.date(byAdding: .day, value: -7, to: currentStart) ?? currentStart
+            previousBoundary = currentStart
+        case .month:
+            previousStart = calendar.date(byAdding: .month, value: -1, to: currentStart) ?? currentStart
+            previousBoundary = currentStart
+        }
+        return HarborComparisonPeriod(
+            currentStart: currentStart,
+            currentEnd: now,
+            previousStart: previousStart,
+            previousEnd: min(previousBoundary.addingTimeInterval(-0.001), previousStart.addingTimeInterval(elapsed))
+        )
+    }
+
+    private func proportionalDelta(current: Int, previous: Int, lowerIsBetter: Bool) -> HarborMetricDelta? {
+        guard previous > 0, current != previous else { return nil }
+        let change = Double(current - previous) / Double(previous) * 100
+        let increased = change > 0
+        let favorable = lowerIsBetter ? !increased : increased
+        let formatted = abs(change).formatted(.number.precision(.fractionLength(0...1)))
+        return HarborMetricDelta(text: "\(increased ? "↑" : "↓") \(formatted)%", color: favorable ? .green : .red)
+    }
+
+    private func durationDelta(current: Int?, previous: Int?) -> HarborMetricDelta? {
+        guard let current, let previous, current != previous else { return nil }
+        let improved = current < previous
+        return HarborMetricDelta(
+            text: "\(improved ? "↓" : "↑") \(durationText(abs(current - previous)))",
+            color: improved ? .green : .red
+        )
+    }
+
+    private func optionalDurationDelta(current: Int?, previous: Int?) -> HarborMetricDelta? {
+        guard let current, let previous, previous > 0, current != previous else { return nil }
+        return proportionalDelta(current: current, previous: previous, lowerIsBetter: false)
+    }
+
+    private func successRateDelta(current: Double?, previous: Double?) -> HarborMetricDelta? {
+        guard let current, let previous else { return nil }
+        let points = (current - previous) * 100
+        guard abs(points) >= 0.05 else { return nil }
+        let increased = points > 0
+        return HarborMetricDelta(
+            text: "\(increased ? "↑" : "↓") \(abs(points).formatted(.number.precision(.fractionLength(0...1)))) 个百分点",
+            color: increased ? .green : .red
+        )
+    }
+
     private func analyticsWorkspace(
         kind: CodexConnectionKind,
         profileID: UUID?,
         metrics: AppModel.CodexRequestMetrics,
         workDuration: Int?,
         health: ConnectionHealth,
-        isActive: Bool,
-        diagnostic: ConnectionDiagnostic?,
         rows: [HarborHealthRow],
         accent: Color
     ) -> some View {
         VStack(spacing: 12) {
             requestMetricsRow(
                 kind: kind,
+                profileID: kind == .apiKey ? profileID : nil,
                 metrics: metrics,
                 workDuration: workDuration,
                 accent: accent
             )
 
             GeometryReader { proxy in
-                if proxy.size.width >= 780 {
-                    HStack(alignment: .top, spacing: 12) {
-                        requestTrendPanel(kind: kind, accent: accent)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        connectionHealthPanel(
-                            kind: kind,
-                            profileID: profileID,
-                            health: health,
-                            isActive: isActive,
-                            diagnostic: diagnostic,
-                            metrics: metrics,
-                            rows: rows
-                        )
-                        .frame(width: min(278, max(238, proxy.size.width * 0.26)))
-                    }
-                } else {
-                    VStack(spacing: 12) {
-                        requestTrendPanel(kind: kind, accent: accent)
-                            .frame(minHeight: 240)
-                        connectionHealthPanel(
-                            kind: kind,
-                            profileID: profileID,
-                            health: health,
-                            isActive: isActive,
-                            diagnostic: diagnostic,
-                            metrics: metrics,
-                            rows: rows
-                        )
+                Group {
+                    if proxy.size.width >= 780 {
+                        HStack(alignment: .top, spacing: 12) {
+                            requestTrendPanel(kind: kind, metrics: metrics, accent: accent)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            connectionHealthPanel(
+                                kind: kind,
+                                profileID: profileID,
+                                health: health,
+                                rows: rows
+                            )
+                            .frame(width: min(304, max(278, proxy.size.width * 0.285)))
+                        }
+                    } else {
+                        VStack(spacing: 12) {
+                            requestTrendPanel(kind: kind, metrics: metrics, accent: accent)
+                                .frame(minHeight: 240)
+                            connectionHealthPanel(
+                                kind: kind,
+                                profileID: profileID,
+                                health: health,
+                                rows: rows
+                            )
+                        }
                     }
                 }
+                .frame(minHeight: 0, maxHeight: .infinity, alignment: .top)
             }
+            .frame(minHeight: 0, maxHeight: .infinity)
         }
-        .frame(maxHeight: .infinity, alignment: .top)
+        .frame(minHeight: 0, maxHeight: .infinity, alignment: .top)
     }
 
     private func connectionHealthPanel(
         kind: CodexConnectionKind,
         profileID: UUID?,
         health: ConnectionHealth,
-        isActive: Bool,
-        diagnostic: ConnectionDiagnostic?,
-        metrics: AppModel.CodexRequestMetrics,
         rows: [HarborHealthRow]
     ) -> some View {
-        let summary = connectionHealthSummary(health: health, metrics: metrics)
-        let warning = connectionHealthWarning(kind: kind, health: health, metrics: metrics, diagnostic: diagnostic)
+        let summary = connectionHealthSummary(health: health)
         let recentEvents = recentConnectionActivity(kind: kind, profileID: profileID)
         return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 9) {
@@ -2716,17 +3085,16 @@ struct RootView: View {
                     .foregroundStyle(summary.color)
                     .frame(width: 28, height: 28)
                     .background(summary.color.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("连接健康")
-                        .font(.callout.weight(.semibold))
-                    Text(summary.title)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(summary.color)
-                }
+                Text("连接健康")
+                    .font(.callout.weight(.semibold))
                 Spacer(minLength: 4)
-                Image(systemName: summary.icon)
+                Label(summary.title, systemImage: summary.icon)
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(summary.color)
                     .accessibilityLabel(summary.title)
+                    .padding(.horizontal, 9)
+                    .frame(height: 26)
+                    .background(summary.color.opacity(0.09), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
             .padding(.bottom, 12)
 
@@ -2761,22 +3129,6 @@ struct RootView: View {
                 }
             }
 
-            if let warning {
-                HStack(alignment: .top, spacing: 7) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                    Text(warning)
-                        .font(.caption2.weight(.medium))
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .foregroundStyle(.orange)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                .padding(.top, 12)
-            }
-
             if !recentEvents.isEmpty {
                 Rectangle()
                     .fill(Color.primary.opacity(0.07))
@@ -2788,26 +3140,30 @@ struct RootView: View {
                     .padding(.top, 12)
                     .padding(.bottom, 5)
 
-                VStack(spacing: 0) {
-                    ForEach(recentEvents) { event in
-                        HStack(spacing: 8) {
-                            Image(systemName: activityIcon(event))
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundStyle(activityColor(event))
-                                .frame(width: 18, height: 18)
-                                .background(activityColor(event).opacity(0.09), in: Circle())
-                            Text(activityTitle(event))
-                                .font(.system(size: 10.5, weight: .medium))
-                                .lineLimit(1)
-                            Spacer(minLength: 4)
-                            Text(event.timestamp.formatted(date: .omitted, time: .shortened))
-                                .font(.system(size: 9.5, weight: .medium, design: .rounded))
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
+                ScrollView(.vertical) {
+                    VStack(spacing: 0) {
+                        ForEach(recentEvents) { item in
+                            HStack(spacing: 8) {
+                                Image(systemName: activityIcon(item.event))
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundStyle(activityColor(item.event))
+                                    .frame(width: 18, height: 18)
+                                    .background(activityColor(item.event).opacity(0.09), in: Circle())
+                                Text(item.count > 1 ? "\(activityTitle(item.event)) ×\(item.count)" : activityTitle(item.event))
+                                    .font(.system(size: 10.5, weight: .medium))
+                                    .lineLimit(1)
+                                Spacer(minLength: 4)
+                                Text(item.event.timestamp.formatted(date: .omitted, time: .shortened))
+                                    .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
+                            }
+                            .frame(minHeight: 28)
                         }
-                        .frame(minHeight: 28)
                     }
                 }
+                .scrollIndicators(.automatic)
+                .frame(minHeight: 0, maxHeight: 132)
             }
 
             Spacer(minLength: 0)
@@ -2823,16 +3179,25 @@ struct RootView: View {
     private func recentConnectionActivity(
         kind: CodexConnectionKind,
         profileID: UUID?
-    ) -> [ConnectionActivityEvent] {
-        Array(
-            model.activityEvents
-                .filter {
-                    $0.connectionKind == kind
-                        && (profileID == nil || $0.profileID == profileID)
-                }
-                .sorted { $0.timestamp > $1.timestamp }
-                .prefix(4)
-        )
+    ) -> [HarborActivityGroup] {
+        let source = model.activityEvents
+            .filter {
+                $0.connectionKind == kind
+                    && (profileID == nil || $0.profileID == profileID)
+            }
+            .sorted { $0.timestamp > $1.timestamp }
+        var groups: [HarborActivityGroup] = []
+        for event in source {
+            if let last = groups.last,
+               last.event.kind == event.kind,
+               last.event.succeeded == event.succeeded {
+                groups[groups.count - 1] = HarborActivityGroup(event: last.event, count: last.count + 1)
+            } else {
+                groups.append(HarborActivityGroup(event: event, count: 1))
+            }
+            if groups.count == 4 { break }
+        }
+        return groups
     }
 
     private func activityTitle(_ event: ConnectionActivityEvent) -> String {
@@ -2871,50 +3236,20 @@ struct RootView: View {
     }
 
     private func connectionHealthSummary(
-        health: ConnectionHealth,
-        metrics: AppModel.CodexRequestMetrics
+        health: ConnectionHealth
     ) -> (title: String, color: Color, icon: String) {
         switch health {
         case .unavailable:
             return ("异常", .red, "xmark.circle.fill")
         case .expired:
-            return ("需要关注", .orange, "exclamationmark.triangle.fill")
+            return ("已过期", .orange, "exclamationmark.triangle.fill")
         case .checking:
             return ("检查中", .blue, "arrow.triangle.2.circlepath")
         case .unchecked:
             return ("待检查", .secondary, "questionmark.circle")
         case .available:
-            if metrics.count >= 3, let successRate = metrics.successRate, successRate < 0.90 {
-                return ("需要关注", .orange, "exclamationmark.triangle.fill")
-            }
-            if let latency = metrics.averageDurationMilliseconds, latency >= 10_000 {
-                return ("需要关注", .orange, "exclamationmark.triangle.fill")
-            }
             return ("正常", .green, "checkmark.circle.fill")
         }
-    }
-
-    private func connectionHealthWarning(
-        kind: CodexConnectionKind,
-        health: ConnectionHealth,
-        metrics: AppModel.CodexRequestMetrics,
-        diagnostic: ConnectionDiagnostic?
-    ) -> String? {
-        switch health {
-        case .expired:
-            return kind == .harborKey ? "当前托管密钥已过期" : (healthDetail(health) ?? "当前连接已过期")
-        case .unavailable:
-            return diagnostic?.failureReason ?? healthDetail(health) ?? "当前连接不可用"
-        default:
-            break
-        }
-        if metrics.count >= 3, let successRate = metrics.successRate, successRate < 0.90 {
-            return "\(trendRange.rawValue)成功率仅 \(percentText(successRate))"
-        }
-        if let latency = metrics.averageDurationMilliseconds, latency >= 10_000 {
-            return "\(trendRange.rawValue)平均响应达到 \(durationText(latency))"
-        }
-        return nil
     }
 
     private func accountHealthRows(
@@ -3017,24 +3352,20 @@ struct RootView: View {
         accent: Color
     ) -> some View {
         let selected = trendRange == range
-        return Button {
+        return HarborSegmentButton(
+            title: title,
+            icon: nil,
+            selected: selected,
+            tint: accent,
+            width: 46,
+            height: 25,
+            radius: 13,
+            helpText: "查看\(range.rawValue)统计"
+        ) {
             withAnimation(reduceMotion ? .linear(duration: 0.01) : .spring(response: 0.28, dampingFraction: 0.86)) {
                 trendRange = range
             }
-        } label: {
-            Text(title)
-                .font(.system(size: 10.5, weight: .semibold))
-                .foregroundStyle(selected ? accent : .secondary)
-                .frame(width: 46, height: 25)
-                .background(selected ? accent.opacity(0.14) : Color.clear, in: Capsule())
-                .overlay(
-                    Capsule()
-                        .stroke(selected ? accent.opacity(0.25) : Color.clear, lineWidth: 1)
-                )
         }
-        .buttonStyle(.plain)
-        .contentShape(Capsule())
-        .help("查看\(range.rawValue)统计")
     }
 
     private func successRateColor(_ value: Double?) -> Color {
@@ -3046,6 +3377,7 @@ struct RootView: View {
 
     private func requestTrendPanel(
         kind: CodexConnectionKind,
+        metrics: AppModel.CodexRequestMetrics,
         accent: Color
     ) -> some View {
         let now = Date()
@@ -3067,6 +3399,9 @@ struct RootView: View {
                 latencyValues: { profileID in
                     model.codexResponseHourlyAverages(for: kind, profileID: profileID, now: now, since: dayStart)
                 },
+                successValues: { profileID in
+                    model.codexSuccessHourlyRates(for: kind, profileID: profileID, now: now, since: dayStart)
+                },
                 accent: accent
             )
             labels = hourlyTrendLabels(dayStart: dayStart, now: now)
@@ -3085,13 +3420,16 @@ struct RootView: View {
                 latencyValues: { profileID in
                     model.codexResponseDailyAverages(for: kind, profileID: profileID, days: 7, now: now)
                 },
+                successValues: { profileID in
+                    model.codexSuccessDailyRates(for: kind, profileID: profileID, days: 7, now: now)
+                },
                 accent: accent
             )
             labels = dailyTrendLabels(days: 7, now: now)
             currentFraction = nil
         case .month:
             let calendar = Calendar.current
-            let days = calendar.range(of: .day, in: .month, for: now)?.count ?? 30
+            let days = max(1, calendar.component(.day, from: now))
             series = trendSeries(
                 for: kind,
                 now: now,
@@ -3104,6 +3442,9 @@ struct RootView: View {
                 latencyValues: { profileID in
                     model.codexResponseDailyAverages(for: kind, profileID: profileID, days: days, now: now)
                 },
+                successValues: { profileID in
+                    model.codexSuccessDailyRates(for: kind, profileID: profileID, days: days, now: now)
+                },
                 accent: accent
             )
             labels = dailyTrendLabels(days: days, now: now)
@@ -3111,6 +3452,8 @@ struct RootView: View {
         }
         let hasData = series.contains { $0.values.contains(where: { $0 > 0 }) }
         let summary = trendSummary(series: series, labels: labels)
+        let comparison = trendComparison(kind: kind, summaryValue: summary.numericValue, now: now)
+        let footerItems = trendFooterItems(series: series, labels: labels, metrics: metrics, currentFraction: currentFraction)
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 12) {
                 Text("使用趋势")
@@ -3121,6 +3464,10 @@ struct RootView: View {
                 statisticsRangeControl(accent: accent)
             }
 
+            if kind == .apiKey, series.count > 1 {
+                trendLegend(series)
+            }
+
             HStack(alignment: .firstTextBaseline, spacing: 18) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(summary.value)
@@ -3129,6 +3476,19 @@ struct RootView: View {
                     Text(summary.label)
                         .font(.caption2.weight(.medium))
                         .foregroundStyle(.secondary)
+                }
+                if let comparison {
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.08))
+                        .frame(width: 1, height: 32)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(comparison.text)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(comparison.color)
+                        Text(comparisonCaption)
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 if let peak = summary.peak {
                     Rectangle()
@@ -3156,9 +3516,11 @@ struct RootView: View {
                 labels: labels,
                 metric: trendMetric,
                 accent: accent,
+                selectedSeriesID: kind == .apiKey ? previewAPIProfileID?.uuidString : nil,
+                focusedSeriesID: kind == .apiKey ? hoveredTrendSeriesID : nil,
                 currentFraction: currentFraction
             )
-                .frame(minHeight: 176, maxHeight: .infinity)
+                .frame(minHeight: 210, maxHeight: .infinity)
                 .overlay {
                     if !hasData {
                         VStack(spacing: 5) {
@@ -3171,15 +3533,33 @@ struct RootView: View {
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
+                        }
                     }
+            HStack(spacing: 7) {
+                ForEach(footerItems) { item in
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(item.color)
+                            .frame(width: 6, height: 6)
+                        Text(item.title)
+                            .foregroundStyle(.secondary)
+                        Text(item.value)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.72)
+                    }
+                    .font(.system(size: 10, weight: .medium))
+                    .padding(.horizontal, 9)
+                    .frame(maxWidth: .infinity, minHeight: 34)
+                    .background(Color.primary.opacity(0.026), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.primary.opacity(0.065)))
                 }
-            if kind == .apiKey, series.count > 1 {
-                trendLegend(series)
             }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
-        .frame(maxHeight: .infinity, alignment: .top)
+        .frame(minHeight: 0, maxHeight: .infinity, alignment: .top)
         .background(Color(nsColor: .textBackgroundColor).opacity(0.82), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.primary.opacity(0.075)))
     }
@@ -3209,7 +3589,7 @@ struct RootView: View {
     private func trendSummary(
         series: [HarborTrendSeries],
         labels: [String]
-    ) -> (value: String, label: String, peak: String?) {
+    ) -> (value: String, label: String, peak: String?, numericValue: Int) {
         let entries = series.flatMap { item in
             item.values.enumerated().map { (series: item, index: $0.offset, value: $0.element) }
         }
@@ -3233,7 +3613,7 @@ struct RootView: View {
             label = "平均响应"
         }
         guard let peak = positiveEntries.max(by: { $0.value < $1.value }) else {
-            return (value, label, nil)
+            return (value, label, nil, numericTrendValue(entries))
         }
         let peakValue: String = switch trendMetric {
         case .token: formatTokenCount(peak.value)
@@ -3242,7 +3622,125 @@ struct RootView: View {
         }
         let peakLabel = labels[safe: peak.index] ?? ""
         let seriesLabel = series.count > 1 ? " · \(peak.series.title)" : ""
-        return (value, label, "\(peakValue) · \(peakLabel)\(seriesLabel)")
+        return (value, label, "\(peakValue) · \(peakLabel)\(seriesLabel)", numericTrendValue(entries))
+    }
+
+    private func numericTrendValue(_ entries: [(series: HarborTrendSeries, index: Int, value: Int)]) -> Int {
+        switch trendMetric {
+        case .token, .requests:
+            return entries.reduce(0) { $0 + $1.value }
+        case .latency:
+            let weighted = entries.reduce(into: (duration: 0, requests: 0)) { result, entry in
+                let count = entry.series.requestCounts[safe: entry.index] ?? 0
+                result.duration += entry.value * count
+                result.requests += count
+            }
+            return weighted.requests > 0 ? weighted.duration / weighted.requests : 0
+        }
+    }
+
+    private func trendComparison(
+        kind: CodexConnectionKind,
+        summaryValue: Int,
+        now: Date
+    ) -> HarborMetricDelta? {
+        let period = comparisonPeriod(now: now)
+        switch trendMetric {
+        case .token:
+            let previous = model.codexTokenSummary(
+                for: kind,
+                profileID: nil,
+                since: period.previousStart,
+                until: period.previousEnd
+            ).totalTokens
+            return proportionalDelta(current: summaryValue, previous: previous, lowerIsBetter: false)
+        case .requests:
+            let previous = model.codexRequestMetrics(
+                for: kind,
+                profileID: nil,
+                since: period.previousStart,
+                now: period.previousEnd
+            ).count
+            return proportionalDelta(current: summaryValue, previous: previous, lowerIsBetter: false)
+        case .latency:
+            let previous = model.codexRequestMetrics(
+                for: kind,
+                profileID: nil,
+                since: period.previousStart,
+                now: period.previousEnd
+            ).averageDurationMilliseconds
+            return durationDelta(current: summaryValue > 0 ? summaryValue : nil, previous: previous)
+        }
+    }
+
+    private var comparisonCaption: String {
+        switch trendRange {
+        case .today: "较昨日同期"
+        case .sevenDays: "较上一个 7 日"
+        case .month: "较上月同期"
+        }
+    }
+
+    private func trendFooterItems(
+        series: [HarborTrendSeries],
+        labels: [String],
+        metrics: AppModel.CodexRequestMetrics,
+        currentFraction: Double?
+    ) -> [HarborTrendFooterItem] {
+        let count = series.map(\.values.count).max() ?? 0
+        let visibleCount: Int
+        if let currentFraction {
+            visibleCount = min(count, max(1, Int(floor(currentFraction * 24)) + 1))
+        } else {
+            visibleCount = count
+        }
+        let values: [Int] = (0..<visibleCount).map { index in
+            switch trendMetric {
+            case .token, .requests:
+                return series.reduce(0) { $0 + ($1.values[safe: index] ?? 0) }
+            case .latency:
+                let weighted = series.reduce(into: (duration: 0, requests: 0)) { result, item in
+                    let requests = item.requestCounts[safe: index] ?? 0
+                    result.duration += (item.latencyValues[safe: index] ?? 0) * requests
+                    result.requests += requests
+                }
+                return weighted.requests > 0 ? weighted.duration / weighted.requests : 0
+            }
+        }
+        let nonzero = values.enumerated().filter { $0.element > 0 }
+        let averageLabel = trendRange == .today ? "时均" : "日均"
+
+        if trendMetric == .latency {
+            let average = metrics.averageDurationMilliseconds.map(durationText) ?? "暂无"
+            let p95 = metrics.p95DurationMilliseconds.map(durationText) ?? "暂无"
+            let highest = nonzero.max(by: { $0.element < $1.element })
+            let lowest = nonzero.min(by: { $0.element < $1.element })
+            return [
+                HarborTrendFooterItem(title: "平均", value: average, color: .blue),
+                HarborTrendFooterItem(title: "P95", value: p95, color: .purple),
+                HarborTrendFooterItem(title: "最高", value: highest.map { "\(durationText($0.element)) · \(labels[safe: $0.offset] ?? "")" } ?? "暂无", color: .orange),
+                HarborTrendFooterItem(title: "最低", value: lowest.map { "\(durationText($0.element)) · \(labels[safe: $0.offset] ?? "")" } ?? "暂无", color: .secondary)
+            ]
+        }
+
+        let total = values.reduce(0, +)
+        let average = values.isEmpty ? 0 : total / values.count
+        let highest = values.enumerated().max(by: { $0.element < $1.element })
+        let lowest = values.enumerated().min(by: { $0.element < $1.element })
+        return [
+            HarborTrendFooterItem(title: "总计", value: trendFooterValue(total), color: .blue),
+            HarborTrendFooterItem(title: averageLabel, value: trendFooterValue(average), color: .purple),
+            HarborTrendFooterItem(title: "最高", value: highest.map { "\(trendFooterValue($0.element)) · \(labels[safe: $0.offset] ?? "")" } ?? "暂无", color: .orange),
+            HarborTrendFooterItem(title: "最低", value: lowest.map { "\(trendFooterValue($0.element)) · \(labels[safe: $0.offset] ?? "")" } ?? "暂无", color: .secondary)
+        ]
+    }
+
+    private func trendFooterValue(_ value: Int) -> String {
+        switch trendMetric {
+        case .token: formatTokenCount(value)
+        case .requests: "\(value) 次"
+        case .latency: durationText(value)
+        }
     }
 
     private func trendSeries(
@@ -3251,13 +3749,14 @@ struct RootView: View {
         requestValues: (UUID?) -> [Int],
         tokenValues: (UUID?) -> [Int],
         latencyValues: (UUID?) -> [Int],
+        successValues: (UUID?) -> [Int],
         accent: Color
     ) -> [HarborTrendSeries] {
         if kind == .apiKey {
             let apiProfiles = model.profiles.filter { $0.kind.connectionKind == .apiKey }
-            let palette: [Color] = [.orange, .teal, .pink, .indigo, .cyan, .mint]
             return apiProfiles.enumerated().map { index, profile in
                 let requests = requestValues(profile.id)
+                let latencies = latencyValues(profile.id)
                 let values: [Int] = switch trendMetric {
                 case .token: tokenValues(profile.id)
                 case .requests: requests
@@ -3269,15 +3768,16 @@ struct RootView: View {
                     title: profile.name,
                     values: values,
                     requestCounts: requests,
-                    color: profile.id == previewAPIProfileID
-                        ? accent
-                        : (index < palette.count ? palette[index].opacity(0.78) : identity.brand.tint.opacity(0.78)),
-                    dash: profile.id == previewAPIProfileID ? [] : trendDashStyle(index: index + 1)
+                    latencyValues: latencies,
+                    successRates: successValues(profile.id),
+                    color: apiTrendColor(profile: profile, identity: identity),
+                    dash: trendDashStyle(index: index)
                 )
             }
         }
 
         let requests = requestValues(nil)
+        let latencies = latencyValues(nil)
         let values: [Int] = switch trendMetric {
         case .token: tokenValues(nil)
         case .requests: requests
@@ -3289,6 +3789,8 @@ struct RootView: View {
                 title: kind.title,
                 values: values,
                 requestCounts: requests,
+                latencyValues: latencies,
+                successRates: successValues(nil),
                 color: accent,
                 dash: []
             )
@@ -3297,26 +3799,94 @@ struct RootView: View {
 
     private func trendDashStyle(index: Int) -> [CGFloat] {
         switch index % 4 {
+        case 0: []
         case 1: [5, 4]
         case 2: [2, 3]
-        case 3: [7, 3, 2, 3]
-        default: []
+        default: [7, 3, 2, 3]
+        }
+    }
+
+    private func apiTrendColor(profile: HarborProfile, identity: ProviderIdentity) -> Color {
+        let signature = "\(profile.name) \(profile.model) \(identity.host)".lowercased()
+        if identity.brand == .zhipu || signature.contains("zhipu") || signature.contains("glm") || signature.contains("智普") {
+            return .blue
+        }
+        if identity.brand == .kimi || signature.contains("kimi") || signature.contains("moonshot") {
+            return .purple
+        }
+        if identity.brand == .qwen || signature.contains("qwen") || signature.contains("千问") || signature.contains("dashscope") {
+            return .orange
+        }
+        switch identity.brand {
+        case .openAI: return .green
+        case .deepSeek: return .cyan
+        case .miniMax: return .pink
+        case .openRouter: return .indigo
+        case .siliconFlow: return .teal
+        case .custom:
+            let palette: [Color] = [.blue, .purple, .orange, .teal, .pink, .indigo, .cyan, .mint]
+            let stableIndex = identity.host.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0x7fffffff }
+            return palette[stableIndex % palette.count]
+        case .kimi, .qwen, .zhipu:
+            return identity.brand.tint
         }
     }
 
     private func trendLegend(_ series: [HarborTrendSeries]) -> some View {
-        HStack(spacing: 8) {
+        let selectedID = previewAPIProfileID?.uuidString
+        return HStack(spacing: 7) {
             ForEach(series.prefix(6), id: \.id) { item in
+                let isCurrent = item.id == selectedID
+                let isFocused = item.id == hoveredTrendSeriesID
                 HStack(spacing: 5) {
-                    RoundedRectangle(cornerRadius: 2, style: .continuous)
-                        .fill(item.color)
-                        .frame(width: 16, height: 3)
+                    Path { path in
+                        path.move(to: CGPoint(x: 0, y: 3))
+                        path.addLine(to: CGPoint(x: 18, y: 3))
+                    }
+                    .stroke(
+                        item.color.opacity(isCurrent || isFocused ? 1 : 0.66),
+                        style: StrokeStyle(
+                            lineWidth: isCurrent || isFocused ? 2.5 : 1.7,
+                            lineCap: .round,
+                            dash: item.dash
+                        )
+                    )
+                    .frame(width: 18, height: 6)
                     Text(item.title)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 10, weight: isCurrent ? .semibold : .medium))
+                        .foregroundStyle(isCurrent || isFocused ? Color.primary : Color.secondary)
                         .lineLimit(1)
+                    if isCurrent {
+                        Text("当前")
+                            .font(.system(size: 8.5, weight: .semibold))
+                            .foregroundStyle(item.color)
+                    }
                 }
-                .help(item.title)
+                .padding(.horizontal, 7)
+                .frame(height: 24)
+                .background(
+                    isCurrent
+                        ? item.color.opacity(0.07)
+                        : (isFocused ? item.color.opacity(0.035) : Color.clear),
+                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .stroke(isCurrent ? item.color.opacity(0.17) : Color.clear)
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .onHover { hovering in
+                    withAnimation(reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.14)) {
+                        if hovering {
+                            hoveredTrendSeriesID = item.id
+                        } else if hoveredTrendSeriesID == item.id {
+                            hoveredTrendSeriesID = nil
+                        }
+                    }
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(isCurrent ? "\(item.title)，当前 API" : item.title)
+                .help(isCurrent ? "\(item.title) · 当前 API" : "悬停聚焦 \(item.title)")
             }
             if series.count > 6 {
                 Text("+\(series.count - 6)")
@@ -3325,7 +3895,11 @@ struct RootView: View {
             }
             Spacer(minLength: 0)
         }
-        .frame(height: 16)
+        .frame(height: 24)
+        .animation(
+            reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.14),
+            value: hoveredTrendSeriesID
+        )
     }
 
     private func hourlyTrendLabels(dayStart: Date, now: Date = Date()) -> [String] {
@@ -3363,21 +3937,17 @@ struct RootView: View {
         tint: Color,
         action: @escaping () -> Void
     ) -> some View {
-        Button(action: action) {
-            Label(title, systemImage: icon)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(selected ? tint : .secondary)
-                .frame(width: 64, height: 30)
-                .background(selected ? tint.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(selected ? tint.opacity(0.26) : Color.clear, lineWidth: 1)
-                )
-                .shadow(color: selected ? tint.opacity(0.10) : .clear, radius: 3, y: 1)
-        }
-        .buttonStyle(.plain)
-        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .help("查看\(title)趋势")
+        HarborSegmentButton(
+            title: title,
+            icon: icon,
+            selected: selected,
+            tint: tint,
+            width: 64,
+            height: 30,
+            radius: 8,
+            helpText: "查看\(title)趋势",
+            action: action
+        )
     }
 
     private func formatTokenCount(_ value: Int) -> String {

@@ -1547,13 +1547,15 @@ final class AppModel: ObservableObject {
     func codexWorkDurationMilliseconds(
         for connectionKind: CodexConnectionKind,
         profileID: UUID?,
-        since: Date? = nil
+        since: Date? = nil,
+        until: Date? = nil
     ) -> Int? {
         let durations = activityEvents.compactMap { event -> Int? in
             guard event.kind == .codexRequest,
                   event.connectionKind == connectionKind,
                   (profileID == nil || event.profileID == profileID),
-                  (since == nil || event.timestamp >= since!) else { return nil }
+                  (since == nil || event.timestamp >= since!),
+                  (until == nil || event.timestamp <= until!) else { return nil }
             return event.durationMilliseconds
         }
         guard !durations.isEmpty else { return nil }
@@ -1563,13 +1565,15 @@ final class AppModel: ObservableObject {
     func codexTokenSummary(
         for connectionKind: CodexConnectionKind,
         profileID: UUID?,
-        since: Date? = nil
+        since: Date? = nil,
+        until: Date? = nil
     ) -> CodexTokenUsageSummary {
         let events = activityEvents.filter {
             $0.connectionKind == connectionKind
                 && (profileID == nil || $0.profileID == profileID)
                 && $0.kind == .codexRequest
                 && (since == nil || $0.timestamp >= since!)
+                && (until == nil || $0.timestamp <= until!)
         }
         let tokenByTurn = Dictionary(uniqueKeysWithValues: codexTokenUsageRecords.map { ($0.id, $0) })
         let matched = events.compactMap { event -> CodexTokenUsageRecord? in
@@ -1584,6 +1588,99 @@ final class AppModel: ObservableObject {
             reasoningOutputTokens: matched.reduce(0) { $0 + $1.reasoningOutputTokens },
             totalTokens: matched.reduce(0) { $0 + $1.totalTokens }
         )
+    }
+
+    func codexSuccessHourlyRates(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        now: Date = Date(),
+        since: Date? = nil
+    ) -> [Int] {
+        requestHourlyBuckets(for: connectionKind, profileID: profileID, now: now, since: since)
+            .map { bucket in
+                guard !bucket.isEmpty else { return 0 }
+                return Int((Double(bucket.filter(\.succeeded).count) / Double(bucket.count) * 100).rounded())
+            }
+    }
+
+    func codexWorkDurationHourlyTotals(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        now: Date = Date(),
+        since: Date? = nil
+    ) -> [Int] {
+        requestHourlyBuckets(for: connectionKind, profileID: profileID, now: now, since: since)
+            .map { $0.compactMap(\.durationMilliseconds).reduce(0, +) }
+    }
+
+    func codexSuccessDailyRates(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        days: Int,
+        now: Date = Date()
+    ) -> [Int] {
+        requestDailyBuckets(for: connectionKind, profileID: profileID, days: days, now: now)
+            .map { bucket in
+                guard !bucket.isEmpty else { return 0 }
+                return Int((Double(bucket.filter(\.succeeded).count) / Double(bucket.count) * 100).rounded())
+            }
+    }
+
+    func codexWorkDurationDailyTotals(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        days: Int,
+        now: Date = Date()
+    ) -> [Int] {
+        requestDailyBuckets(for: connectionKind, profileID: profileID, days: days, now: now)
+            .map { $0.compactMap(\.durationMilliseconds).reduce(0, +) }
+    }
+
+    private func requestHourlyBuckets(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        now: Date,
+        since: Date?
+    ) -> [[ConnectionActivityEvent]] {
+        let calendar = Calendar.current
+        let currentHour = calendar.dateInterval(of: .hour, for: now)?.start ?? now
+        let firstHour = since.flatMap { calendar.dateInterval(of: .hour, for: $0)?.start }
+            ?? calendar.date(byAdding: .hour, value: -23, to: currentHour)
+        guard let firstHour else { return Array(repeating: [], count: 24) }
+        var buckets = Array(repeating: [ConnectionActivityEvent](), count: 24)
+        for event in activityEvents where
+            event.kind == .codexRequest &&
+            event.connectionKind == connectionKind &&
+            (profileID == nil || event.profileID == profileID) &&
+            event.timestamp >= firstHour && event.timestamp <= now {
+            let index = calendar.dateComponents([.hour], from: firstHour, to: event.timestamp).hour ?? -1
+            if buckets.indices.contains(index) { buckets[index].append(event) }
+        }
+        return buckets
+    }
+
+    private func requestDailyBuckets(
+        for connectionKind: CodexConnectionKind,
+        profileID: UUID?,
+        days: Int,
+        now: Date
+    ) -> [[ConnectionActivityEvent]] {
+        let calendar = Calendar.current
+        let count = max(days, 1)
+        let today = calendar.startOfDay(for: now)
+        guard let firstDay = calendar.date(byAdding: .day, value: -(count - 1), to: today) else {
+            return Array(repeating: [], count: count)
+        }
+        var buckets = Array(repeating: [ConnectionActivityEvent](), count: count)
+        for event in activityEvents where
+            event.kind == .codexRequest &&
+            event.connectionKind == connectionKind &&
+            (profileID == nil || event.profileID == profileID) &&
+            event.timestamp >= firstDay && event.timestamp <= now {
+            let index = calendar.dateComponents([.day], from: firstDay, to: event.timestamp).day ?? -1
+            if buckets.indices.contains(index) { buckets[index].append(event) }
+        }
+        return buckets
     }
 
     func providerBilledTokenTotal(

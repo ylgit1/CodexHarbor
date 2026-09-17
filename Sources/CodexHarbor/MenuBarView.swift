@@ -20,7 +20,11 @@ struct MenuBarView: View {
             Section("账户登录") {
                 ForEach(model.accountProfiles) { profile in
                     Button {
-                        Task { await model.switchAccount(to: profile.id) }
+                        Task {
+                            await model.switchAccount(to: profile.id)
+                            guard model.errorMessage == nil else { return }
+                            await model.reloadCodex()
+                        }
                     } label: {
                         Label(profile.name, systemImage: isActive(profile) ? "checkmark.circle.fill" : "person.crop.circle")
                     }

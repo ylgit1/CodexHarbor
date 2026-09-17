@@ -7,7 +7,9 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "CodexHarborCore", targets: ["CodexHarborCore"]),
-        .executable(name: "CodexHarbor", targets: ["CodexHarbor"])
+        .library(name: "ChatGPTBridgeCore", targets: ["ChatGPTBridgeCore"]),
+        .executable(name: "CodexHarbor", targets: ["CodexHarbor"]),
+        .executable(name: "HarborChatGPTAgent", targets: ["HarborChatGPTAgent"])
     ],
     targets: [
         .target(
@@ -17,13 +19,28 @@ let package = Package(
                 .linkedLibrary("sqlite3")
             ]
         ),
+        .target(
+            name: "ChatGPTBridgeCore",
+            linkerSettings: [
+                .linkedFramework("Network"),
+                .linkedFramework("Security")
+            ]
+        ),
         .executableTarget(
             name: "CodexHarbor",
-            dependencies: ["CodexHarborCore"]
+            dependencies: ["CodexHarborCore", "ChatGPTBridgeCore"]
+        ),
+        .executableTarget(
+            name: "HarborChatGPTAgent",
+            dependencies: ["ChatGPTBridgeCore"]
         ),
         .testTarget(
             name: "CodexHarborCoreTests",
             dependencies: ["CodexHarborCore"]
+        ),
+        .testTarget(
+            name: "ChatGPTBridgeCoreTests",
+            dependencies: ["ChatGPTBridgeCore"]
         )
     ]
 )

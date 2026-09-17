@@ -1186,6 +1186,7 @@ struct RootView: View {
     @State private var hoveredTrendSeriesID: String?
     @State private var trendRange: TrendRange = .today
     @State private var trendMetric: TrendMetric = .token
+    @State private var showsChatGPTBridge = false
 
     var body: some View {
         content
@@ -1309,9 +1310,14 @@ struct RootView: View {
             Divider()
                 .opacity(0.65)
             VStack(spacing: 0) {
-                workspaceToolbar
-                currentConnectionCard
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                if showsChatGPTBridge {
+                    ChatGPTBridgeView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                } else {
+                    workspaceToolbar
+                    currentConnectionCard
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                }
             }
         }
         // Keep a sensible minimum for the macOS window, while allowing the
@@ -1327,7 +1333,15 @@ struct RootView: View {
             modeBar
             Divider()
                 .opacity(0.55)
-            profileLibrary
+            chatGPTBridgeNavigation
+            Divider()
+                .opacity(0.55)
+            if showsChatGPTBridge {
+                chatGPTBridgeSidebarSummary
+                    .frame(maxHeight: .infinity, alignment: .top)
+            } else {
+                profileLibrary
+            }
             sidebarUsageSummary
         }
         .frame(minHeight: 0, maxHeight: .infinity, alignment: .top)
@@ -1403,6 +1417,69 @@ struct RootView: View {
         .padding(.horizontal, 12)
         .padding(.top, 12)
         .padding(.bottom, 11)
+    }
+
+    private var chatGPTBridgeNavigation: some View {
+        Button {
+            withAnimation(reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.18)) {
+                showsChatGPTBridge = true
+            }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "bubble.left.and.text.bubble.right.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(showsChatGPTBridge ? Color.blue : Color.primary.opacity(0.72))
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("ChatGPT 本地访问")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(showsChatGPTBridge ? Color.blue : Color.primary.opacity(0.82))
+                    Text("独立 MCP · 不影响 Codex")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 48)
+            .background(
+                showsChatGPTBridge
+                    ? Color.blue.opacity(0.09)
+                    : Color.clear,
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(showsChatGPTBridge ? Color.blue.opacity(0.36) : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .help("配置 ChatGPT 官方 Chat 对本机开发目录的访问")
+    }
+
+    private var chatGPTBridgeSidebarSummary: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("独立运行", systemImage: "checkmark.shield.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.green)
+            Text("ChatGPT Bridge 使用独立 Agent、MCP 与数据目录，不读取或修改 ~/.codex，也不占用 Codex Relay 端口。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Divider().opacity(0.5)
+            Text("日常工作仍在 ChatGPT 官方 Chat 中完成。Harbor 只负责本地连接、权限和状态。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     private var sidebarUsageSummary: some View {
@@ -1542,6 +1619,7 @@ struct RootView: View {
         let tint = Color.blue
         return Button {
             withAnimation(reduceMotion ? .linear(duration: 0.01) : .spring(response: 0.28, dampingFraction: 0.82)) {
+                showsChatGPTBridge = false
                 libraryMode = mode
             }
         } label: {

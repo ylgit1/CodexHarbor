@@ -16,11 +16,13 @@ if [[ -e "$app_path" ]]; then
   mv "$app_path" "$previous_path"
 fi
 
-mkdir -p "$app_path/Contents/MacOS" "$app_path/Contents/Resources"
+mkdir -p "$app_path/Contents/MacOS" "$app_path/Contents/Helpers" "$app_path/Contents/Resources"
 cp "$build_root/release/CodexHarbor" "$app_path/Contents/MacOS/CodexHarbor"
+cp "$build_root/release/HarborChatGPTAgent" "$app_path/Contents/Helpers/HarborChatGPTAgent"
 cp "$project_root/Resources/Info.plist" "$app_path/Contents/Info.plist"
 cp "$project_root/Resources/AppIcon.icns" "$app_path/Contents/Resources/AppIcon.icns"
-chmod 755 "$app_path/Contents/MacOS/CodexHarbor"
+chmod 755 "$app_path/Contents/MacOS/CodexHarbor" "$app_path/Contents/Helpers/HarborChatGPTAgent"
+codesign --force --sign - "$app_path/Contents/Helpers/HarborChatGPTAgent"
 codesign --force --deep --sign - "$app_path"
 
 echo "$app_path"

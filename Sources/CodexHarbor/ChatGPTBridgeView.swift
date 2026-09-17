@@ -583,6 +583,49 @@ struct ChatGPTBridgeView: View {
                 statusBadge(title: tunnelStateText, color: tunnelStateColor)
             }
 
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("首次配置快捷入口")
+                            .font(.caption.weight(.semibold))
+                        Text("按顺序创建 Tunnel ID 和 Runtime API Key，再回到这里保存连接。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 12)
+                    Button {
+                        openTunnelManagement()
+                    } label: {
+                        Label("1  新建 Tunnel ID", systemImage: "point.3.connected.trianglepath.dotted")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("打开 OpenAI Platform Tunnels 页面")
+
+                    Button {
+                        openRuntimeKeyManagement()
+                    } label: {
+                        Label("2  新建 Runtime API Key", systemImage: "key.fill")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("创建 Restricted Runtime API Key，并授予 Tunnels Read + Use")
+
+                    Button {
+                        openChatGPTConnectorSettings()
+                    } label: {
+                        Label("3  ChatGPT 连接设置", systemImage: "bubble.left.and.bubble.right")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .help("打开 ChatGPT Connectors，在 Connection 中选择 Tunnel")
+                }
+                .padding(11)
+                .background(Color.blue.opacity(0.045), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(Color.blue.opacity(0.12)))
+
+                Text("Runtime API Key 建议创建为 Restricted，并仅授予 Tunnels Read + Use。不要把 Admin API Key 用作长期运行密钥。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Tunnel ID")
@@ -640,11 +683,7 @@ struct ChatGPTBridgeView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(bridge.isWorking || tunnelIDInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
-                Button("ChatGPT 连接设置") { openChatGPTConnectorSettings() }
-                    .buttonStyle(.bordered)
-                Button("Tunnel 管理") { openTunnelManagement() }
-                    .buttonStyle(.bordered)
-                Button("Runtime API Key") { openRuntimeKeyManagement() }
+                Button("打开 ChatGPT 连接设置") { openChatGPTConnectorSettings() }
                     .buttonStyle(.bordered)
 
                 if bridge.configuration.secureTunnel != nil {

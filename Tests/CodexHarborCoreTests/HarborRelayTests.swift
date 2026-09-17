@@ -13,11 +13,13 @@ struct HarborRelayTests {
             appSupport: root.appendingPathComponent("support", isDirectory: true)
         )
         let secretStore = LocalSecretStore(url: paths.credentialsURL)
-        let server = HarborRelayServer(paths: paths, secretStore: secretStore)
+        let testPort: UInt16 = 28473
+        let server = HarborRelayServer(paths: paths, secretStore: secretStore, port: testPort)
         try server.start()
         defer { server.stop() }
 
-        let (data, response) = try await URLSession.shared.data(from: RelayConfiguration.localBaseURL.appendingPathComponent("models"))
+        let testBaseURL = URL(string: "http://127.0.0.1:\(testPort)/v1")!
+        let (data, response) = try await URLSession.shared.data(from: testBaseURL.appendingPathComponent("models"))
         #expect((response as? HTTPURLResponse)?.statusCode == 503)
         let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
         #expect((object["error"] as? [String: Any])?["type"] as? String == "harbor_relay_error")

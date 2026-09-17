@@ -77,8 +77,9 @@ public struct RelayRequestRecord: Identifiable, Codable, Equatable, Sendable {
 }
 
 public struct RelayConfiguration: Codable, Equatable, Sendable {
+    public static let host = "127.0.0.1"
     public static let port: UInt16 = 18473
-    public static let localBaseURL = URL(string: "http://127.0.0.1:\(port)/v1")!
+    public static let localBaseURL = URL(string: "http://\(host):\(port)/v1")!
 
     public let profileID: UUID
     public let upstreamBaseURL: URL
@@ -487,21 +488,29 @@ public final class HarborRelayServer: @unchecked Sendable {
     private let secretStore: SecretStore
     private let configurationStore: RelayConfigurationStore
     private let activityStore: RelayActivityStore
+    private let port: UInt16
     private let queue = DispatchQueue(label: "com.codexharbor.relay", qos: .userInitiated)
     private var listener: NWListener?
 
-    public init(paths: CodexPaths = .live(), secretStore: SecretStore = LocalSecretStore.liveMigratingLegacyKeychain()) {
+    public init(
+        paths: CodexPaths = .live(),
+        secretStore: SecretStore = LocalSecretStore.liveMigratingLegacyKeychain(),
+        port: UInt16 = RelayConfiguration.port
+    ) {
         self.paths = paths
         self.secretStore = secretStore
         self.configurationStore = RelayConfigurationStore(paths: paths)
         self.activityStore = RelayActivityStore(paths: paths)
+        self.port = port
     }
 
     public func start() throws {
         guard listener == nil else { return }
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
-        let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: RelayConfiguration.port)!)
+        let listenerPort = NWEndpoint.Port(rawValue: port)!
+        parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(RelayConfiguration.host), port: listenerPort)
+        let listener = try NWListener(using: parameters)
         let ready = DispatchSemaphore(value: 0)
         let state = RelayListenerStartState()
         listener.newConnectionHandler = { [weak self] connection in self?.accept(connection) }

@@ -1,13 +1,7 @@
 import CodexHarborCore
 import AppKit
-import CryptoKit
 import Darwin
 import Foundation
-
-private struct CodexRequestConnectionSnapshot {
-    let kind: CodexConnectionKind
-    let profileID: UUID?
-}
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -51,8 +45,9 @@ final class AppModel: ObservableObject {
     private let service: HarborServiceClient
     private let profileCatalog: ProfileCatalogCoordinator
     private let activityStore: ConnectionActivityStore
-    private let requestMonitor: CodexRequestMonitor
-    private let tokenUsageMonitor: CodexTokenUsageMonitor
+    private let telemetryCoordinator: CodexTelemetryCoordinator
+    private let authenticationChangeMonitor: CodexAuthenticationChangeMonitor
+    private let relayActivityChangeMonitor: RelayActivityChangeMonitor
     private let relayConfigurationStore: RelayConfigurationStore
     private let relayActivityStore: RelayActivityStore
     private let providerUsageAdapter: ProviderUsageAdapterClient
@@ -60,13 +55,7 @@ final class AppModel: ObservableObject {
     private var didAutoQueryUsage = false
     private let accountLoginSession = AccountLoginSessionManager()
     private var requestMonitorTask: Task<Void, Never>?
-    private var observedAuthenticationDigest: SHA256.Digest?
-    private var observedCodexTurnIDs: Set<String>
-    private var activeCodexTurnSnapshots: [String: CodexRequestConnectionSnapshot] = [:]
-    private let requestMonitorStartedAt = Date()
-    private var relayTokenUsageRecords: [CodexTokenUsageRecord] = []
     private let logStore = HarborLogStore()
-    private let requestMonitorStateStore = CodexRequestMonitorStateStore()
 
     init() {
         let store = LocalSecretStore.liveMigratingLegacyKeychain()
@@ -75,13 +64,17 @@ final class AppModel: ObservableObject {
         service = HarborServiceClient()
         profileCatalog = ProfileCatalogCoordinator(store: store)
         activityStore = ConnectionActivityStore()
-        requestMonitor = CodexRequestMonitor()
-        tokenUsageMonitor = CodexTokenUsageMonitor()
+        let codexPaths = CodexPaths.live()
+        let relayActivityStore = RelayActivityStore(paths: codexPaths)
+        self.relayActivityStore = relayActivityStore
+        telemetryCoordinator = CodexTelemetryCoordinator(
+            paths: codexPaths,
+            relayActivityStore: relayActivityStore
+        )
+        authenticationChangeMonitor = CodexAuthenticationChangeMonitor(paths: codexPaths)
+        relayActivityChangeMonitor = RelayActivityChangeMonitor(paths: codexPaths)
         relayConfigurationStore = RelayConfigurationStore()
-        relayActivityStore = RelayActivityStore()
         providerUsageAdapter = ProviderUsageAdapterClient()
-        observedAuthenticationDigest = Self.authenticationDigest(at: CodexPaths.live().authURL)
-        observedCodexTurnIDs = requestMonitorStateStore.load()
         activityEvents = (try? activityStore.load()) ?? []
         logs = logStore.load()
     }
@@ -134,6 +127,8 @@ final class AppModel: ObservableObject {
         }
         await refreshConnectionHealth(logResult: false)
         if let activeCustomProfile { await refreshProviderBilling(for: activeCustomProfile.id) }
+        startAuthenticationChangeMonitor()
+        startRelayActivityChangeMonitor()
         startCodexRequestMonitor()
     }
 
@@ -1153,7 +1148,7 @@ final class AppModel: ObservableObject {
         environment = try await manager.inspect()
         try await profileCatalog.migrateLegacyIfNeeded(environment: environment)
         try await profileCatalog.synchronizeCurrentAccountIfPresent()
-        observedAuthenticationDigest = Self.authenticationDigest(at: CodexPaths.live().authURL)
+        await telemetryCoordinator.markAuthenticationCurrent()
         try await refreshCatalog()
         if environment.activeMode != .harbor || activeCustomProfile == nil {
             HarborRelayProcess.stopIfRunning()
@@ -1285,13 +1280,10 @@ final class AppModel: ObservableObject {
         since: Date? = nil
     ) -> Int {
         guard connectionKind == .apiKey else { return 0 }
-        let records = (try? relayActivityStore.load()) ?? []
-        return records.reduce(0) { result, record in
-            guard (profileID == nil || record.profileID == profileID),
-                  (since == nil || record.startedAt >= since!),
-                  let billed = record.usage.billedTokens else { return result }
-            return result + billed
-        }
+        return (try? relayActivityStore.billedTokenTotal(
+            profileID: profileID,
+            since: since
+        )) ?? 0
     }
 
     func refreshProviderBilling(for profileID: UUID) async {
@@ -1308,30 +1300,50 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func startAuthenticationChangeMonitor() {
+        authenticationChangeMonitor.start { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isBusy else { return }
+                await self.telemetryCoordinator.markAuthenticationCurrent()
+                await self.synchronizeAccountProfileAfterAuthenticationChange()
+            }
+        }
+    }
+
+    private func startRelayActivityChangeMonitor() {
+        relayActivityChangeMonitor.start { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.telemetryConnectionSnapshot?.kind == .apiKey else { return }
+                await self.refreshCodexTelemetry(seedRequests: false)
+            }
+        }
+    }
+
     private func startCodexRequestMonitor() {
         guard requestMonitorTask == nil else { return }
         requestMonitorTask = Task { [weak self] in
             guard let self else { return }
-            var shouldSeed = self.observedCodexTurnIDs.isEmpty
+            var shouldSeed = await self.telemetryCoordinator.shouldSeedRequests
+
             while !Task.isCancelled {
-                await self.synchronizeAccountProfileIfAuthenticationChanged()
-                let tokenRecords = await self.tokenUsageMonitor.recentUsage()
-                self.ingestRelayRecords()
-                let mergedTokenRecords = Dictionary(
-                    (tokenRecords + self.relayTokenUsageRecords).map { ($0.id, $0) },
-                    uniquingKeysWith: { _, newest in newest }
-                ).values.sorted { $0.timestamp < $1.timestamp }
-                if self.codexTokenUsageRecords != mergedTokenRecords {
-                    self.codexTokenUsageRecords = mergedTokenRecords
-                }
-                self.ingestTokenUsageRecords(tokenRecords)
-                await self.pollCodexRequests(seedOnly: shouldSeed)
+                await self.refreshCodexTelemetry(seedRequests: shouldSeed)
                 shouldSeed = false
-                // Request/token telemetry is background product data,
-                // not a connection heartbeat. Ten seconds keeps the dashboard
-                // responsive without waking SQLite and rollout readers every 3s.
+
+                let interval: Int
+                switch self.telemetryConnectionSnapshot?.kind {
+                case .apiKey:
+                    // Relay SQLite changes wake telemetry immediately. Keep a
+                    // slower fallback in case vnode delivery is unavailable.
+                    interval = 60
+                case .account, .harborKey:
+                    interval = 10
+                case nil:
+                    interval = 30
+                }
+
                 do {
-                    try await Task.sleep(for: .seconds(10))
+                    try await Task.sleep(for: .seconds(interval))
                 } catch {
                     break
                 }
@@ -1339,13 +1351,35 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func synchronizeAccountProfileIfAuthenticationChanged() async {
-        let authURL = CodexPaths.live().authURL
-        let latestDigest = Self.authenticationDigest(at: authURL)
-        guard latestDigest != observedAuthenticationDigest else { return }
-        observedAuthenticationDigest = latestDigest
-        guard latestDigest != nil else { return }
+    private func refreshCodexTelemetry(seedRequests: Bool) async {
+        let existingSources = Set(activityEvents.compactMap(\.sourceID))
+        let update = await telemetryCoordinator.poll(
+            connection: telemetryConnectionSnapshot,
+            existingActivitySourceIDs: existingSources,
+            seedRequests: seedRequests
+        )
 
+        if update.authenticationChanged {
+            await synchronizeAccountProfileAfterAuthenticationChange()
+        }
+
+        if codexTokenUsageRecords != update.tokenUsageRecords {
+            codexTokenUsageRecords = update.tokenUsageRecords
+        }
+
+        var changed = false
+        for event in update.activityEvents {
+            if let updated = try? activityStore.append(event, to: activityEvents) {
+                activityEvents = updated
+                changed = true
+            }
+        }
+        if changed {
+            objectWillChange.send()
+        }
+    }
+
+    private func synchronizeAccountProfileAfterAuthenticationChange() async {
         do {
             try await profileCatalog.synchronizeCurrentAccountIfPresent()
             try await refreshCatalog()
@@ -1355,146 +1389,25 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private nonisolated static func authenticationDigest(at url: URL) -> SHA256.Digest? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return SHA256.hash(data: data)
-    }
-
-    private func pollCodexRequests(seedOnly: Bool) async {
-        let monitor = requestMonitor
-        let records = (try? await Task.detached(priority: .utility) {
-            try monitor.recentTurns()
-        }.value) ?? []
-        guard !records.isEmpty else { return }
-
-        if seedOnly {
-            // Do not seed in-progress turns. They must be observed again after
-            // completion so the request is counted exactly once.
-            let terminalIDs = records.filter(\.isTerminal).map(\.id)
-            observedCodexTurnIDs.formUnion(terminalIDs)
-            records.filter { !$0.isTerminal }.forEach { observedCodexTurnIDs.remove($0.id) }
-            persistRequestMonitorState()
-            return
-        }
-
-        // Capture the connection at turn start. A user may switch Harbor
-        // connections while a Codex turn is running; attribution should stay
-        // with the connection that actually started that turn.
-        if let snapshot = liveConnectionSnapshot {
-            for record in records where !record.isTerminal {
-                if activeCodexTurnSnapshots[record.id] == nil {
-                    activeCodexTurnSnapshots[record.id] = CodexRequestConnectionSnapshot(
-                        kind: snapshot.kind,
-                        profileID: snapshot.profileID
-                    )
-                }
-                observedCodexTurnIDs.remove(record.id)
-            }
-        }
-
-        var didAdd = false
-        for record in records.reversed() where record.isTerminal {
-            guard !observedCodexTurnIDs.contains(record.id) else { continue }
-            observedCodexTurnIDs.insert(record.id)
-            let startedAt = record.startedAt ?? record.completedAt ?? Date()
-            let snapshot = activeCodexTurnSnapshots.removeValue(forKey: record.id)
-                ?? liveConnectionSnapshot.map { CodexRequestConnectionSnapshot(kind: $0.kind, profileID: $0.profileID) }
-            guard let snapshot else { continue }
-            guard snapshot.kind != .apiKey else { continue }
-            recordActivity(
-                .codexRequest,
-                connectionKind: snapshot.kind,
-                profileID: snapshot.profileID,
-                succeeded: record.status == "completed",
-                startedAt: startedAt,
-                durationMilliseconds: record.durationMilliseconds,
-                sourceID: record.id
-            )
-            didAdd = true
-        }
-        if didAdd { persistRequestMonitorState() }
-    }
-
-    /// Token usage records are written to rollout JSONL slightly before the
-    /// SQLite projection is updated. Ingesting them as a fallback keeps the
-    /// dashboard live without waiting for the projection, while the startup
-    /// timestamp prevents historical records from being backfilled.
-    private func ingestTokenUsageRecords(_ records: [CodexTokenUsageRecord]) {
-        guard let snapshot = liveConnectionSnapshot else { return }
-        guard snapshot.kind != .apiKey else { return }
-        let existingSources = Set(activityEvents.compactMap { event -> String? in
-            guard event.kind == .codexRequest else { return nil }
-            return event.sourceID
-        })
-        for record in records where
-            record.timestamp >= requestMonitorStartedAt &&
-            !existingSources.contains(record.id) &&
-            !observedCodexTurnIDs.contains(record.id) {
-            observedCodexTurnIDs.insert(record.id)
-            recordActivity(
-                .codexRequest,
-                connectionKind: snapshot.kind,
-                profileID: snapshot.profileID,
-                succeeded: true,
-                startedAt: record.timestamp,
-                durationMilliseconds: nil,
-                sourceID: record.id
-            )
-        }
-        persistRequestMonitorState()
-    }
-
-    private func ingestRelayRecords() {
-        guard let records = try? relayActivityStore.load() else { return }
-        let existingSources = Set(activityEvents.compactMap(\.sourceID))
-        var changed = false
-        var tokenRecords: [CodexTokenUsageRecord] = []
-        for record in records {
-            if !existingSources.contains(record.id) {
-                let event = ConnectionActivityEvent(
-                    timestamp: record.startedAt,
-                    connectionKind: .apiKey,
-                    profileID: record.profileID,
-                    kind: .codexRequest,
-                    succeeded: record.succeeded,
-                    durationMilliseconds: record.durationMilliseconds,
-                    sourceID: record.id
-                )
-                if let updated = try? activityStore.append(event, to: activityEvents) {
-                    activityEvents = updated
-                    changed = true
-                }
-            }
-            guard record.usage.source != .unavailable else { continue }
-            tokenRecords.append(CodexTokenUsageRecord(
-                id: record.id,
-                timestamp: record.startedAt,
-                inputTokens: record.usage.inputTokens,
-                cachedInputTokens: record.usage.cachedInputTokens,
-                outputTokens: record.usage.outputTokens,
-                reasoningOutputTokens: record.usage.reasoningOutputTokens,
-                totalTokens: record.usage.totalTokens
-            ))
-        }
-        relayTokenUsageRecords = tokenRecords
-        if changed { objectWillChange.send() }
-    }
-
-    private var liveConnectionSnapshot: (kind: CodexConnectionKind, profileID: UUID?)? {
+    private var telemetryConnectionSnapshot: CodexTelemetryConnectionSnapshot? {
         switch environment.activeMode {
         case .chatGPT:
-            return (.account, selectedAccountProfileID)
+            return CodexTelemetryConnectionSnapshot(
+                kind: .account,
+                profileID: selectedAccountProfileID
+            )
         case .harbor:
             guard let activeProfileID,
-                  let profile = profiles.first(where: { $0.id == activeProfileID }) else { return nil }
-            return (profile.kind.connectionKind, activeProfileID)
+                  let profile = profiles.first(where: { $0.id == activeProfileID }) else {
+                return nil
+            }
+            return CodexTelemetryConnectionSnapshot(
+                kind: profile.kind.connectionKind,
+                profileID: activeProfileID
+            )
         case nil:
             return nil
         }
-    }
-
-    private func persistRequestMonitorState() {
-        requestMonitorStateStore.save(observedCodexTurnIDs)
     }
 
     private func recordActivity(

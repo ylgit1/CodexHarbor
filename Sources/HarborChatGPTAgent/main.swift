@@ -579,7 +579,11 @@ private actor AgentLifecycle {
                 state: health.mcp.state,
                 message: mcp == .ready ? "MCP 正常" : "MCP 未就绪",
                 lastCheckAt: checkedAt,
-                details: ["127.0.0.1:\(mcpPort)", "tools：\(mcpToolCount) 个"]
+                details: [
+                    "127.0.0.1:\(mcpPort)",
+                    "tools：\(mcpToolCount) 个",
+                    "工具目录：\(MCPToolCatalogMetadata.version)"
+                ]
             ),
             BridgeNodeDiagnostic(
                 id: "tunnel-client",
@@ -635,6 +639,8 @@ private actor AgentLifecycle {
             processIdentifier: agent == .running ? ProcessInfo.processInfo.processIdentifier : nil,
             mcpPort: mcp == .ready ? mcpPort : nil,
             mcpURL: mcp == .ready ? mcpURL.absoluteString : nil,
+            toolCatalogVersion: mcp == .ready ? MCPToolCatalogMetadata.version : nil,
+            toolCatalogCount: mcp == .ready ? MCPToolCatalogMetadata.toolCount : nil,
             startedAt: agent == .running ? startedAt : nil,
             lastToolCallAt: lastToolCallAt,
             transportHealthCheckedAt: transportHealthCheckedAt,
@@ -710,6 +716,11 @@ private final class TerminationSignalWaiter: @unchecked Sendable {
 @main
 struct HarborChatGPTAgentMain {
     static func main() async throws {
+        if CommandLine.arguments.contains("--print-tool-catalog") {
+            print("\(MCPToolCatalogMetadata.version)|\(MCPToolCatalogMetadata.toolCount)")
+            return
+        }
+
         let paths = try BridgePaths.live()
         try paths.ensureDirectories()
 
@@ -760,7 +771,35 @@ struct HarborChatGPTAgentMain {
                         transportMode: .httpsCompatibility,
                         hostname: hostname,
                         configuredAt: configuredAt,
-                        lastActivityAt: now
+                        lastActivityAt: now,
+                        discoveredToolCatalogVersion: existing?.discoveredToolCatalogVersion,
+                        discoveredToolCount: existing?.discoveredToolCount,
+                        catalogDiscoveredAt: existing?.catalogDiscoveredAt
+                    )
+                )
+            },
+            onToolCatalogDiscovered: {
+                let now = Date()
+                let existing = integrationStore.load()
+                let hostname = configuration.transportMode == .httpsCompatibility
+                    ? configuration.httpsCompatibility?.hostname
+                    : nil
+                let sameTransport = existing?.transportMode == configuration.transportMode
+                let sameHost = configuration.transportMode == .secureTunnel
+                    || existing?.hostname?.caseInsensitiveCompare(hostname ?? "") == .orderedSame
+                let configuredAt = sameTransport && sameHost
+                    ? (existing?.configuredAt ?? now)
+                    : now
+
+                try? integrationStore.save(
+                    ChatGPTIntegrationMarker(
+                        transportMode: configuration.transportMode,
+                        hostname: hostname,
+                        configuredAt: configuredAt,
+                        lastActivityAt: now,
+                        discoveredToolCatalogVersion: MCPToolCatalogMetadata.version,
+                        discoveredToolCount: MCPToolCatalogMetadata.toolCount,
+                        catalogDiscoveredAt: now
                     )
                 )
             }

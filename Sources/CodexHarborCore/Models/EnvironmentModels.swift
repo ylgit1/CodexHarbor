@@ -127,5 +127,6 @@ public struct CodexPaths: Sendable {
     public var activityEventsURL: URL { appSupport.appendingPathComponent("activity-events.json") }
     public var relayConfigurationURL: URL { appSupport.appendingPathComponent("relay-configuration.json") }
     public var relayEventsURL: URL { appSupport.appendingPathComponent("relay-events.json") }
+    public var relayEventsDatabaseURL: URL { appSupport.appendingPathComponent("relay-events.sqlite") }
     public var relayPIDURL: URL { appSupport.appendingPathComponent("relay.pid") }
 }

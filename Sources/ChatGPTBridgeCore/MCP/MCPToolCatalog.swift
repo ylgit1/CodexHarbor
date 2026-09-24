@@ -1,4 +1,21 @@
+import CryptoKit
 import Foundation
+
+public enum MCPToolCatalogMetadata {
+    public static let toolCount = MCPToolCatalog.definitions.count
+    public static let toolNames = MCPToolCatalog.definitions.map(\.name)
+
+    public static let version: String = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = (try? encoder.encode(MCPToolCatalog.definitions)) ?? Data()
+        let digest = SHA256.hash(data: data)
+            .prefix(6)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "3.0-\(toolCount)-\(digest)"
+    }()
+}
 
 enum MCPToolCatalog {
     static let definitions: [MCPToolDefinition] = [
@@ -410,6 +427,31 @@ enum MCPToolCatalog {
             annotations: mutatingAnnotations
         ),
         MCPToolDefinition(
+            name: "coding_task",
+            title: "Coding Task",
+            description: "Run a stateful coding task around one Task ID. Actions: start applies model-supplied precise changes then automatically diff/tests/builds/packages; status inspects progress; output reads current command output; repair applies a repair patch to the same task and automatically re-verifies; cancel stops the active command. Harbor owns orchestration and verification while the model remains responsible for understanding requirements and generating code changes.",
+            inputSchema: objectSchema(
+                properties: [
+                    "action": stringSchema(description: "start, status, output, repair, or cancel; defaults to start"),
+                    "workspaceId": stringSchema(description: "Optional workspace UUID; the active session workspace is used for start"),
+                    "taskId": stringSchema(description: "Coding Task UUID for status/output/repair/cancel"),
+                    "requirement": stringSchema(description: "User requirement recorded with a start action"),
+                    "changes": arraySchema(items: codingTaskChangeSchema),
+                    "includeTests": .object(["type": .string("boolean"), "default": .bool(true)]),
+                    "includeBuild": .object(["type": .string("boolean"), "default": .bool(true)]),
+                    "includePackage": .object(["type": .string("boolean"), "default": .bool(true)]),
+                    "maxRepairAttempts": integerSchema(minimum: 0, maximum: 5),
+                    "timeoutSeconds": integerSchema(minimum: 1, maximum: ShellTool.maximumTimeoutSeconds),
+                    "stdoutOffset": integerSchema(minimum: 0),
+                    "stderrOffset": integerSchema(minimum: 0),
+                    "limitBytes": integerSchema(minimum: 1, maximum: CommandSessionManager.maximumOutputChunkBytes)
+                ],
+                required: []
+            ),
+            outputSchema: codingTaskResponseSchema,
+            annotations: mutatingAnnotations
+        ),
+        MCPToolDefinition(
             name: "repair_project",
             title: "Repair Swift project",
             description: "Run a permission-aware Swift repair workflow: inspect Git, test, optionally apply a reviewed unified diff, retest, and build.",
@@ -669,6 +711,70 @@ enum MCPToolCatalog {
             "steps": arraySchema(items: projectWorkflowStepResultSchema)
         ],
         required: ["kind", "state", "message", "steps"]
+    )
+
+    private static let codingTaskChangeSchema = objectSchema(
+        properties: [
+            "path": stringSchema(description: "Workspace-relative file path"),
+            "mode": stringSchema(description: "old_new, line_range, or unified_diff"),
+            "oldText": stringSchema(description: "Exact existing text for old_new"),
+            "newText": stringSchema(description: "Replacement text for old_new"),
+            "startLine": integerSchema(minimum: 1),
+            "endLine": integerSchema(minimum: 1),
+            "content": stringSchema(description: "Replacement content for line_range"),
+            "patch": stringSchema(description: "Unified diff for unified_diff")
+        ],
+        required: ["path"]
+    )
+
+    private static let codingTaskStepSchema = objectSchema(
+        properties: [
+            "index": integerSchema(minimum: 0),
+            "name": stringSchema(description: "Verification/package step name"),
+            "executable": stringSchema(description: "Step executable"),
+            "arguments": stringArraySchema,
+            "state": stringSchema(description: "pending, running, completed, failed, cancelled, or timedOut"),
+            "commandID": stringSchema(description: "Backing command session UUID"),
+            "exitCode": signedIntegerSchema,
+            "errors": arraySchema(items: buildErrorSchema)
+        ],
+        required: ["index", "name", "executable", "arguments", "state", "errors"]
+    )
+
+    private static let codingTaskResponseSchema = objectSchema(
+        properties: [
+            "taskID": stringSchema(description: "Persistent Coding Task UUID"),
+            "workspaceID": stringSchema(description: "Workspace UUID owned by this task"),
+            "requirement": stringSchema(description: "Original user requirement"),
+            "state": stringSchema(description: "planned, running, needsRepair, completed, failed, cancelled, timedOut, or unsupported"),
+            "phase": stringSchema(description: "analyzing, modifying, diffing, testing, building, packaging, repairing, or complete"),
+            "message": stringSchema(description: "Current task message"),
+            "startedAt": dateValueSchema,
+            "finishedAt": dateValueSchema,
+            "durationMilliseconds": integerSchema(minimum: 0),
+            "repairAttempt": integerSchema(minimum: 0),
+            "maximumRepairAttempts": integerSchema(minimum: 0),
+            "appliedChanges": stringArraySchema,
+            "changedFiles": arraySchema(items: gitFileChangeSchema),
+            "errors": arraySchema(items: buildErrorSchema),
+            "currentCommandID": stringSchema(description: "Current or most recent command session UUID"),
+            "steps": arraySchema(items: codingTaskStepSchema),
+            "stdout": stringSchema(description: "Current command output for action=output"),
+            "stderr": stringSchema(description: "Current command error output for action=output"),
+            "stdoutOffset": integerSchema(minimum: 0),
+            "stderrOffset": integerSchema(minimum: 0),
+            "nextStdoutOffset": integerSchema(minimum: 0),
+            "nextStderrOffset": integerSchema(minimum: 0),
+            "stdoutHasMore": booleanSchema(description: "Whether more stdout is available"),
+            "stderrHasMore": booleanSchema(description: "Whether more stderr is available")
+        ],
+        required: [
+            "taskID", "workspaceID", "requirement", "state", "phase", "message",
+            "startedAt", "durationMilliseconds", "repairAttempt", "maximumRepairAttempts",
+            "appliedChanges", "changedFiles", "errors", "steps", "stdout", "stderr",
+            "stdoutOffset", "stderrOffset", "nextStdoutOffset", "nextStderrOffset",
+            "stdoutHasMore", "stderrHasMore"
+        ]
     )
 
     private static let patchFileResultSchema = objectSchema(

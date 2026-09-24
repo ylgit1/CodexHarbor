@@ -556,7 +556,7 @@ struct HarborHomeDashboardView: View {
                     Image(systemName: "display")
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(HarborColors.blue)
-                    Text("ChatGPT 本地访问")
+                    Text("ChatGPT 接入")
                         .font(.system(size: 14, weight: .semibold))
                     Spacer()
                     HarborStatusBadge(
@@ -577,7 +577,7 @@ struct HarborHomeDashboardView: View {
                 Button(action: onOpenLocalAccess) {
                     HStack {
                         Spacer()
-                        Text("进入本地访问")
+                        Text("进入 ChatGPT 接入")
                         Image(systemName: "arrow.right")
                         Spacer()
                     }

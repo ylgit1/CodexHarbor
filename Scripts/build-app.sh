@@ -13,6 +13,10 @@ lock_dir="$build_root/build-app.lock"
 lock_pid_file="$lock_dir/pid"
 
 mode="${1:-fast}"
+install_app=true
+if [[ "${2:-}" == "--no-install" ]]; then
+  install_app=false
+fi
 jobs="${CODEX_HARBOR_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
 acquire_build_lock() {
@@ -74,7 +78,7 @@ case "$mode" in
     echo "==> 跳过编译，直接打包现有 Release 产物"
     ;;
   *)
-    echo "用法：$0 [fast|full|package-only]" >&2
+    echo "用法：$0 [fast|full|package-only] [--no-install]" >&2
     exit 2
     ;;
 esac
@@ -97,6 +101,12 @@ mv "$staging_app_path" "$app_path"
 
 echo "==> Release 包已生成：$app_path"
 
+if [[ "$install_app" != true ]]; then
+  echo "==> --no-install：仅生成 Release App，不替换 /Applications、不重载 Agent"
+  echo "$app_path"
+  exit 0
+fi
+
 echo "==> 安装到 /Applications"
 rm -rf "$installed_staging_path" "$installed_backup_path"
 /usr/bin/ditto "$app_path" "$installed_staging_path"
@@ -108,7 +118,7 @@ if [[ -e "$installed_app_path" ]]; then
 fi
 
 if mv "$installed_staging_path" "$installed_app_path"; then
-  rm -rf "$installed_backup_path"
+  echo "==> 新版已替换，保留上一版本直到运行态健康验证完成"
 else
   echo "安装新版失败，正在恢复原应用。" >&2
   rm -rf "$installed_staging_path"
@@ -118,21 +128,15 @@ else
   exit 5
 fi
 
-codesign --verify --deep --strict "$installed_app_path"
-plutil -lint "$installed_app_path/Contents/Info.plist"
-[[ -x "$installed_app_path/Contents/Helpers/HarborChatGPTAgent" ]] || {
-  echo "安装后的 HarborChatGPTAgent 不存在或不可执行。" >&2
-  exit 6
-}
+/bin/zsh "$project_root/Scripts/verify-installed-app.sh" --offline
 
-echo "==> 检查当前本地 MCP 健康状态"
-if health_json="$(curl -fsS --max-time 3 http://127.0.0.1:19473/health 2>/dev/null)"; then
-  echo "$health_json"
-elif lsof -nP -iTCP:19473 -sTCP:LISTEN 2>/dev/null | grep -q "HarborCha"; then
-  echo "HarborChatGPTAgent 正在监听 19473，但 /health 检查失败。" >&2
-  exit 7
-else
-  echo "==> 应用已替换；本地服务当前未运行，跳过在线健康检查"
-fi
+verify_log="/tmp/codexharbor-install-verify.log"
+verify_status="/tmp/codexharbor-install-verify.status"
+rm -f "$verify_log" "$verify_status"
+nohup /bin/zsh "$project_root/Scripts/reload-and-verify-installed-app.sh" >"$verify_log" 2>&1 &
 
+echo "==> 已安排 Agent 安全重载与运行态校验"
+echo "    状态：$verify_status"
+echo "    日志：$verify_log"
+echo "    若 health/catalog 校验失败，将自动恢复上一版本。"
 echo "$installed_app_path"

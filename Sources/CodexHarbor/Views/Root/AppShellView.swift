@@ -363,7 +363,7 @@ struct AppShellView: View {
                 onDeleteProfile: { deletionTarget = .api($0) }
             )
         } else {
-            Button("返回连接管理") {
+            Button("返回 Codex 连接") {
                 showingConnectionDetail = false
             }
         }

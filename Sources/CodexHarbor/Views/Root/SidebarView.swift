@@ -12,10 +12,10 @@ enum HarborMainPage: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .home: "首页"
-        case .connections: "连接管理"
+        case .home: "概览"
+        case .connections: "Codex 连接"
         case .analytics: "使用统计"
-        case .localAccess: "本地访问"
+        case .localAccess: "ChatGPT 接入"
         case .settings: "设置"
         }
     }
@@ -78,7 +78,7 @@ struct HarborSidebarView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Codex Harbor")
                     .font(.system(size: 13, weight: .bold, design: .rounded))
-                Text("连接更好的 AI")
+                Text("AI 开发控制中心")
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(.secondary)
             }

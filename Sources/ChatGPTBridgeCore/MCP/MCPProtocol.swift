@@ -82,10 +82,10 @@ public struct MCPRequestContext: Sendable {
 
 public actor MCPServer {
     public static let serverName = "Codex Harbor Local"
-    public static let serverVersion = "0.2.0"
+    public static let serverVersion = "0.3.0"
 
     private static let workflowInstructions = """
-    Use Codex Harbor Local tools only inside user-approved workspace roots. Work as a continuous coding workflow: open the workspace, inspect the relevant files, make the requested changes, run targeted verification, diagnose failures, and continue until the user's requested outcome is complete. Do not stop merely after opening a workspace, reading a file, applying one edit, or running one command. Stop only when the task is verified complete, an explicit approval or missing user decision is required, or a permission boundary blocks progress. After open_workspace, the active workspace is retained across follow-up calls and reconnects, so workspaceId may be omitted.
+    Use Codex Harbor Local tools only inside user-approved workspace roots. Work as a continuous coding workflow until the user's requested outcome is implemented and verified. For substantial requests that include modification plus test/build/package, prefer coding_task after inspecting enough context to produce precise changes: start one Task ID, follow it with status/output, and when it reports needsRepair generate a focused repair change and continue the same Task ID. Use lower-level patch_file, run_command, start_command, or start_workflow when the task is exploratory, partial, or does not fit Coding Task. Do not stop merely after opening a workspace, reading a file, applying one edit, or running one command. Stop only when the task is verified complete, an explicit approval or missing user decision is required, or a permission boundary blocks progress. After open_workspace, the active workspace is retained across follow-up calls and reconnects, so workspaceId may be omitted.
     """
 
     private let router: ToolRouter
@@ -176,6 +176,8 @@ public actor MCPServer {
                 "name": .string(Self.serverName),
                 "version": .string(Self.serverVersion)
             ]),
+            "toolCatalogVersion": .string(MCPToolCatalogMetadata.version),
+            "toolCount": .number(Double(MCPToolCatalogMetadata.toolCount)),
             "instructions": .string(Self.workflowInstructions)
         ])
     }
@@ -186,6 +188,8 @@ public actor MCPServer {
             "capabilities": .object([
                 "tools": .object([:])
             ]),
+            "toolCatalogVersion": .string(MCPToolCatalogMetadata.version),
+            "toolCount": .number(Double(MCPToolCatalogMetadata.toolCount)),
             "instructions": .string(Self.workflowInstructions),
             "ttlMs": .number(60_000),
             "cacheScope": .string("private")
@@ -197,6 +201,8 @@ public actor MCPServer {
         let tools = definitions.compactMap { try? JSONValue.encoded($0) }
         return completeResult([
             "tools": .array(tools),
+            "toolCatalogVersion": .string(MCPToolCatalogMetadata.version),
+            "toolCount": .number(Double(MCPToolCatalogMetadata.toolCount)),
             "ttlMs": .number(60_000),
             "cacheScope": .string("private")
         ])
@@ -307,6 +313,8 @@ public actor MCPServer {
             return "Cancellation step complete. Verify the final task status before finishing."
         case "run_workflow", "repair_project":
             return "Workflow step complete. Continue from the returned workflow state until the requested task is verified or user input is required."
+        case "coding_task":
+            return "Coding Task state updated. Keep using the same taskId: poll status/output while running; if needsRepair, generate a precise repair change and call action=repair; finish only when the task is completed or a real user decision is required."
         default:
             return "Tool step complete. Continue until the user's requested outcome is verified."
         }

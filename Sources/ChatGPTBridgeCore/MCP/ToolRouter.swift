@@ -15,6 +15,8 @@ public actor ToolRouter {
     private let repairAgent: RepairAgent
     private let workflowAgent: ProjectWorkflowAgent
     private let workflowSessionManager: WorkflowSessionManager
+    private let codingTaskManager: CodingTaskManager
+    private let permissionEngine: PermissionEngine
     private let auditLogger: AuditLogger
     private let approvalStore: BridgeApprovalStore?
     private let workspaceSessionStore: WorkspaceSessionStore
@@ -31,6 +33,7 @@ public actor ToolRouter {
         self.approvalStore = approvalStore
         self.workspaceSessionStore = workspaceSessionStore
         let permissions = PermissionEngine(configuration: configuration)
+        self.permissionEngine = permissions
         self.openWorkspaceTool = OpenWorkspaceTool(workspaceManager: workspaceManager)
         self.readTool = ReadFileTool(workspaceManager: workspaceManager)
         self.searchTool = SearchTool(workspaceManager: workspaceManager)
@@ -78,6 +81,13 @@ public actor ToolRouter {
         self.workflowAgent = workflowAgent
         self.workflowSessionManager = WorkflowSessionManager(
             workflowAgent: workflowAgent,
+            commandSessionManager: commandSessionManager,
+            auditLogger: auditLogger
+        )
+        self.codingTaskManager = CodingTaskManager(
+            workspaceManager: workspaceManager,
+            patchTool: patchTool,
+            gitService: gitService,
             commandSessionManager: commandSessionManager,
             auditLogger: auditLogger
         )
@@ -466,6 +476,118 @@ public actor ToolRouter {
                 )
                 return try JSONValue.encoded(result)
 
+            case "coding_task":
+                let action = optionalString("action", in: arguments) ?? "start"
+                switch action {
+                case "start":
+                    let targetWorkspace = try await resolveWorkspaceID(
+                        in: arguments,
+                        sessionID: context.sessionID
+                    )
+                    let requirement = try requiredString("requirement", in: arguments)
+                    let changes = try codingTaskChanges(in: arguments)
+                    let includeTests = optionalBool("includeTests", in: arguments) ?? true
+                    let includeBuild = optionalBool("includeBuild", in: arguments) ?? true
+                    let includePackage = optionalBool("includePackage", in: arguments) ?? true
+                    let timeoutSeconds = try optionalInt("timeoutSeconds", in: arguments)
+                        ?? ShellTool.maximumTimeoutSeconds
+                    let maximumRepairAttempts = try optionalInt("maxRepairAttempts", in: arguments) ?? 2
+
+                    let plan = try await workflowAgent.plan(
+                        workspaceID: targetWorkspace,
+                        includeTests: includeTests,
+                        includeBuild: includeBuild
+                    )
+                    let workspace = try await workspaceManager.workspace(id: targetWorkspace)
+                    let packageCommand = includePackage
+                        ? CodingTaskManager.packageCommand(for: workspace)
+                        : nil
+                    let commands = plan.commands + (packageCommand.map { [$0] } ?? [])
+                    let approvalGranted = try approvalState(
+                        tool: name,
+                        workspaceID: targetWorkspace,
+                        target: ".",
+                        details: [requirement] + changes.map(\.path),
+                        fallback: context.approvalGranted
+                    )
+                    try authorizeCodingTask(
+                        changes: changes,
+                        commands: commands,
+                        timeoutSeconds: timeoutSeconds,
+                        approvalGranted: approvalGranted
+                    )
+
+                    return try JSONValue.encoded(
+                        try await codingTaskManager.start(
+                            workspaceID: targetWorkspace,
+                            requirement: requirement,
+                            changes: changes,
+                            plan: plan,
+                            packageCommand: packageCommand,
+                            timeoutSeconds: timeoutSeconds,
+                            maximumRepairAttempts: maximumRepairAttempts,
+                            approvalGranted: approvalGranted
+                        )
+                    )
+
+                case "status":
+                    return try JSONValue.encoded(
+                        try await codingTaskManager.status(
+                            taskID: try requiredUUID("taskId", in: arguments)
+                        )
+                    )
+
+                case "output":
+                    return try JSONValue.encoded(
+                        try await codingTaskManager.output(
+                            taskID: try requiredUUID("taskId", in: arguments),
+                            stdoutOffset: try optionalInt("stdoutOffset", in: arguments) ?? 0,
+                            stderrOffset: try optionalInt("stderrOffset", in: arguments) ?? 0,
+                            limitBytes: try optionalInt("limitBytes", in: arguments)
+                                ?? CommandSessionManager.maximumOutputChunkBytes
+                        )
+                    )
+
+                case "repair":
+                    let taskID = try requiredUUID("taskId", in: arguments)
+                    let changes = try codingTaskChanges(in: arguments)
+                    let taskStatus = try await codingTaskManager.status(taskID: taskID)
+                    let timeoutSeconds = try optionalInt("timeoutSeconds", in: arguments)
+                        ?? ShellTool.maximumTimeoutSeconds
+                    let approvalGranted = try approvalState(
+                        tool: name,
+                        workspaceID: taskStatus.workspaceID,
+                        target: ".",
+                        details: ["repair", taskID.uuidString] + changes.map(\.path),
+                        fallback: context.approvalGranted
+                    )
+                    try authorizeCodingTask(
+                        changes: changes,
+                        commands: try await codingTaskManager.commands(taskID: taskID),
+                        timeoutSeconds: timeoutSeconds,
+                        approvalGranted: approvalGranted
+                    )
+                    return try JSONValue.encoded(
+                        try await codingTaskManager.repair(
+                            taskID: taskID,
+                            changes: changes,
+                            approvalGranted: approvalGranted
+                        )
+                    )
+
+                case "cancel":
+                    return try JSONValue.encoded(
+                        try await codingTaskManager.cancel(
+                            taskID: try requiredUUID("taskId", in: arguments)
+                        )
+                    )
+
+                default:
+                    throw ToolRouterError.invalidArguments(
+                        "coding_task action 仅支持 start/status/output/repair/cancel"
+                    )
+                }
+
             default:
                 throw ToolRouterError.unknownTool(name)
             }
@@ -655,6 +777,55 @@ public actor ToolRouter {
         return integer
     }
 
+    private func codingTaskChanges(in arguments: [String: JSONValue]) throws -> [CodingTaskChange] {
+        try (arguments["changes"]?.arrayValue ?? []).map { raw in
+            guard let object = raw.objectValue,
+                  let path = object["path"]?.stringValue,
+                  !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ToolRouterError.invalidArguments("changes 中每项都必须包含 path")
+            }
+            return CodingTaskChange(
+                path: path,
+                mode: object["mode"]?.stringValue ?? "old_new",
+                oldText: object["oldText"]?.stringValue,
+                newText: object["newText"]?.stringValue,
+                startLine: object["startLine"]?.intValue,
+                endLine: object["endLine"]?.intValue,
+                content: object["content"]?.stringValue,
+                patch: object["patch"]?.stringValue
+            )
+        }
+    }
+
+    private func authorizeCodingTask(
+        changes: [CodingTaskChange],
+        commands: [ProjectWorkflowCommand],
+        timeoutSeconds: Int,
+        approvalGranted: Bool
+    ) throws {
+        if !changes.isEmpty {
+            try permissionEngine.authorizePatch(PatchPermission(
+                operation: "Coding Task 修改 \(changes.count) 个文件",
+                approvalGranted: approvalGranted
+            ))
+        }
+
+        let policy = CommandPolicy()
+        for command in commands {
+            let request = CommandRequest(
+                executable: command.executable,
+                arguments: command.arguments,
+                workingDirectory: command.workingDirectory,
+                timeoutSeconds: timeoutSeconds
+            )
+            try permissionEngine.authorizeCommand(
+                policy.assess(request),
+                request: request,
+                approvalGranted: approvalGranted
+            )
+        }
+    }
+
     private func approvalState(
         tool: String,
         workspaceID: UUID?,
@@ -706,6 +877,13 @@ public actor ToolRouter {
             ]
         case "repair_project":
             return [arguments["path"]?.stringValue ?? "", arguments["patch"]?.stringValue ?? ""]
+        case "coding_task":
+            let action = arguments["action"]?.stringValue ?? "start"
+            let requirement = arguments["requirement"]?.stringValue ?? ""
+            let paths = (arguments["changes"]?.arrayValue ?? []).compactMap {
+                $0.objectValue?["path"]?.stringValue
+            }
+            return [action, requirement] + paths
         default:
             return []
         }

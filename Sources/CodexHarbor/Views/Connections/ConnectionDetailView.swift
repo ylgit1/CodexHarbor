@@ -28,7 +28,7 @@ struct HarborConnectionDetailView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Button(action: onBack) {
-                Label("返回连接管理", systemImage: "chevron.left")
+                Label("返回 Codex 连接", systemImage: "chevron.left")
                     .font(.system(size: 11, weight: .semibold))
             }
             .buttonStyle(HarborInteractivePlainButtonStyle(tint: Color.primary, cornerRadius: 9))

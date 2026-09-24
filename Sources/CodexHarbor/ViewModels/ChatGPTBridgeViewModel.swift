@@ -20,6 +20,9 @@ final class ChatGPTBridgeViewModel: ObservableObject {
     @Published private(set) var hasCloudflareZoneAPIToken = false
     @Published private(set) var isFetchingCloudflareZones = false
     @Published private(set) var chatGPTPublicHTTPSConfigured = false
+    @Published private(set) var discoveredToolCatalogVersion: String?
+    @Published private(set) var discoveredToolCount: Int?
+    @Published private(set) var catalogDiscoveredAt: Date?
     @Published private(set) var mcpHealthy = false
     @Published private(set) var launchAgentStatus: BridgeLaunchAgentStatus?
     @Published private(set) var diagnosticResults: [BridgeDiagnosticResult] = []
@@ -30,6 +33,7 @@ final class ChatGPTBridgeViewModel: ObservableObject {
     @Published private(set) var isWorking = false
     @Published private(set) var isDiagnosing = false
     @Published private(set) var isCloudflareAuthorizing = false
+    @Published private(set) var isExportingDiagnostics = false
     @Published private(set) var isSwitchingTransport = false
     @Published private(set) var transportSwitchMessage: String?
 
@@ -89,6 +93,30 @@ final class ChatGPTBridgeViewModel: ObservableObject {
 
     var overallReady: Bool {
         localReady && runtime.tunnel == .connected
+    }
+
+    var toolCatalogRefreshRequired: Bool {
+        guard let current = runtime.toolCatalogVersion,
+              let discovered = discoveredToolCatalogVersion else {
+            return false
+        }
+        return current != discovered || runtime.toolCatalogCount != discoveredToolCount
+    }
+
+    var toolCatalogWarningText: String? {
+        guard let currentVersion = runtime.toolCatalogVersion,
+              let currentCount = runtime.toolCatalogCount else { return nil }
+
+        if let discoveredVersion = discoveredToolCatalogVersion {
+            guard currentVersion != discoveredVersion || currentCount != discoveredToolCount else {
+                return nil
+            }
+            let chatGPTCount = discoveredToolCount.map { "\($0) 个工具" } ?? "工具数量未知"
+            return "服务端 \(currentCount) 个工具 / ChatGPT 当前会话 \(chatGPTCount)，工具目录版本不一致；重新连接或新建会话后会刷新。"
+        }
+
+        guard runtime.chatGPT != .notConfigured else { return nil }
+        return "服务端 \(currentCount) 个工具 / ChatGPT 当前会话尚未确认工具目录；首次完成 tools/list 后会自动确认。"
     }
 
     var isPublicHTTPSMode: Bool {
@@ -225,6 +253,45 @@ final class ChatGPTBridgeViewModel: ObservableObject {
         networkMonitor.start(queue: networkMonitorQueue)
     }
 
+    @discardableResult
+    func exportDiagnosticBundle(to destinationURL: URL) async -> Bool {
+        guard !isExportingDiagnostics else { return false }
+        isExportingDiagnostics = true
+        defer { isExportingDiagnostics = false }
+
+        let configuration = self.configuration
+        let runtime = self.runtime
+        let diagnostics = diagnosticResults
+        let auditEntries = recentAuditEntries
+        let integrationMarker = paths.map { ChatGPTIntegrationMarkerStore(paths: $0).load() } ?? nil
+
+        do {
+            let generated = try await Task.detached(priority: .utility) {
+                try BridgeDiagnosticBundleExporter().export(
+                    configuration: configuration,
+                    runtime: runtime,
+                    destinationDirectory: destinationURL.deletingLastPathComponent(),
+                    integrationMarker: integrationMarker,
+                    diagnostics: diagnostics,
+                    auditEntries: auditEntries
+                )
+            }.value
+
+            if generated.standardizedFileURL != destinationURL.standardizedFileURL {
+                let fileManager = FileManager.default
+                if fileManager.fileExists(atPath: destinationURL.path) {
+                    try fileManager.removeItem(at: destinationURL)
+                }
+                try fileManager.moveItem(at: generated, to: destinationURL)
+            }
+            statusMessage = "诊断包已导出：\(destinationURL.lastPathComponent)"
+            return true
+        } catch {
+            statusMessage = "诊断包导出失败：\(error.localizedDescription)"
+            return false
+        }
+    }
+
     func decideApproval(_ request: BridgeApprovalRequest, allow: Bool) async {
         guard let paths else { return }
         BridgeApprovalStore(paths: paths).decide(id: request.id, allow: allow)
@@ -274,7 +341,7 @@ final class ChatGPTBridgeViewModel: ObservableObject {
         do {
             if enabled {
                 guard updated.enabled else {
-                    statusMessage = "登录自动启动偏好已保存；启用 ChatGPT 本地访问后生效。"
+                    statusMessage = "登录自动启动偏好已保存；启用 ChatGPT 接入后生效。"
                     refreshLaunchAgentStatus()
                     return
                 }
@@ -1031,7 +1098,7 @@ final class ChatGPTBridgeViewModel: ObservableObject {
             mcpHealthy = false
             refreshLaunchAgentStatus()
         }
-        statusMessage = "ChatGPT 本地访问已停止。"
+        statusMessage = "ChatGPT 接入已停止。"
     }
 
     private func apply(
@@ -1115,9 +1182,17 @@ final class ChatGPTBridgeViewModel: ObservableObject {
     private func refreshChatGPTIntegration() {
         guard let paths else {
             chatGPTPublicHTTPSConfigured = false
+            discoveredToolCatalogVersion = nil
+            discoveredToolCount = nil
+            catalogDiscoveredAt = nil
             return
         }
-        chatGPTPublicHTTPSConfigured = ChatGPTIntegrationMarkerStore(paths: paths)
+        let markerStore = ChatGPTIntegrationMarkerStore(paths: paths)
+        let marker = markerStore.load()
+        discoveredToolCatalogVersion = marker?.discoveredToolCatalogVersion
+        discoveredToolCount = marker?.discoveredToolCount
+        catalogDiscoveredAt = marker?.catalogDiscoveredAt
+        chatGPTPublicHTTPSConfigured = markerStore
             .matchesPublicHTTPS(hostname: configuration.httpsCompatibility?.hostname)
     }
 

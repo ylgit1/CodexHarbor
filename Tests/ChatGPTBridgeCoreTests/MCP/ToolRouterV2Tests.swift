@@ -125,6 +125,31 @@ struct ToolRouterV2Tests {
             context: context
         )
         #expect(cancelledWorkflow.objectValue?["state"]?.stringValue == "unsupported")
+
+        let codingTask = try await router.execute(
+            name: "coding_task",
+            arguments: [
+                "action": .string("start"),
+                "requirement": .string("verify Coding Task routing"),
+                "includeTests": .bool(false),
+                "includeBuild": .bool(false),
+                "includePackage": .bool(false)
+            ],
+            context: context
+        )
+        let taskID = try #require(codingTask.objectValue?["taskID"]?.stringValue)
+        #expect(codingTask.objectValue?["state"]?.stringValue == "unsupported")
+
+        let codingTaskStatus = try await router.execute(
+            name: "coding_task",
+            arguments: [
+                "action": .string("status"),
+                "taskId": .string(taskID)
+            ],
+            context: context
+        )
+        #expect(codingTaskStatus.objectValue?["taskID"]?.stringValue == taskID)
+        #expect(codingTaskStatus.objectValue?["state"]?.stringValue == "unsupported")
     }
 
     private func initializeGit(at root: URL) throws {

@@ -21,7 +21,7 @@ struct HarborConnectionManagementView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 HStack {
-                    Text("连接管理")
+                    Text("Codex 连接")
                         .font(.system(size: 22, weight: .bold, design: .rounded))
                     Spacer()
 

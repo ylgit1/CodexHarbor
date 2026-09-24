@@ -121,32 +121,6 @@ public struct RelayConfigurationStore {
     }
 }
 
-public struct RelayActivityStore {
-    private let paths: CodexPaths
-    private let fileManager: FileManager
-
-    public init(paths: CodexPaths = .live(), fileManager: FileManager = .default) {
-        self.paths = paths
-        self.fileManager = fileManager
-    }
-
-    public func load() throws -> [RelayRequestRecord] {
-        guard fileManager.fileExists(atPath: paths.relayEventsURL.path) else { return [] }
-        return try JSONDecoder().decode([RelayRequestRecord].self, from: Data(contentsOf: paths.relayEventsURL))
-    }
-
-    public func append(_ record: RelayRequestRecord, now: Date = Date()) throws {
-        let cutoff = now.addingTimeInterval(-30 * 24 * 60 * 60)
-        let existing = (try? load()) ?? []
-        let records = Array((existing.filter { $0.startedAt >= cutoff && $0.id != record.id } + [record]).suffix(5_000))
-        try fileManager.createDirectory(at: paths.appSupport, withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(records).write(to: paths.relayEventsURL, options: .atomic)
-        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: paths.relayEventsURL.path)
-    }
-}
-
 public enum RelayProtocolCodec {
     public static func responsesRequest(from data: Data, model: String) throws -> Data {
         guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {

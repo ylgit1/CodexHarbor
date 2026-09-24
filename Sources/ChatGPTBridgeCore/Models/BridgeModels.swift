@@ -18,6 +18,7 @@ public enum BridgeError: Error, LocalizedError, Sendable {
     case commandTimedOut(Int)
     case commandSessionNotFound(UUID)
     case workflowSessionNotFound(UUID)
+    case codingTaskNotFound(UUID)
 
     public var errorDescription: String? {
         switch self {
@@ -55,6 +56,8 @@ public enum BridgeError: Error, LocalizedError, Sendable {
             return "命令任务不存在或已过期：\(id.uuidString)"
         case .workflowSessionNotFound(let id):
             return "工作流任务不存在或已过期：\(id.uuidString)"
+        case .codingTaskNotFound(let id):
+            return "Coding Task 不存在或已过期：\(id.uuidString)"
         }
     }
 }
@@ -105,17 +108,26 @@ public struct ChatGPTIntegrationMarker: Codable, Equatable, Sendable {
     public var hostname: String?
     public var configuredAt: Date
     public var lastActivityAt: Date
+    public var discoveredToolCatalogVersion: String?
+    public var discoveredToolCount: Int?
+    public var catalogDiscoveredAt: Date?
 
     public init(
         transportMode: BridgeTransportMode,
         hostname: String? = nil,
         configuredAt: Date = Date(),
-        lastActivityAt: Date = Date()
+        lastActivityAt: Date = Date(),
+        discoveredToolCatalogVersion: String? = nil,
+        discoveredToolCount: Int? = nil,
+        catalogDiscoveredAt: Date? = nil
     ) {
         self.transportMode = transportMode
         self.hostname = hostname
         self.configuredAt = configuredAt
         self.lastActivityAt = lastActivityAt
+        self.discoveredToolCatalogVersion = discoveredToolCatalogVersion
+        self.discoveredToolCount = discoveredToolCount
+        self.catalogDiscoveredAt = catalogDiscoveredAt
     }
 }
 
@@ -354,6 +366,8 @@ public struct BridgeRuntimeState: Codable, Equatable, Sendable {
     public var processIdentifier: Int32?
     public var mcpPort: UInt16?
     public var mcpURL: String?
+    public var toolCatalogVersion: String?
+    public var toolCatalogCount: Int?
     public var startedAt: Date?
     public var lastToolCallAt: Date?
     public var transportHealthCheckedAt: Date?
@@ -381,6 +395,8 @@ public struct BridgeRuntimeState: Codable, Equatable, Sendable {
         processIdentifier: Int32? = nil,
         mcpPort: UInt16? = nil,
         mcpURL: String? = nil,
+        toolCatalogVersion: String? = nil,
+        toolCatalogCount: Int? = nil,
         startedAt: Date? = nil,
         lastToolCallAt: Date? = nil,
         transportHealthCheckedAt: Date? = nil,
@@ -407,6 +423,8 @@ public struct BridgeRuntimeState: Codable, Equatable, Sendable {
         self.processIdentifier = processIdentifier
         self.mcpPort = mcpPort
         self.mcpURL = mcpURL
+        self.toolCatalogVersion = toolCatalogVersion
+        self.toolCatalogCount = toolCatalogCount
         self.startedAt = startedAt
         self.lastToolCallAt = lastToolCallAt
         self.transportHealthCheckedAt = transportHealthCheckedAt
@@ -435,6 +453,8 @@ public struct BridgeRuntimeState: Codable, Equatable, Sendable {
         case processIdentifier
         case mcpPort
         case mcpURL
+        case toolCatalogVersion
+        case toolCatalogCount
         case startedAt
         case lastToolCallAt
         case transportHealthCheckedAt
@@ -466,6 +486,8 @@ public struct BridgeRuntimeState: Codable, Equatable, Sendable {
         processIdentifier = try container.decodeIfPresent(Int32.self, forKey: .processIdentifier)
         mcpPort = try container.decodeIfPresent(UInt16.self, forKey: .mcpPort)
         mcpURL = try container.decodeIfPresent(String.self, forKey: .mcpURL)
+        toolCatalogVersion = try container.decodeIfPresent(String.self, forKey: .toolCatalogVersion)
+        toolCatalogCount = try container.decodeIfPresent(Int.self, forKey: .toolCatalogCount)
         startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt)
         lastToolCallAt = try container.decodeIfPresent(Date.self, forKey: .lastToolCallAt)
         transportHealthCheckedAt = try container.decodeIfPresent(Date.self, forKey: .transportHealthCheckedAt)

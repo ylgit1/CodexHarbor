@@ -723,6 +723,8 @@ struct ChatGPTBridgeCoreTests {
         #expect(discoverObject["supportedVersions"]?.arrayValue?.first?.stringValue == MCPProtocolVersion.modern)
         #expect(discoverObject["ttlMs"]?.intValue == 60_000)
         #expect(discoverObject["cacheScope"]?.stringValue == "private")
+        #expect(discoverObject["toolCatalogVersion"]?.stringValue == MCPToolCatalogMetadata.version)
+        #expect(discoverObject["toolCount"]?.intValue == MCPToolCatalogMetadata.toolCount)
         #expect(discoverObject["instructions"]?.stringValue?.contains("continuous coding workflow") == true)
 
         let list = await server.handle(
@@ -733,15 +735,17 @@ struct ChatGPTBridgeCoreTests {
             )
         )
         let listObject = try #require(list.result?.objectValue)
+        #expect(listObject["toolCatalogVersion"]?.stringValue == MCPToolCatalogMetadata.version)
+        #expect(listObject["toolCount"]?.intValue == MCPToolCatalogMetadata.toolCount)
         let tools = try #require(listObject["tools"]?.arrayValue)
-        #expect(tools.count == 22)
+        #expect(tools.count == MCPToolCatalogMetadata.toolCount)
         let names = tools.compactMap { $0.objectValue?["name"]?.stringValue }
         #expect(names == [
             "open_workspace", "read", "search", "list_directory", "workspace_tree",
             "edit", "patch_file", "git_diff", "git_status", "write",
             "run_command", "bash", "start_command", "command_status", "command_output",
             "cancel_command", "start_workflow", "workflow_status", "workflow_output",
-            "cancel_workflow", "run_workflow", "repair_project"
+            "cancel_workflow", "run_workflow", "coding_task", "repair_project"
         ])
         #expect(tools.allSatisfy { $0.objectValue?["outputSchema"] != nil })
         #expect(names.contains("initialize") == false)
@@ -917,6 +921,8 @@ struct ChatGPTBridgeCoreTests {
         let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
         #expect(object["status"] as? String == "ok")
         #expect(object["protocolVersion"] as? String == MCPProtocolVersion.modern)
+        #expect(object["toolCatalogVersion"] as? String == MCPToolCatalogMetadata.version)
+        #expect(object["toolCount"] as? Int == MCPToolCatalogMetadata.toolCount)
     }
 
     @Test("Local MCP HTTP server serves modern discovery and tools list")
@@ -931,7 +937,13 @@ struct ChatGPTBridgeCoreTests {
             configuration: BridgeConfiguration(),
             auditLogger: audit
         )
-        let http = LocalMCPHTTPServer(server: MCPServer(router: router))
+        let catalogMarker = fixture.root.appendingPathComponent("catalog-discovered")
+        let http = LocalMCPHTTPServer(
+            server: MCPServer(router: router),
+            onToolCatalogDiscovered: {
+                try? Data("seen".utf8).write(to: catalogMarker, options: .atomic)
+            }
+        )
         let port = try http.start()
         defer { http.stop() }
         let endpoint = try #require(URL(string: "http://127.0.0.1:\(port)/mcp"))
@@ -958,7 +970,15 @@ struct ChatGPTBridgeCoreTests {
         let (listData, listResponse) = try await URLSession.shared.data(for: listURLRequest)
         #expect((listResponse as? HTTPURLResponse)?.statusCode == 200)
         let list = try JSONDecoder().decode(MCPJSONRPCResponse.self, from: listData)
-        #expect(list.result?.objectValue?["tools"]?.arrayValue?.count == 22)
+        #expect(list.result?.objectValue?["tools"]?.arrayValue?.count == MCPToolCatalogMetadata.toolCount)
+        #expect(FileManager.default.fileExists(atPath: catalogMarker.path))
+
+        try? FileManager.default.removeItem(at: catalogMarker)
+        var internalListRequest = listURLRequest
+        internalListRequest.setValue("1", forHTTPHeaderField: "X-Harbor-Internal-Diagnostics")
+        let (_, internalListResponse) = try await URLSession.shared.data(for: internalListRequest)
+        #expect((internalListResponse as? HTTPURLResponse)?.statusCode == 200)
+        #expect(FileManager.default.fileExists(atPath: catalogMarker.path) == false)
 
         var invalidRequest = URLRequest(url: endpoint)
         invalidRequest.httpMethod = "POST"

@@ -375,6 +375,7 @@ public struct BridgeDiagnosticsRunner: Sendable {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.setValue("tools/list", forHTTPHeaderField: "Mcp-Method")
             request.setValue(MCPProtocolVersion.modern, forHTTPHeaderField: "MCP-Protocol-Version")
+            request.setValue("1", forHTTPHeaderField: "X-Harbor-Internal-Diagnostics")
             if let token = try secretStore.string(for: .localMCPAccessToken), !token.isEmpty {
                 request.setValue(token, forHTTPHeaderField: "X-Harbor-Bridge-Token")
             }

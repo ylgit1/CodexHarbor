@@ -95,7 +95,7 @@ struct HarborLocalAccessView: View {
         }
         .sheet(isPresented: $showCloseConfirmation) {
             HarborDestructiveConfirmDialog(
-                title: "关闭本地访问？",
+                title: "关闭 ChatGPT 接入？",
                 message: "关闭后 ChatGPT 将无法访问本地 MCP 工具。",
                 confirmTitle: "关闭服务",
                 onCancel: { showCloseConfirmation = false },
@@ -134,7 +134,7 @@ struct HarborLocalAccessView: View {
 
         return HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("本地访问")
+                Text("ChatGPT 接入")
                     .font(.system(size: 22, weight: .bold, design: .rounded))
                 Text("查看真实链路状态，管理授权目录与连接方式。")
                     .font(.system(size: 10.5))
@@ -259,7 +259,7 @@ struct HarborLocalAccessView: View {
                                 .foregroundStyle(HarborColors.blue)
                             Text("尚未添加允许访问目录")
                                 .font(.system(size: 12, weight: .semibold))
-                            Text("连接配置可以单独保存；启动本地访问前至少需要添加一个目录。")
+                            Text("连接配置可以单独保存；启动 ChatGPT 接入前至少需要添加一个目录。")
                                 .font(.system(size: 9.5))
                                 .foregroundStyle(.secondary)
                             Button("添加目录", action: onAddRoot)
@@ -332,6 +332,17 @@ struct HarborLocalAccessView: View {
                             .font(.system(size: 9.5, weight: .medium))
                             .foregroundStyle(.secondary)
                     }
+
+                    Button(action: exportDiagnosticBundle) {
+                        if bridge.isExportingDiagnostics {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Image(systemName: "square.and.arrow.up")
+                        }
+                    }
+                    .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+                    .disabled(bridge.isExportingDiagnostics)
+                    .help("导出脱敏诊断包")
                 }
 
                 Divider().opacity(0.32)
@@ -375,6 +386,21 @@ struct HarborLocalAccessView: View {
         }
     }
 
+    private func exportDiagnosticBundle() {
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = "CodexHarbor-Diagnostics-\(Date().formatted(.iso8601.year().month().day())).zip"
+        panel.message = "导出脱敏诊断信息，不包含 Runtime Key、API Key 或访问令牌。"
+
+        guard panel.runModal() == .OK, var destination = panel.url else { return }
+        if destination.pathExtension.lowercased() != "zip" {
+            destination.appendPathExtension("zip")
+        }
+        Task {
+            await bridge.exportDiagnosticBundle(to: destination)
+        }
+    }
+
     private func chainNotice(icon: String, color: Color, text: String) -> some View {
         HStack(alignment: .top, spacing: 7) {
             Image(systemName: icon)
@@ -414,11 +440,25 @@ struct HarborLocalAccessView: View {
                 color: HarborColors.blue,
                 text: "\(recoveryNode.title)：\(recoveryNode.message)"
             )
+        } else if serviceRunning && bridge.toolCatalogRefreshRequired,
+                  let warning = bridge.toolCatalogWarningText {
+            chainNotice(
+                icon: "arrow.triangle.2.circlepath.circle.fill",
+                color: HarborColors.orange,
+                text: warning
+            )
         } else if chatGPTWaiting {
             chainNotice(
                 icon: "clock.badge.questionmark",
                 color: HarborColors.orange,
                 text: "链路已经就绪，等待 ChatGPT MCP 首次调用。"
+            )
+        } else if serviceRunning,
+                  let warning = bridge.toolCatalogWarningText {
+            chainNotice(
+                icon: "questionmark.circle.fill",
+                color: HarborColors.orange,
+                text: warning
             )
         } else if serviceRunning {
             chainNotice(
@@ -430,7 +470,7 @@ struct HarborLocalAccessView: View {
             chainNotice(
                 icon: "pause.circle.fill",
                 color: .secondary,
-                text: "本地访问当前已关闭。"
+                text: "ChatGPT 接入当前已关闭。"
             )
         }
     }
@@ -507,7 +547,7 @@ struct HarborLocalAccessView: View {
                             .font(.system(size: 14, weight: .semibold))
 
                         Text(mode == .secureTunnel
-                            ? "通过 OpenAI Tunnel 建立本地访问"
+                            ? "通过 OpenAI Tunnel 建立 ChatGPT 接入"
                             : "通过 Cloudflare 提供公网 HTTPS 访问")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
@@ -718,7 +758,7 @@ struct HarborLocalAccessView: View {
                 ConnectionOperationStep(id: "health", title: "健康检查"),
                 ConnectionOperationStep(id: "status", title: "更新状态")
             ],
-            footer: "正在启动本地访问，请稍候…"
+            footer: "正在启动 ChatGPT 接入，请稍候…"
         )
 
         Task { @MainActor in
@@ -743,7 +783,7 @@ struct HarborLocalAccessView: View {
             await bridge.refresh()
             selectedMode = bridge.configuration.transportMode
             updateOperationStep(3, state: .completed, detail: "已完成")
-            await finishOperation(footer: "本地访问已启动")
+            await finishOperation(footer: "ChatGPT 接入已启动")
         }
     }
 
@@ -849,7 +889,7 @@ struct HarborLocalAccessView: View {
                 ConnectionOperationStep(id: "cleanup", title: "清理资源"),
                 ConnectionOperationStep(id: "status", title: "更新状态")
             ],
-            footer: "正在关闭本地访问，请稍候…"
+            footer: "正在关闭 ChatGPT 接入，请稍候…"
         )
 
         Task { @MainActor in
@@ -865,7 +905,7 @@ struct HarborLocalAccessView: View {
             await bridge.refresh()
             selectedMode = bridge.configuration.transportMode
             updateOperationStep(2, state: .completed, detail: "已完成")
-            await finishOperation(footer: "本地访问已关闭")
+            await finishOperation(footer: "ChatGPT 接入已关闭")
         }
     }
 

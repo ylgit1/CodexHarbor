@@ -22,6 +22,7 @@ public final class LocalMCPHTTPServer: @unchecked Sendable {
     private let accessToken: String?
     private let publicAccessToken: String?
     private let onPublicClientInitialized: (@Sendable () -> Void)?
+    private let onToolCatalogDiscovered: (@Sendable () -> Void)?
     private let queue = DispatchQueue(label: "com.codexharbor.chatgptbridge.mcp", qos: .userInitiated)
     private let lock = NSLock()
     private var listener: NWListener?
@@ -31,12 +32,14 @@ public final class LocalMCPHTTPServer: @unchecked Sendable {
         server: MCPServer,
         accessToken: String? = nil,
         publicAccessToken: String? = nil,
-        onPublicClientInitialized: (@Sendable () -> Void)? = nil
+        onPublicClientInitialized: (@Sendable () -> Void)? = nil,
+        onToolCatalogDiscovered: (@Sendable () -> Void)? = nil
     ) {
         self.server = server
         self.accessToken = accessToken?.isEmpty == false ? accessToken : nil
         self.publicAccessToken = publicAccessToken?.isEmpty == false ? publicAccessToken : nil
         self.onPublicClientInitialized = onPublicClientInitialized
+        self.onToolCatalogDiscovered = onToolCatalogDiscovered
     }
 
     public var port: UInt16? {
@@ -153,6 +156,8 @@ public final class LocalMCPHTTPServer: @unchecked Sendable {
             let body = (try? JSONSerialization.data(withJSONObject: [
                 "status": "ok",
                 "protocolVersion": MCPProtocolVersion.modern,
+                "toolCatalogVersion": MCPToolCatalogMetadata.version,
+                "toolCount": MCPToolCatalogMetadata.toolCount,
                 "host": Self.host,
                 "port": port as Any
             ])) ?? Data("{}".utf8)
@@ -193,6 +198,10 @@ public final class LocalMCPHTTPServer: @unchecked Sendable {
         }
 
         let decodedRequest = try? JSONDecoder().decode(MCPJSONRPCRequest.self, from: request.body)
+        if decodedRequest?.method == "tools/list",
+           request.headers["x-harbor-internal-diagnostics"] != "1" {
+            onToolCatalogDiscovered?()
+        }
         let incomingSessionID = request.headers["mcp-session-id"]
         let sessionID = incomingSessionID ?? (decodedRequest?.method == "initialize" ? UUID().uuidString : nil)
         if authenticatedByPath,

@@ -23,7 +23,8 @@ let package = Package(
             name: "ChatGPTBridgeCore",
             linkerSettings: [
                 .linkedFramework("Network"),
-                .linkedFramework("Security")
+                .linkedFramework("Security"),
+                .linkedFramework("SystemConfiguration")
             ]
         ),
         .executableTarget(

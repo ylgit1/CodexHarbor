@@ -290,6 +290,45 @@ struct CodexConfigurationManagerTests {
         #expect(renewed.lastUsedAt == profile.lastUsedAt)
     }
 
+    @Test("A newer refreshed access token updates the cached Plus expiry")
+    func refreshedAccessTokenWinsOverStaleIdentityToken() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+
+        func jwt(_ claims: [String: Any]) throws -> String {
+            let payload = try JSONSerialization.data(withJSONObject: [
+                "https://api.openai.com/auth": claims
+            ])
+            let encoded = payload.base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "")
+            return "header.\(encoded).signature"
+        }
+
+        let staleIdentity = try jwt([
+            "chatgpt_plan_type": "plus",
+            "chatgpt_subscription_active_until": "2026-09-20T09:47:33+00:00",
+            "chatgpt_subscription_last_checked": "2026-09-20T01:05:17+00:00"
+        ])
+        let refreshedAccess = try jwt([
+            "chatgpt_plan_type": "plus",
+            "chatgpt_subscription_active_until": "2026-10-20T09:47:33+00:00",
+            "chatgpt_subscription_last_checked": "2026-09-22T01:05:17+00:00"
+        ])
+        try fixture.writeAuth(try JSONSerialization.data(withJSONObject: [
+            "tokens": [
+                "account_id": "plus-account",
+                "access_token": refreshedAccess,
+                "id_token": staleIdentity
+            ]
+        ]))
+
+        let repository = CodexAccountProfileRepository(paths: fixture.paths, store: fixture.store)
+        let profile = try await repository.saveCurrentLogin(name: nil)
+        #expect(profile.subscriptionExpiresAt == "2026-10-20T09:47:33+00:00")
+    }
+
     @Test("Account health distinguishes renewable and expired credentials")
     func detectsAccountCredentialHealth() async throws {
         let fixture = try Fixture()

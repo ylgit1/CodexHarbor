@@ -228,19 +228,96 @@ public struct HTTPSCompatibilityConfiguration: Codable, Equatable, Sendable {
     }
 }
 
+public enum TunnelProxyStrategy: String, Codable, CaseIterable, Sendable {
+    case automatic
+    case system
+    case direct
+
+    public var displayName: String {
+        switch self {
+        case .automatic: "自动"
+        case .system: "系统代理"
+        case .direct: "直连"
+        }
+    }
+}
+
+public enum TunnelProxyRoute: String, Codable, Sendable {
+    case systemProxy
+    case direct
+
+    public var displayName: String {
+        switch self {
+        case .systemProxy: "系统代理"
+        case .direct: "直连"
+        }
+    }
+}
+
+public struct TunnelProxyStatus: Codable, Equatable, Sendable {
+    public var strategy: TunnelProxyStrategy
+    public var selectedRoute: TunnelProxyRoute
+    public var systemProxyDetected: Bool
+    public var systemProxyDescription: String?
+    public var proxyReachable: Bool?
+    public var directReachable: Bool?
+    public var checkedAt: Date
+    public var message: String
+
+    public init(
+        strategy: TunnelProxyStrategy,
+        selectedRoute: TunnelProxyRoute,
+        systemProxyDetected: Bool,
+        systemProxyDescription: String? = nil,
+        proxyReachable: Bool? = nil,
+        directReachable: Bool? = nil,
+        checkedAt: Date = Date(),
+        message: String
+    ) {
+        self.strategy = strategy
+        self.selectedRoute = selectedRoute
+        self.systemProxyDetected = systemProxyDetected
+        self.systemProxyDescription = systemProxyDescription
+        self.proxyReachable = proxyReachable
+        self.directReachable = directReachable
+        self.checkedAt = checkedAt
+        self.message = message
+    }
+}
+
 public struct SecureTunnelConfiguration: Codable, Equatable, Sendable {
     public var tunnelID: String
     public var executablePath: String?
     public var controlPlaneBaseURL: String
+    public var proxyStrategy: TunnelProxyStrategy
 
     public init(
         tunnelID: String,
         executablePath: String? = nil,
-        controlPlaneBaseURL: String = "https://api.openai.com"
+        controlPlaneBaseURL: String = "https://api.openai.com",
+        proxyStrategy: TunnelProxyStrategy = .automatic
     ) {
         self.tunnelID = tunnelID
         self.executablePath = executablePath
         self.controlPlaneBaseURL = controlPlaneBaseURL
+        self.proxyStrategy = proxyStrategy
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case tunnelID
+        case executablePath
+        case controlPlaneBaseURL
+        case proxyStrategy
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        tunnelID = try container.decode(String.self, forKey: .tunnelID)
+        executablePath = try container.decodeIfPresent(String.self, forKey: .executablePath)
+        controlPlaneBaseURL = try container.decodeIfPresent(String.self, forKey: .controlPlaneBaseURL)
+            ?? "https://api.openai.com"
+        proxyStrategy = try container.decodeIfPresent(TunnelProxyStrategy.self, forKey: .proxyStrategy)
+            ?? .automatic
     }
 }
 
@@ -363,6 +440,7 @@ public struct BridgeRuntimeState: Codable, Equatable, Sendable {
     public var transportProcessIdentifier: Int32?
     public var remoteEndpointReady: Bool
     public var transportMessage: String?
+    public var proxyStatus: TunnelProxyStatus?
     public var processIdentifier: Int32?
     public var mcpPort: UInt16?
     public var mcpURL: String?
@@ -392,6 +470,7 @@ public struct BridgeRuntimeState: Codable, Equatable, Sendable {
         transportProcessIdentifier: Int32? = nil,
         remoteEndpointReady: Bool = false,
         transportMessage: String? = nil,
+        proxyStatus: TunnelProxyStatus? = nil,
         processIdentifier: Int32? = nil,
         mcpPort: UInt16? = nil,
         mcpURL: String? = nil,
@@ -420,6 +499,7 @@ public struct BridgeRuntimeState: Codable, Equatable, Sendable {
         self.transportProcessIdentifier = transportProcessIdentifier
         self.remoteEndpointReady = remoteEndpointReady
         self.transportMessage = transportMessage
+        self.proxyStatus = proxyStatus
         self.processIdentifier = processIdentifier
         self.mcpPort = mcpPort
         self.mcpURL = mcpURL
@@ -450,6 +530,7 @@ public struct BridgeRuntimeState: Codable, Equatable, Sendable {
         case transportProcessIdentifier
         case remoteEndpointReady
         case transportMessage
+        case proxyStatus
         case processIdentifier
         case mcpPort
         case mcpURL
@@ -483,6 +564,7 @@ public struct BridgeRuntimeState: Codable, Equatable, Sendable {
         remoteEndpointReady = try container.decodeIfPresent(Bool.self, forKey: .remoteEndpointReady)
             ?? (tunnel == .connected)
         transportMessage = try container.decodeIfPresent(String.self, forKey: .transportMessage)
+        proxyStatus = try container.decodeIfPresent(TunnelProxyStatus.self, forKey: .proxyStatus)
         processIdentifier = try container.decodeIfPresent(Int32.self, forKey: .processIdentifier)
         mcpPort = try container.decodeIfPresent(UInt16.self, forKey: .mcpPort)
         mcpURL = try container.decodeIfPresent(String.self, forKey: .mcpURL)

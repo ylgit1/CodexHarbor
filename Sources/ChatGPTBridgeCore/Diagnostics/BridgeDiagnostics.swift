@@ -66,6 +66,7 @@ public struct BridgeDiagnosticsRunner: Sendable {
 
         switch configuration.transportMode {
         case .secureTunnel:
+            results.append(await checkProxy(configuration: configuration, runtime: runtime))
             results.append(measure(id: "tunnel-key", title: "Runtime Key") {
                 switch runtime.health.tunnel.runtimeKey {
                 case .valid: return (.passed, "Runtime Key 有效")
@@ -118,6 +119,7 @@ public struct BridgeDiagnosticsRunner: Sendable {
         results.append(await checkMCPTools(runtime: runtime))
         switch configuration.transportMode {
         case .secureTunnel:
+            results.append(await checkProxy(configuration: configuration, runtime: runtime))
             results.append(measure(id: "tunnel-client", title: "OpenAI 管道客户端") {
                 switch TunnelClientLocator().locate(preferredPath: configuration.secureTunnel?.executablePath) {
                 case .available(let url): return (.passed, url.path)
@@ -186,6 +188,57 @@ public struct BridgeDiagnosticsRunner: Sendable {
                 : (.passed, "Bridge 使用独立数据目录、进程和端口")
         })
         return results
+    }
+
+    private func checkProxy(
+        configuration: BridgeConfiguration,
+        runtime: BridgeRuntimeState
+    ) async -> BridgeDiagnosticResult {
+        let started = Date()
+        guard let tunnel = configuration.secureTunnel,
+              let controlPlaneURL = URL(string: tunnel.controlPlaneBaseURL) else {
+            return result(
+                id: "network-proxy",
+                title: "网络与代理",
+                status: .warning,
+                message: "OpenAI 本地管道尚未完成配置",
+                started: started
+            )
+        }
+
+        let status: TunnelProxyStatus
+        if let recent = runtime.proxyStatus,
+           Date().timeIntervalSince(recent.checkedAt) <= 30 {
+            status = recent
+        } else {
+            do {
+                status = try await TunnelProxyResolver().resolve(
+                    strategy: tunnel.proxyStrategy,
+                    controlPlaneURL: controlPlaneURL
+                ).status
+            } catch {
+                return result(
+                    id: "network-proxy",
+                    title: "网络与代理",
+                    status: .failed,
+                    message: "\(error.localizedDescription)；本地 MCP 仍保持绕过代理",
+                    started: started
+                )
+            }
+        }
+
+        let degradedProxy = status.strategy == .automatic
+            && status.systemProxyDetected
+            && status.proxyReachable == false
+            && status.directReachable == true
+        let proxyDescription = status.systemProxyDescription.map { " · \($0)" } ?? ""
+        return result(
+            id: "network-proxy",
+            title: "网络与代理",
+            status: degradedProxy ? .warning : .passed,
+            message: "\(status.message)\(proxyDescription)；本地 MCP 已绕过代理",
+            started: started
+        )
     }
 
     private func checkCompatibilityEndpoint(configuration: BridgeConfiguration) async -> BridgeDiagnosticResult {

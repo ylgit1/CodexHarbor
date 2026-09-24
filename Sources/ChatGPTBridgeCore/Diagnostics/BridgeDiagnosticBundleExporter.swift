@@ -21,6 +21,7 @@ public struct BridgeDiagnosticBundleExporter: Sendable {
         let gitPushPermission: String
         let transportMode: String
         let secureTunnelConfigured: Bool
+        let secureTunnelProxyStrategy: String?
         let httpsCompatibilityConfigured: Bool
     }
 
@@ -35,6 +36,14 @@ public struct BridgeDiagnosticBundleExporter: Sendable {
         let transportProcessIdentifier: Int32?
         let processIdentifier: Int32?
         let remoteEndpointReady: Bool
+        let proxyStrategy: String?
+        let proxySelectedRoute: String?
+        let proxySystemDetected: Bool?
+        let proxySystemDescription: String?
+        let proxyReachable: Bool?
+        let directReachable: Bool?
+        let proxyCheckedAt: Date?
+        let proxyMessage: String?
         let mcpPort: UInt16?
         let toolCatalogVersion: String?
         let toolCatalogCount: Int?
@@ -130,6 +139,7 @@ public struct BridgeDiagnosticBundleExporter: Sendable {
             gitPushPermission: configuration.gitPushPermission.rawValue,
             transportMode: configuration.transportMode.rawValue,
             secureTunnelConfigured: configuration.secureTunnel != nil,
+            secureTunnelProxyStrategy: configuration.secureTunnel?.proxyStrategy.rawValue,
             httpsCompatibilityConfigured: configuration.httpsCompatibility != nil
         )
         try writeJSON(config, to: staging.appendingPathComponent("configuration.json"))
@@ -145,6 +155,16 @@ public struct BridgeDiagnosticBundleExporter: Sendable {
             transportProcessIdentifier: runtime.transportProcessIdentifier,
             processIdentifier: runtime.processIdentifier,
             remoteEndpointReady: runtime.remoteEndpointReady,
+            proxyStrategy: runtime.proxyStatus?.strategy.rawValue,
+            proxySelectedRoute: runtime.proxyStatus?.selectedRoute.rawValue,
+            proxySystemDetected: runtime.proxyStatus?.systemProxyDetected,
+            proxySystemDescription: runtime.proxyStatus.flatMap { status in
+                status.systemProxyDescription.map { sanitize($0) }
+            },
+            proxyReachable: runtime.proxyStatus?.proxyReachable,
+            directReachable: runtime.proxyStatus?.directReachable,
+            proxyCheckedAt: runtime.proxyStatus?.checkedAt,
+            proxyMessage: runtime.proxyStatus.map { sanitize($0.message) },
             mcpPort: runtime.mcpPort,
             toolCatalogVersion: runtime.toolCatalogVersion,
             toolCatalogCount: runtime.toolCatalogCount,

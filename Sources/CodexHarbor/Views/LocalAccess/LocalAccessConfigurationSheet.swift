@@ -15,6 +15,7 @@ struct HarborLocalTransportConfigurationSheet: View {
 
     @State private var cloudflareAPIToken = ""
     @State private var showingCloudflareZones = false
+    @State private var proxyStrategy: TunnelProxyStrategy = .automatic
 
     var body: some View {
         VStack(alignment: .leading, spacing: 13) {
@@ -92,6 +93,7 @@ struct HarborLocalTransportConfigurationSheet: View {
         .padding(20)
         .frame(width: 600)
         .task {
+            proxyStrategy = bridge.configuration.secureTunnel?.proxyStrategy ?? .automatic
             // The AppShell runtime monitor owns periodic refreshes.
             // Configuration actions refresh explicitly after mutations.
             await bridge.refresh()
@@ -162,6 +164,28 @@ struct HarborLocalTransportConfigurationSheet: View {
                     }
                     .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
                     .help("打开 OpenAI API Key 管理页面")
+                }
+            }
+
+            labeledField("代理策略") {
+                VStack(alignment: .leading, spacing: 7) {
+                    HarborSegmentControl(
+                        options: TunnelProxyStrategy.allCases.map { ($0, $0.displayName) },
+                        selection: $proxyStrategy
+                    )
+                    .frame(width: 300)
+
+                    HStack(spacing: 6) {
+                        Image(systemName: bridge.runtime.proxyStatus?.selectedRoute == .systemProxy
+                            ? "network"
+                            : "arrow.right.circle")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Text(proxyStrategyDescription)
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
         }
@@ -344,6 +368,23 @@ struct HarborLocalTransportConfigurationSheet: View {
         return configured ? HarborColors.orange : .secondary
     }
 
+    private var proxyStrategyDescription: String {
+        guard mode == .secureTunnel else { return "" }
+        if let status = bridge.runtime.proxyStatus,
+           status.strategy == proxyStrategy {
+            let proxy = status.systemProxyDescription.map { " · \($0)" } ?? ""
+            return "\(status.message)\(proxy)"
+        }
+        switch proxyStrategy {
+        case .automatic:
+            return "自动检测系统代理；代理不可达时尝试直连。本地 MCP 始终绕过代理。"
+        case .system:
+            return "强制使用当前 macOS HTTP/HTTPS/SOCKS 系统代理。本地 MCP 仍保持直连。"
+        case .direct:
+            return "忽略系统代理，OpenAI Control Plane 直接连接；适合代理异常时手动排查。"
+        }
+    }
+
     private var inputValid: Bool {
         switch mode {
         case .secureTunnel:
@@ -368,7 +409,8 @@ struct HarborLocalTransportConfigurationSheet: View {
                     tunnelID: tunnelID,
                     runtimeAPIKey: submittedRuntimeKey,
                     executablePath: bridge.configuration.secureTunnel?.executablePath ?? "",
-                    controlPlaneBaseURL: bridge.configuration.secureTunnel?.controlPlaneBaseURL ?? "https://api.openai.com"
+                    controlPlaneBaseURL: bridge.configuration.secureTunnel?.controlPlaneBaseURL ?? "https://api.openai.com",
+                    proxyStrategy: proxyStrategy
                 )
                 if !submittedRuntimeKey.isEmpty && bridge.hasTunnelRuntimeKey {
                     runtimeKey = ""

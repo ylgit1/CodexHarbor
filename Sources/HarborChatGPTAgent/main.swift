@@ -27,6 +27,7 @@ private actor AgentLifecycle {
     private var compatibilityManager: HTTPSCompatibilityManager?
     private var tunnelState: TunnelRuntimeState = .disabled
     private var tunnelMessage: String?
+    private var proxyStatus: TunnelProxyStatus?
     private var transportProcessRunning = false
     private var transportProcessIdentifier: Int32?
     private var remoteEndpointReady = false
@@ -114,6 +115,7 @@ private actor AgentLifecycle {
         compatibilityManager = nil
         tunnelState = .disabled
         tunnelMessage = nil
+        proxyStatus = nil
         transportProcessRunning = false
         transportProcessIdentifier = nil
         remoteEndpointReady = false
@@ -299,6 +301,7 @@ private actor AgentLifecycle {
         guard let tunnelConfiguration = configuration.secureTunnel else {
             tunnelState = .disabled
             tunnelMessage = nil
+            proxyStatus = nil
             transportProcessRunning = false
             transportProcessIdentifier = nil
             remoteEndpointReady = false
@@ -314,6 +317,7 @@ private actor AgentLifecycle {
         transportProcessRunning = false
         transportProcessIdentifier = nil
         remoteEndpointReady = false
+        proxyStatus = nil
         runtimeKeyState = .checking
         controlPlaneState = .recovering
         endpointState = .recovering
@@ -321,16 +325,17 @@ private actor AgentLifecycle {
         tunnelMessage = "Runtime Key 刷新中，正在恢复 OpenAI Tunnel"
         writeRuntimeState(agent: .running, mcp: .ready)
 
+        let manager = SecureTunnelManager(paths: paths)
+        tunnelManager = manager
         do {
             let runtimeKey = try resolveRuntimeKey()
-            let manager = SecureTunnelManager(paths: paths)
-            tunnelManager = manager
             let managerState = try await manager.start(
                 configuration: tunnelConfiguration,
                 mcpURL: mcpURL,
                 runtimeAPIKey: runtimeKey,
                 localMCPAccessToken: localMCPAccessToken
             )
+            proxyStatus = await manager.proxyStatus()
             transportProcessRunning = await manager.isProcessRunning()
             if case .running(let pid, _) = managerState {
                 transportProcessIdentifier = pid
@@ -367,6 +372,7 @@ private actor AgentLifecycle {
                 tunnelMessage = "tunnel-client 已启动，Runtime Key 与控制面正在恢复"
             }
         } catch {
+            proxyStatus = await manager.proxyStatus()
             transportProcessRunning = false
             transportProcessIdentifier = nil
             remoteEndpointReady = false
@@ -396,6 +402,7 @@ private actor AgentLifecycle {
         guard let compatibility = configuration.httpsCompatibility else {
             tunnelState = .disabled
             tunnelMessage = nil
+            proxyStatus = nil
             transportProcessRunning = false
             transportProcessIdentifier = nil
             remoteEndpointReady = false
@@ -408,6 +415,7 @@ private actor AgentLifecycle {
         transportProcessRunning = false
         transportProcessIdentifier = nil
         remoteEndpointReady = false
+        proxyStatus = nil
         runtimeKeyState = .notRequired
         controlPlaneState = .recovering
         endpointState = .recovering
@@ -636,6 +644,7 @@ private actor AgentLifecycle {
             transportProcessIdentifier: transportProcessIdentifier,
             remoteEndpointReady: remoteEndpointReady,
             transportMessage: tunnelMessage,
+            proxyStatus: proxyStatus,
             processIdentifier: agent == .running ? ProcessInfo.processInfo.processIdentifier : nil,
             mcpPort: mcp == .ready ? mcpPort : nil,
             mcpURL: mcp == .ready ? mcpURL.absoluteString : nil,

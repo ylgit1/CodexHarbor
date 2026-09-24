@@ -1279,6 +1279,8 @@ struct ChatGPTBridgeCoreTests {
         #expect(plan.environment["CONTROL_PLANE_TUNNEL_ID"] == "tunnel_test")
         #expect(plan.environment["CONTROL_PLANE_API_KEY"] == "runtime-secret")
         #expect(plan.environment["HARBOR_LOCAL_MCP_TOKEN"] == "local-secret")
+        #expect(plan.environment["NO_PROXY"]?.contains("127.0.0.1") == true)
+        #expect(plan.environment["NO_PROXY"]?.contains("localhost") == true)
         #expect(plan.arguments.contains("--mcp.extra-headers"))
         #expect(plan.arguments.contains("--mcp.discovery-extra-headers"))
 

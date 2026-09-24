@@ -1,5 +1,4 @@
 import Foundation
-import SystemConfiguration
 
 public enum TunnelClientAvailability: Equatable, Sendable {
     case available(URL)
@@ -95,12 +94,19 @@ public struct SecureTunnelHealthSnapshot: Equatable, Sendable {
 public actor SecureTunnelManager {
     private let paths: BridgePaths
     private let locator: TunnelClientLocator
+    private let proxyResolver: TunnelProxyResolver
     private var process: Process?
     private var state: SecureTunnelManagerState = .stopped
+    private var currentProxyStatus: TunnelProxyStatus?
 
-    public init(paths: BridgePaths, locator: TunnelClientLocator = TunnelClientLocator()) {
+    public init(
+        paths: BridgePaths,
+        locator: TunnelClientLocator = TunnelClientLocator(),
+        proxyResolver: TunnelProxyResolver = TunnelProxyResolver()
+    ) {
         self.paths = paths
         self.locator = locator
+        self.proxyResolver = proxyResolver
     }
 
     public func currentState() -> SecureTunnelManagerState {
@@ -116,12 +122,17 @@ public actor SecureTunnelManager {
         return process?.processIdentifier
     }
 
+    public func proxyStatus() -> TunnelProxyStatus? {
+        currentProxyStatus
+    }
+
     public func makeLaunchPlan(
         configuration: SecureTunnelConfiguration,
         mcpURL: URL,
         runtimeAPIKey: String,
         localMCPAccessToken: String? = nil,
-        baseEnvironment: [String: String] = ProcessInfo.processInfo.environment
+        baseEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+        resolvedProxyEnvironment: [String: String]? = nil
     ) throws -> TunnelClientLaunchPlan {
         let tunnelID = configuration.tunnelID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !tunnelID.isEmpty else {
@@ -144,8 +155,11 @@ public actor SecureTunnelManager {
         let healthURLFile = paths.root.appendingPathComponent("tunnel-health.url")
         let pidFile = paths.root.appendingPathComponent("tunnel.pid")
         let logFile = paths.root.appendingPathComponent("tunnel-client.log")
-        var environment = baseEnvironment
-        Self.applySystemProxyEnvironment(to: &environment)
+        var environment = resolvedProxyEnvironment
+            ?? proxyResolver.preferredEnvironment(
+                strategy: configuration.proxyStrategy,
+                baseEnvironment: baseEnvironment
+            )
         environment["CONTROL_PLANE_API_KEY"] = runtimeAPIKey
         environment["CONTROL_PLANE_TUNNEL_ID"] = tunnelID
         environment["CONTROL_PLANE_BASE_URL"] = configuration.controlPlaneBaseURL
@@ -180,66 +194,6 @@ public actor SecureTunnelManager {
         )
     }
 
-    private static func applySystemProxyEnvironment(to environment: inout [String: String]) {
-        let hasExplicitProxy = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
-            .contains { key in
-                guard let value = environment[key] else { return false }
-                return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
-        guard !hasExplicitProxy,
-              let settings = SCDynamicStoreCopyProxies(nil) as? [String: Any] else {
-            return
-        }
-
-        func enabled(_ key: CFString) -> Bool {
-            (settings[key as String] as? NSNumber)?.boolValue == true
-        }
-
-        func host(_ key: CFString) -> String? {
-            guard let raw = settings[key as String] as? String else { return nil }
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return value.isEmpty ? nil : value
-        }
-
-        func port(_ key: CFString) -> Int? {
-            (settings[key as String] as? NSNumber)?.intValue
-        }
-
-        if enabled(kSCPropNetProxiesHTTPEnable),
-           let proxyHost = host(kSCPropNetProxiesHTTPProxy),
-           let proxyPort = port(kSCPropNetProxiesHTTPPort) {
-            let proxy = "http://\(proxyHost):\(proxyPort)"
-            environment["HTTP_PROXY"] = proxy
-            environment["http_proxy"] = proxy
-        }
-
-        if enabled(kSCPropNetProxiesHTTPSEnable),
-           let proxyHost = host(kSCPropNetProxiesHTTPSProxy),
-           let proxyPort = port(kSCPropNetProxiesHTTPSPort) {
-            let proxy = "http://\(proxyHost):\(proxyPort)"
-            environment["HTTPS_PROXY"] = proxy
-            environment["https_proxy"] = proxy
-        }
-
-        if enabled(kSCPropNetProxiesSOCKSEnable),
-           let proxyHost = host(kSCPropNetProxiesSOCKSProxy),
-           let proxyPort = port(kSCPropNetProxiesSOCKSPort) {
-            let proxy = "socks5://\(proxyHost):\(proxyPort)"
-            environment["ALL_PROXY"] = proxy
-            environment["all_proxy"] = proxy
-        }
-
-        let existingNoProxy = environment["NO_PROXY"] ?? environment["no_proxy"] ?? ""
-        let requiredNoProxy = ["127.0.0.1", "localhost", "::1"]
-        let merged = ([existingNoProxy] + requiredNoProxy)
-            .flatMap { $0.split(separator: ",").map(String.init) }
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        let noProxy = Array(Set(merged)).sorted().joined(separator: ",")
-        environment["NO_PROXY"] = noProxy
-        environment["no_proxy"] = noProxy
-    }
-
     public func start(
         configuration: SecureTunnelConfiguration,
         mcpURL: URL,
@@ -248,11 +202,20 @@ public actor SecureTunnelManager {
     ) async throws -> SecureTunnelManagerState {
         if case .running = state { return state }
         state = .starting
+        guard let controlPlaneURL = URL(string: configuration.controlPlaneBaseURL) else {
+            throw BridgeError.invalidPath("OpenAI Control Plane 地址无效")
+        }
+        let proxyResolution = try await proxyResolver.resolve(
+            strategy: configuration.proxyStrategy,
+            controlPlaneURL: controlPlaneURL
+        )
+        currentProxyStatus = proxyResolution.status
         let plan = try makeLaunchPlan(
             configuration: configuration,
             mcpURL: mcpURL,
             runtimeAPIKey: runtimeAPIKey,
-            localMCPAccessToken: localMCPAccessToken
+            localMCPAccessToken: localMCPAccessToken,
+            resolvedProxyEnvironment: proxyResolution.environment
         )
 
         let process = Process()

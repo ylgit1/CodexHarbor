@@ -431,7 +431,7 @@ final class ChatGPTBridgeViewModel: ObservableObject {
         } else if recovering > 0 {
             statusMessage = "链路检测完成：\(recovering) 个节点正在恢复。"
         } else {
-            statusMessage = "链路检测完成：Agent、MCP、Tunnel 与端点均正常。"
+            statusMessage = "链路检测完成：Agent、MCP、网络代理、Tunnel 与端点均正常。"
         }
     }
 
@@ -445,7 +445,7 @@ final class ChatGPTBridgeViewModel: ObservableObject {
             "mcp": results.filter { ["mcp", "mcp-initialize", "mcp-tools"].contains($0.id) },
             "tunnel-client": results.filter { $0.id == "transport-process" },
             "openai-tunnel": results.filter {
-                ["tunnel", "tunnel-key", "public-mcp"].contains($0.id)
+                ["network-proxy", "proxy", "tunnel", "tunnel-key", "public-mcp"].contains($0.id)
             }
         ]
 
@@ -828,7 +828,8 @@ final class ChatGPTBridgeViewModel: ObservableObject {
         tunnelID: String,
         runtimeAPIKey: String,
         executablePath: String? = nil,
-        controlPlaneBaseURL: String = "https://api.openai.com"
+        controlPlaneBaseURL: String = "https://api.openai.com",
+        proxyStrategy: TunnelProxyStrategy? = nil
     ) async {
         var resolvedExecutablePath = executablePath?.trimmingCharacters(in: .whitespacesAndNewlines)
         if resolvedExecutablePath?.isEmpty != false {
@@ -847,6 +848,7 @@ final class ChatGPTBridgeViewModel: ObservableObject {
             runtimeAPIKey: runtimeAPIKey,
             executablePath: resolvedExecutablePath,
             controlPlaneBaseURL: controlPlaneBaseURL,
+            proxyStrategy: proxyStrategy,
             activateTransport: false
         )
     }
@@ -900,6 +902,7 @@ final class ChatGPTBridgeViewModel: ObservableObject {
         runtimeAPIKey: String,
         executablePath: String? = nil,
         controlPlaneBaseURL: String = "https://api.openai.com",
+        proxyStrategy: TunnelProxyStrategy? = nil,
         activateTransport: Bool = true
     ) async {
         let trimmedID = tunnelID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -960,7 +963,10 @@ final class ChatGPTBridgeViewModel: ObservableObject {
             updated.secureTunnel = SecureTunnelConfiguration(
                 tunnelID: trimmedID,
                 executablePath: resolvedExecutablePath,
-                controlPlaneBaseURL: trimmedControlPlane
+                controlPlaneBaseURL: trimmedControlPlane,
+                proxyStrategy: proxyStrategy
+                    ?? updated.secureTunnel?.proxyStrategy
+                    ?? .automatic
             )
             guard await save(updated) else { return }
             refreshSecretAvailability()

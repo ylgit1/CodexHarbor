@@ -62,6 +62,10 @@ ChatGPT 可以通过 Codex Harbor 调用本机项目能力，而无需让整个�
 - Allowed Roots 项目目录授权
 - Tunnel / HTTPS 运行状态检测
 - Runtime Key / Access Token 生命周期处理
+- 本地管道代理策略：自动 / 系统代理 / 直连
+- 自动检测 macOS HTTP/HTTPS/SOCKS 代理；代理不可达时可回退直连
+- 本地 MCP 强制加入 localhost / 127.0.0.1 / ::1 绕过代理
+- 代理与直连都失败时提示 VPN/TUN/路由类网络异常
 - 工具目录版本与 ChatGPT 已发现目录的差异检测
 - 连接异常后的恢复与重新连接
 - 自动下载当前 Mac 架构对应的 tunnel-client / cloudflared

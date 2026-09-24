@@ -606,6 +606,21 @@ struct HarborLocalAccessView: View {
                         .help("删除配置")
                     }
                 }
+
+                if mode == .secureTunnel, configured {
+                    HStack(spacing: 6) {
+                        Image(systemName: bridge.runtime.proxyStatus?.selectedRoute == .systemProxy
+                            ? "network"
+                            : "arrow.right.circle")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Text(secureTunnelProxySummary)
+                            .font(.system(size: 9.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                }
             }
         }
         .overlay(
@@ -657,6 +672,7 @@ struct HarborLocalAccessView: View {
         switch id {
         case "agent": "cube.fill"
         case "mcp": "desktopcomputer"
+        case "network-proxy": "network"
         case "tunnel-client": "link"
         case "openai-tunnel": "icloud.fill"
         case "chatgpt-mcp": "circle.hexagongrid.fill"
@@ -704,7 +720,7 @@ struct HarborLocalAccessView: View {
         testFeedback = ConnectionTestFeedback(
             state: .testing,
             title: "正在检测连接",
-            detail: "检查 MCP、Tunnel 与 OpenAI 入口"
+            detail: "检查网络代理、MCP、Tunnel 与 OpenAI 入口"
         )
 
         Task { @MainActor in
@@ -732,7 +748,7 @@ struct HarborLocalAccessView: View {
                 testFeedback = ConnectionTestFeedback(
                     state: .success,
                     title: "连接正常",
-                    detail: "MCP、Tunnel、OpenAI 入口 · \(duration) ms"
+                    detail: "网络代理、MCP、Tunnel、OpenAI 入口 · \(duration) ms"
                 )
             }
 
@@ -1035,6 +1051,16 @@ struct HarborLocalAccessView: View {
         }
         .padding(.horizontal, 15)
         .frame(height: 62)
+    }
+
+    private var secureTunnelProxySummary: String {
+        let strategy = bridge.configuration.secureTunnel?.proxyStrategy ?? .automatic
+        guard bridge.configuration.transportMode == .secureTunnel,
+              let status = bridge.runtime.proxyStatus else {
+            return "代理 · \(strategy.displayName)"
+        }
+        let proxy = status.systemProxyDescription.map { " · \($0)" } ?? ""
+        return "代理 · \(strategy.displayName) · 当前\(status.selectedRoute.displayName)\(proxy)"
     }
 
     private func transportStatus(

@@ -141,22 +141,6 @@ struct AppShellView: View {
                 )
             }
             .sheet(
-                item: Binding(
-                    get: { chatGPTBridge.pendingApprovalRequests.first },
-                    set: { _ in }
-                )
-            ) { request in
-                HarborToolApprovalDialog(
-                    request: request,
-                    onDeny: {
-                        Task { await chatGPTBridge.decideApproval(request, allow: false) }
-                    },
-                    onAllow: {
-                        Task { await chatGPTBridge.decideApproval(request, allow: true) }
-                    }
-                )
-            }
-            .sheet(
                 isPresented: Binding(
                     get: { deletionTarget != nil },
                     set: { if !$0 { deletionTarget = nil } }
@@ -207,6 +191,9 @@ struct AppShellView: View {
                 )
             ) { _ in
                 Task { await chatGPTBridge.reconcileRuntime() }
+            }
+            .onAppear {
+                HarborApprovalPanelController.shared.start()
             }
     }
 

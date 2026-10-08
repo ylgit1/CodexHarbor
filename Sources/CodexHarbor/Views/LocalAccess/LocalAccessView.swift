@@ -25,10 +25,6 @@ struct HarborLocalAccessView: View {
                     connectionPathCard
                     allowedRootsSection
                     transportSection
-
-                    if !bridge.pendingApprovalRequests.isEmpty {
-                        approvalCard
-                    }
                 }
                 .frame(maxWidth: 1220)
                 .frame(maxWidth: .infinity)
@@ -472,49 +468,6 @@ struct HarborLocalAccessView: View {
                 color: .secondary,
                 text: "ChatGPT 接入当前已关闭。"
             )
-        }
-    }
-
-    private var approvalCard: some View {
-        HarborCard(padding: 14) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Label("待确认操作", systemImage: "hand.raised.fill")
-                        .font(.system(size: 12.5, weight: .semibold))
-                        .foregroundStyle(HarborColors.orange)
-                    Spacer()
-                    HarborStatusBadge(
-                        title: "\(bridge.pendingApprovalRequests.count) 项",
-                        color: HarborColors.orange
-                    )
-                }
-
-                ForEach(bridge.pendingApprovalRequests.prefix(3)) { request in
-                    HStack(spacing: 10) {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(request.tool)
-                                .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-                            Text(request.summary)
-                                .font(.system(size: 9.5))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                        }
-
-                        Spacer()
-
-                        Button("拒绝") {
-                            Task { await bridge.decideApproval(request, allow: false) }
-                        }
-                        .buttonStyle(HarborActionButtonStyle(tint: HarborColors.red, prominence: .secondary))
-
-                        Button("允许一次") {
-                            Task { await bridge.decideApproval(request, allow: true) }
-                        }
-                        .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .prominent))
-                    }
-                    .padding(.vertical, 3)
-                }
-            }
         }
     }
 

@@ -1,9 +1,11 @@
 import SwiftUI
 import AppKit
+import ChatGPTBridgeCore
 
 struct HarborSettingsView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var bridge: ChatGPTBridgeViewModel
+    @State private var approvalResetMessage = "重新询问同类操作"
 
     var body: some View {
         ScrollView {
@@ -43,6 +45,15 @@ struct HarborSettingsView: View {
                         Divider().opacity(0.4).padding(.horizontal, 16)
 
                         sectionHeader("应用")
+                        actionRow("撤销已记住的授权", value: approvalResetMessage) {
+                            do {
+                                try BridgeApprovalStore(paths: BridgePaths.live()).revokeRememberedApprovals()
+                                approvalResetMessage = "已撤销，下次操作时重新询问"
+                            } catch {
+                                approvalResetMessage = "撤销失败，请重试"
+                            }
+                        }
+                        Divider().opacity(0.4).padding(.leading, 16)
                         valueRow(
                             "版本",
                             value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"

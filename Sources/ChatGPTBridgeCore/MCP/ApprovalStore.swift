@@ -14,6 +14,14 @@ public struct BridgeApprovalRequest: Codable, Equatable, Identifiable, Sendable 
     public let target: String?
     public let createdAt: Date
     public var decision: BridgeApprovalDecision
+    public let rememberScope: BridgeApprovalScope?
+    public let expiresAt: Date?
+
+    public var deadline: Date { expiresAt ?? createdAt.addingTimeInterval(90) }
+
+    public func remainingSeconds(at now: Date) -> Int {
+        max(0, Int(ceil(deadline.timeIntervalSince(now))))
+    }
 
     public init(
         id: String,
@@ -21,7 +29,9 @@ public struct BridgeApprovalRequest: Codable, Equatable, Identifiable, Sendable 
         summary: String,
         target: String? = nil,
         createdAt: Date = Date(),
-        decision: BridgeApprovalDecision = .pending
+        decision: BridgeApprovalDecision = .pending,
+        rememberScope: BridgeApprovalScope? = nil,
+        expiresAt: Date? = nil
     ) {
         self.id = id
         self.tool = tool
@@ -29,16 +39,23 @@ public struct BridgeApprovalRequest: Codable, Equatable, Identifiable, Sendable 
         self.target = target
         self.createdAt = createdAt
         self.decision = decision
+        self.rememberScope = rememberScope
+        self.expiresAt = expiresAt
     }
 }
 
 public final class BridgeApprovalStore: @unchecked Sendable {
     private let directory: URL
+    private let rulesDirectory: URL
     private let lock = NSLock()
     private let ttl: TimeInterval
+    // Keep authorization lifetime aligned with ToolRouter's 90-second wait.
+    // A late decision must never authorize a subsequent identical command.
+    private let approvalTimeout: TimeInterval = 90
 
     public init(paths: BridgePaths, ttl: TimeInterval = 10 * 60) {
         self.directory = paths.root.appendingPathComponent("approvals", isDirectory: true)
+        self.rulesDirectory = paths.root.appendingPathComponent("approval-rules", isDirectory: true)
         self.ttl = ttl
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try? FileManager.default.setAttributes(
@@ -63,7 +80,8 @@ public final class BridgeApprovalStore: @unchecked Sendable {
         id: String,
         tool: String,
         summary: String,
-        target: String? = nil
+        target: String? = nil,
+        rememberScope: BridgeApprovalScope? = nil
     ) {
         withLock {
             pruneExpiredLocked()
@@ -75,7 +93,9 @@ public final class BridgeApprovalStore: @unchecked Sendable {
                 id: id,
                 tool: tool,
                 summary: summary,
-                target: target
+                target: target,
+                rememberScope: rememberScope,
+                expiresAt: Date().addingTimeInterval(min(ttl, approvalTimeout))
             )
             saveLocked(request, to: url)
         }
@@ -88,6 +108,10 @@ public final class BridgeApprovalStore: @unchecked Sendable {
             guard let request = loadLocked(url) else { return nil }
             switch request.decision {
             case .pending:
+                if let scope = request.rememberScope, hasRememberedApproval(scope) {
+                    try? FileManager.default.removeItem(at: url)
+                    return .granted
+                }
                 return nil
             case .granted, .denied:
                 try? FileManager.default.removeItem(at: url)
@@ -107,6 +131,9 @@ public final class BridgeApprovalStore: @unchecked Sendable {
             }
             try? await Task.sleep(for: .milliseconds(200))
         }
+        // The command is no longer waiting. Remove the prompt immediately
+        // so its notification and UI cannot approve a dead command.
+        withLock { try? FileManager.default.removeItem(at: requestURL(id)) }
         return nil
     }
 
@@ -122,17 +149,46 @@ public final class BridgeApprovalStore: @unchecked Sendable {
             return urls
                 .compactMap(loadLocked)
                 .filter { $0.decision == .pending }
+                .filter { request in
+                    guard let scope = request.rememberScope else { return true }
+                    return !hasRememberedApproval(scope)
+                }
                 .sorted { $0.createdAt > $1.createdAt }
         }
     }
 
-    public func decide(id: String, allow: Bool) {
+    @discardableResult
+    public func decide(id: String, allow: Bool, remember: Bool = false) -> Bool {
         withLock {
             pruneExpiredLocked()
             let url = requestURL(id)
-            guard var request = loadLocked(url), request.decision == .pending else { return }
+            guard var request = loadLocked(url), request.decision == .pending else { return false }
+            if allow && remember {
+                guard let scope = request.rememberScope else { return false }
+                do {
+                    try FileManager.default.createDirectory(at: rulesDirectory, withIntermediateDirectories: true,
+                                                           attributes: [.posixPermissions: 0o700])
+                    let rule = rulesDirectory.appendingPathComponent(scope.id + ".json")
+                    try JSONEncoder().encode(scope).write(to: rule, options: .atomic)
+                    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: rule.path)
+                } catch { return false }
+            }
             request.decision = allow ? .granted : .denied
             saveLocked(request, to: url)
+            return loadLocked(url)?.decision == request.decision
+        }
+    }
+
+    public func hasRememberedApproval(_ scope: BridgeApprovalScope) -> Bool {
+        let url = rulesDirectory.appendingPathComponent(scope.id + ".json")
+        guard let data = try? Data(contentsOf: url),
+              let saved = try? JSONDecoder().decode(BridgeApprovalScope.self, from: data) else { return false }
+        return saved == scope
+    }
+
+    public func revokeRememberedApprovals() throws {
+        if FileManager.default.fileExists(atPath: rulesDirectory.path) {
+            try FileManager.default.removeItem(at: rulesDirectory)
         }
     }
 
@@ -159,7 +215,7 @@ public final class BridgeApprovalStore: @unchecked Sendable {
                 try? FileManager.default.removeItem(at: url)
                 continue
             }
-            if now.timeIntervalSince(request.createdAt) > ttl {
+            if now >= request.deadline || now.timeIntervalSince(request.createdAt) >= min(ttl, approvalTimeout) {
                 try? FileManager.default.removeItem(at: url)
             }
         }

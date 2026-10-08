@@ -1,5 +1,74 @@
 import SwiftUI
 import ChatGPTBridgeCore
+import AppKit
+import QuartzCore
+
+/// Core Animation composites the pulse without reevaluating SwiftUI layout
+/// for every node on every frame.
+private struct HarborConnectionPulse: NSViewRepresentable {
+    let color: Color
+    let animating: Bool
+
+    func makeNSView(context: Context) -> PulseView { PulseView() }
+
+    func updateNSView(_ view: PulseView, context: Context) {
+        view.update(color: NSColor(color).cgColor, animating: animating)
+    }
+
+    static func dismantleNSView(_ view: PulseView, coordinator: ()) {
+        view.ring.removeAllAnimations()
+    }
+
+    final class PulseView: NSView {
+        let ring = CAShapeLayer()
+
+        override init(frame: NSRect) {
+            super.init(frame: frame)
+            wantsLayer = true
+            ring.bounds = CGRect(x: 0, y: 0, width: 49, height: 49)
+            ring.path = CGPath(ellipseIn: ring.bounds.insetBy(dx: 1, dy: 1), transform: nil)
+            ring.fillColor = NSColor.clear.cgColor
+            ring.lineWidth = 1.2
+            ring.opacity = 0.24
+            layer?.addSublayer(ring)
+        }
+
+        required init?(coder: NSCoder) { nil }
+
+        override func layout() {
+            super.layout()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            ring.position = CGPoint(x: bounds.midX, y: bounds.midY)
+            CATransaction.commit()
+        }
+
+        func update(color: CGColor, animating: Bool) {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            ring.strokeColor = color
+            CATransaction.commit()
+            guard animating else {
+                ring.removeAllAnimations()
+                return
+            }
+            guard ring.animation(forKey: "pulse") == nil else { return }
+            let scale = CABasicAnimation(keyPath: "transform.scale")
+            scale.fromValue = 1
+            scale.toValue = 1.10
+            let opacity = CABasicAnimation(keyPath: "opacity")
+            opacity.fromValue = 0.20
+            opacity.toValue = 0.28
+            let pulse = CAAnimationGroup()
+            pulse.animations = [scale, opacity]
+            pulse.duration = 1.2
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            ring.add(pulse, forKey: "pulse")
+        }
+    }
+}
 
 struct HarborConnectionStage: View {
     let title: String
@@ -18,18 +87,10 @@ struct HarborConnectionStage: View {
         VStack(spacing: 6) {
             ZStack {
                 if !reduceMotion && state != .waiting && state != .failed {
-                    // Only the pulse redraws; labels and the surrounding
-                    // layout must not recompute on every animation frame.
-                    TimelineView(.animation(
-                        minimumInterval: 1.0 / 24.0,
-                        paused: scenePhase != .active
-                    )) { timeline in
-                        let wave = (sin(timeline.date.timeIntervalSinceReferenceDate * 2.6) + 1) * 0.5
-                        Circle()
-                            .stroke(color.opacity(0.20 + wave * 0.08), lineWidth: 1.2)
-                            .frame(width: 49, height: 49)
-                            .scaleEffect(1 + wave * 0.10)
-                    }
+                    HarborConnectionPulse(color: color, animating: scenePhase == .active)
+                        .frame(width: 54, height: 54)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
                 }
 
                 Circle()
@@ -109,16 +170,23 @@ struct HarborAnimatedFlowConnector: View {
     }
 
     var body: some View {
-        // Limit the animated Canvas to 24 Hz; static connectors and inactive
-        // windows require no continuous updates.
-        TimelineView(.animation(
-            minimumInterval: 1.0 / 24.0,
-            paused: reduceMotion || scenePhase != .active || !isFlowing
-        )) { timeline in
+        Group {
+            if active && !failed && !reduceMotion && scenePhase == .active {
+                TimelineView(.animation(minimumInterval: 1.0 / 24.0)) { timeline in
+                    connector(at: timeline.date)
+                }
+            } else {
+                connector(at: nil)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private func connector(at date: Date?) -> some View {
             Canvas { context, size in
-                let time = timeline.date.timeIntervalSinceReferenceDate
+                let time = date?.timeIntervalSinceReferenceDate ?? 0
                 let speed = active && !ready ? 0.58 : 0.34
-                let phase = reduceMotion
+                let phase = date == nil
                     ? 0.42
                     : (time * speed).truncatingRemainder(dividingBy: 1)
 
@@ -181,8 +249,6 @@ struct HarborAnimatedFlowConnector: View {
                     )
                 }
             }
-        }
-        .accessibilityHidden(true)
     }
 
     private func flowPath(in size: CGSize) -> Path {

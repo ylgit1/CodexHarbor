@@ -44,6 +44,12 @@ public actor CodexTokenUsageMonitor {
     private let fileManager: FileManager
     private var fileOffsets: [String: Int64]
     private var recordsByID: [String: CodexTokenUsageRecord]
+    private var sortedRecords: [CodexTokenUsageRecord] = []
+    private var knownRolloutFiles: [URL] = []
+    private var lastFullDiscoveryAt: Date?
+    private var lastHistoricalPollAt: Date?
+    private let fullDiscoveryInterval: TimeInterval = 300
+    private let historicalPollInterval: TimeInterval = 30
     private let isoFormatter: ISO8601DateFormatter
 
     public init(
@@ -70,13 +76,16 @@ public actor CodexTokenUsageMonitor {
                 self.recordsByID = Dictionary(uniqueKeysWithValues: state.records.map { ($0.id, $0) })
             }
         }
+        self.sortedRecords = Self.orderedRecords(self.recordsByID.values)
     }
 
     public func recentUsage() -> [CodexTokenUsageRecord] {
-        let cutoff = Date().addingTimeInterval(-30 * 24 * 60 * 60)
+        let now = Date()
+        let cutoff = now.addingTimeInterval(-30 * 24 * 60 * 60)
         var changed = false
-        let files = rolloutFiles()
-        let livePaths = Set(files.map(\.path))
+        var recordsChanged = false
+        let (files, didDiscoverAll) = filesToPoll(at: now)
+        let livePaths = didDiscoverAll ? Set(knownRolloutFiles.map(\.path)) : []
 
         for fileURL in files {
             let path = fileURL.path
@@ -97,8 +106,10 @@ public actor CodexTokenUsageMonitor {
                 let data = try handle.readToEnd() ?? Data()
                 let text = String(decoding: data, as: UTF8.self)
                 for line in text.split(whereSeparator: \.isNewline) {
-                    if let record = parse(String(line)) {
+                    if let record = parse(String(line)),
+                       recordsByID[record.id] != record {
                         recordsByID[record.id] = record
+                        recordsChanged = true
                         changed = true
                     }
                 }
@@ -110,13 +121,83 @@ public actor CodexTokenUsageMonitor {
             }
         }
 
-        for path in fileOffsets.keys where !livePaths.contains(path) {
-            fileOffsets.removeValue(forKey: path)
-            changed = true
+        if didDiscoverAll {
+            for path in fileOffsets.keys where !livePaths.contains(path) {
+                fileOffsets.removeValue(forKey: path)
+                changed = true
+            }
         }
-        recordsByID = recordsByID.filter { $0.value.timestamp >= cutoff }
+
+        // No new token data means there is no reason to re-sort the entire
+        // retained history on every 10-second telemetry refresh.
+        if recordsChanged || sortedRecords.first.map({ $0.timestamp < cutoff }) == true {
+            let retained = recordsByID.filter { $0.value.timestamp >= cutoff }
+            if retained.count != recordsByID.count { changed = true }
+            recordsByID = retained
+            sortedRecords = Self.orderedRecords(recordsByID.values)
+        }
         if changed { persistState() }
-        return recordsByID.values.sorted { $0.timestamp < $1.timestamp }
+        return sortedRecords
+    }
+
+    /// Fast path: discover today's new rollouts each poll, while checking
+    /// historical rollouts less often. A full recursive scan still runs every
+    /// five minutes, so imported or moved sessions are eventually discovered.
+    private func filesToPoll(at now: Date) -> (files: [URL], didDiscoverAll: Bool) {
+        let fullScan = lastFullDiscoveryAt.map {
+            now.timeIntervalSince($0) >= fullDiscoveryInterval
+        } ?? true
+        if fullScan {
+            knownRolloutFiles = rolloutFiles()
+            lastFullDiscoveryAt = now
+        }
+
+        let recent = recentRolloutFiles(at: now)
+        let knownPaths = Set(knownRolloutFiles.map(\.path))
+        knownRolloutFiles.append(contentsOf: recent.filter { !knownPaths.contains($0.path) })
+
+        let historicalPoll = fullScan || (lastHistoricalPollAt.map {
+            now.timeIntervalSince($0) >= historicalPollInterval
+        } ?? true)
+        if historicalPoll {
+            lastHistoricalPollAt = now
+            return (knownRolloutFiles, fullScan)
+        }
+
+        // Continue reading active day's appended token records immediately.
+        return (recent, false)
+    }
+
+    private func recentRolloutFiles(at now: Date) -> [URL] {
+        var utcCalendar = Calendar(identifier: .gregorian)
+        utcCalendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        var folders = Set<String>()
+        for calendar in [Calendar.current, utcCalendar] {
+            for date in [now, now.addingTimeInterval(-86_400)] {
+                let components = calendar.dateComponents([.year, .month, .day], from: date)
+                guard let year = components.year, let month = components.month,
+                      let day = components.day else { continue }
+                folders.insert(String(format: "%04d/%02d/%02d", year, month, day))
+            }
+        }
+
+        return folders.flatMap { relativePath in
+            let folder = paths.sessionsURL.appendingPathComponent(relativePath, isDirectory: true)
+            let contents = (try? fileManager.contentsOfDirectory(
+                at: folder,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            return contents.filter { $0.pathExtension == "jsonl" }
+        }
+    }
+
+    private static func orderedRecords<S: Sequence>(_ values: S) -> [CodexTokenUsageRecord]
+        where S.Element == CodexTokenUsageRecord {
+        values.sorted {
+            if $0.timestamp == $1.timestamp { return $0.id < $1.id }
+            return $0.timestamp < $1.timestamp
+        }
     }
 
     private func rolloutFiles() -> [URL] {

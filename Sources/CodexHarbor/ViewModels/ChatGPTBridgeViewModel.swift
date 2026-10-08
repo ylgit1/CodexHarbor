@@ -27,7 +27,6 @@ final class ChatGPTBridgeViewModel: ObservableObject {
     @Published private(set) var launchAgentStatus: BridgeLaunchAgentStatus?
     @Published private(set) var diagnosticResults: [BridgeDiagnosticResult] = []
     @Published private(set) var recentAuditEntries: [AuditEntry] = []
-    @Published private(set) var pendingApprovalRequests: [BridgeApprovalRequest] = []
     @Published private(set) var tunnelMigrationMessage: String?
     @Published private(set) var statusMessage: String?
     @Published private(set) var isWorking = false
@@ -260,7 +259,6 @@ final class ChatGPTBridgeViewModel: ObservableObject {
         if let entries = try? await AuditLogger(paths: paths).recentEntries(limit: 12) {
             recentAuditEntries = entries.reversed()
         }
-        pendingApprovalRequests = BridgeApprovalStore(paths: paths).pendingRequests()
     }
 
     private func repairRuntimeState(_ state: BridgeRuntimeState) -> BridgeRuntimeState {
@@ -337,15 +335,6 @@ final class ChatGPTBridgeViewModel: ObservableObject {
             statusMessage = "诊断包导出失败：\(error.localizedDescription)"
             return false
         }
-    }
-
-    func decideApproval(_ request: BridgeApprovalRequest, allow: Bool) async {
-        guard let paths else { return }
-        BridgeApprovalStore(paths: paths).decide(id: request.id, allow: allow)
-        pendingApprovalRequests = BridgeApprovalStore(paths: paths).pendingRequests()
-        statusMessage = allow
-            ? "已允许该操作，正在继续执行。"
-            : "已拒绝该操作。"
     }
 
     func addAllowedRoot(_ url: URL) async {
@@ -555,7 +544,6 @@ final class ChatGPTBridgeViewModel: ObservableObject {
         guard await save(updated) else { return }
         if let paths {
             BridgeApprovalStore(paths: paths).clear()
-            pendingApprovalRequests = []
         }
 
         if updated.enabled {

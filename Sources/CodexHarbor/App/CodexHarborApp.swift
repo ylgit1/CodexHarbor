@@ -54,7 +54,16 @@ struct CodexHarborApp: App {
         MenuBarExtra {
             MenuBarView(model: model)
         } label: {
-            Label("Codex Harbor", systemImage: model.environment.activeMode == nil ? "circle.dashed" : "point.3.connected.trianglepath.dotted")
+            Label(
+                "Codex Harbor",
+                systemImage: model.environment.activeMode == nil
+                    ? "circle.dashed"
+                    : "point.3.connected.trianglepath.dotted"
+            )
+            .onAppear {
+                // The menu bar remains alive if every main window is closed.
+                HarborApprovalPanelController.shared.start()
+            }
         }
         .menuBarExtraStyle(.menu)
     }

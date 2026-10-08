@@ -26,6 +26,9 @@ actor CodexTelemetryCoordinator {
     private var relayCursor: Int64 = 0
     private var relaySeeded = false
     private var relayTokenRecordsByID: [String: CodexTokenUsageRecord] = [:]
+    private var earliestRelayRecordDate: Date?
+    private var previousCodexTokenRecords: [CodexTokenUsageRecord] = []
+    private var mergedTokenRecordCache: [CodexTokenUsageRecord] = []
     private let startedAt: Date
 
     init(
@@ -79,6 +82,7 @@ actor CodexTelemetryCoordinator {
 
         var sourceIDs = existingActivitySourceIDs
         var newEvents: [ConnectionActivityEvent] = []
+        var relayTokensChanged = false
 
         for record in relayBatch.records {
             if !sourceIDs.contains(record.id) {
@@ -95,7 +99,7 @@ actor CodexTelemetryCoordinator {
             }
 
             guard record.usage.source != .unavailable else { continue }
-            relayTokenRecordsByID[record.id] = CodexTokenUsageRecord(
+            let tokenRecord = CodexTokenUsageRecord(
                 id: record.id,
                 timestamp: record.startedAt,
                 inputTokens: record.usage.inputTokens,
@@ -104,16 +108,26 @@ actor CodexTelemetryCoordinator {
                 reasoningOutputTokens: record.usage.reasoningOutputTokens,
                 totalTokens: record.usage.totalTokens
             )
+            if relayTokenRecordsByID[record.id] != tokenRecord {
+                relayTokenRecordsByID[record.id] = tokenRecord
+                relayTokensChanged = true
+            }
         }
 
         let relayCutoff = Date().addingTimeInterval(-30 * 24 * 60 * 60)
-        let retainedRelayTokens = relayTokenRecordsByID.values
-            .filter { $0.timestamp >= relayCutoff }
-            .sorted { $0.timestamp < $1.timestamp }
-            .suffix(5_000)
-        relayTokenRecordsByID = Dictionary(
-            uniqueKeysWithValues: retainedRelayTokens.map { ($0.id, $0) }
-        )
+        if relayTokensChanged || earliestRelayRecordDate.map({ $0 < relayCutoff }) == true {
+            let retainedRelayTokens = relayTokenRecordsByID.values
+                .filter { $0.timestamp >= relayCutoff }
+                .sorted { $0.timestamp < $1.timestamp }
+                .suffix(5_000)
+            relayTokenRecordsByID = Dictionary(
+                uniqueKeysWithValues: retainedRelayTokens.map { ($0.id, $0) }
+            )
+            earliestRelayRecordDate = retainedRelayTokens.first?.timestamp
+            // A record can cross the thirty-day retention boundary even when
+            // no new Relay event arrived. That must invalidate the cache too.
+            relayTokensChanged = true
+        }
 
         if let connection, connection.kind != .apiKey {
             for record in codexTokenRecords where
@@ -175,13 +189,21 @@ actor CodexTelemetryCoordinator {
             stateStore.save(observedTurnIDs)
         }
 
-        let mergedTokenRecords = Dictionary(
-            (codexTokenRecords + Array(relayTokenRecordsByID.values)).map { ($0.id, $0) },
-            uniquingKeysWith: { _, newest in newest }
-        ).values.sorted { $0.timestamp < $1.timestamp }
+        // Token summaries are immutable between new records. Rebuilding and
+        // sorting the entire 30-day history at each idle poll wastes CPU.
+        if previousCodexTokenRecords != codexTokenRecords || relayTokensChanged {
+            previousCodexTokenRecords = codexTokenRecords
+            mergedTokenRecordCache = Dictionary(
+                (codexTokenRecords + Array(relayTokenRecordsByID.values)).map { ($0.id, $0) },
+                uniquingKeysWith: { _, newest in newest }
+            ).values.sorted {
+                if $0.timestamp == $1.timestamp { return $0.id < $1.id }
+                return $0.timestamp < $1.timestamp
+            }
+        }
 
         return CodexTelemetryUpdate(
-            tokenUsageRecords: mergedTokenRecords,
+            tokenUsageRecords: mergedTokenRecordCache,
             activityEvents: newEvents,
             authenticationChanged: authenticationChanged
         )

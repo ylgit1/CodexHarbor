@@ -69,11 +69,7 @@ struct HarborSidebarView: View {
 
     private var brandHeader: some View {
         HStack(spacing: 9) {
-            Image(nsImage: NSApplication.shared.applicationIconImage)
-                .resizable()
-                .interpolation(.high)
-                .antialiased(true)
-                .frame(width: 27, height: 27)
+            brandIcon
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("Codex Harbor")
@@ -88,6 +84,24 @@ struct HarborSidebarView: View {
         .padding(.horizontal, 17)
         .padding(.top, 20)
         .frame(height: 75)
+    }
+
+    @ViewBuilder
+    private var brandIcon: some View {
+        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let icon = NSImage(contentsOf: iconURL) {
+            Image(nsImage: icon)
+                .resizable()
+                .interpolation(.high)
+                .antialiased(true)
+                .frame(width: 27, height: 27)
+        } else {
+            Image(systemName: "shippingbox.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 27, height: 27)
+                .background(HarborColors.blue, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
     }
 
     private func row(_ page: HarborMainPage) -> some View {

@@ -713,6 +713,18 @@ public actor ToolRouter {
                 )
                 let target = approvalTarget(name: name, arguments: arguments)
                 let details = approvalDetails(name: name, arguments: arguments)
+                var rememberScope: BridgeApprovalScope?
+                if let workspace, let resolved = try? await workspaceManager.workspace(id: workspace) {
+                    rememberScope = BridgeApprovalScope.make(
+                        workspacePath: resolved.rootPath, tool: name, target: target, details: details
+                    )
+                }
+                // This is reached only for an ask decision. Explicit denials,
+                // blocked commands and path validation still run on execution.
+                if let rememberScope, approvalStore.hasRememberedApproval(rememberScope) {
+                    return try await execute(name: name, arguments: arguments,
+                        context: ToolExecutionContext(approvalGranted: true, sessionID: context.sessionID))
+                }
                 let requestID = BridgeApprovalStore.requestID(
                     tool: name,
                     workspaceID: workspace,
@@ -723,7 +735,8 @@ public actor ToolRouter {
                     id: requestID,
                     tool: name,
                     summary: operation,
-                    target: target
+                    target: target,
+                    rememberScope: rememberScope
                 )
                 switch await approvalStore.waitForDecision(id: requestID) {
                 case .granted:

@@ -90,8 +90,8 @@ struct HarborStatusBadge: View {
     let color: Color
     var pulses: Bool? = nil
 
-    @State private var pulse = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
 
     private var shouldPulse: Bool {
         if let pulses { return pulses }
@@ -105,11 +105,10 @@ struct HarborStatusBadge: View {
         HStack(spacing: 5) {
             ZStack {
                 if shouldPulse && !reduceMotion {
-                    Circle()
-                        .stroke(color.opacity(0.30), lineWidth: 1.5)
+                    // Core Animation handles this perpetual pulse in the
+                    // compositor, without invalidating SwiftUI layout frames.
+                    HarborCompositedPulseRing(color: color, active: scenePhase == .active)
                         .frame(width: 10, height: 10)
-                        .scaleEffect(pulse ? 1.7 : 0.7)
-                        .opacity(pulse ? 0 : 0.7)
                 }
                 Circle()
                     .fill(color)
@@ -133,12 +132,64 @@ struct HarborStatusBadge: View {
         )
         .overlay(Capsule().stroke(color.opacity(0.10)))
         .accessibilityElement(children: .combine)
-        .onAppear {
-            guard shouldPulse && !reduceMotion else { return }
-            withAnimation(.easeOut(duration: 1.45).repeatForever(autoreverses: false)) {
-                pulse = true
-            }
-        }
+    }
+}
+
+/// A compositor-driven 10-point pulse. Never schedules a SwiftUI timeline or
+/// an infinite SwiftUI state animation for a static status badge.
+private struct HarborCompositedPulseRing: NSViewRepresentable {
+    let color: Color
+    let active: Bool
+
+    func makeNSView(context: Context) -> HarborPulseLayerView {
+        HarborPulseLayerView(frame: NSRect(x: 0, y: 0, width: 10, height: 10))
+    }
+
+    func updateNSView(_ nsView: HarborPulseLayerView, context: Context) {
+        nsView.update(color: NSColor(color), active: active)
+    }
+}
+
+private final class HarborPulseLayerView: NSView {
+    private let ring = CAShapeLayer()
+    private var isAnimating = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        ring.frame = CGRect(x: 0, y: 0, width: 10, height: 10)
+        ring.path = CGPath(ellipseIn: CGRect(x: 1, y: 1, width: 8, height: 8), transform: nil)
+        ring.fillColor = NSColor.clear.cgColor
+        ring.lineWidth = 1.5
+        ring.opacity = 0
+        layer?.addSublayer(ring)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("HarborPulseLayerView is created programmatically")
+    }
+
+    func update(color: NSColor, active: Bool) {
+        ring.strokeColor = color.withAlphaComponent(0.30).cgColor
+        guard active != isAnimating else { return }
+        isAnimating = active
+        ring.removeAnimation(forKey: "harborPulse")
+        guard active else { return }
+
+        let scale = CABasicAnimation(keyPath: "transform.scale")
+        scale.fromValue = 0.7
+        scale.toValue = 1.7
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0.7
+        fade.toValue = 0
+        let animation = CAAnimationGroup()
+        animation.animations = [scale, fade]
+        animation.duration = 1.45
+        // Preserve the connected-state breathing indicator. Core Animation
+        // composites it without driving SwiftUI's view/layout update loop.
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        ring.add(animation, forKey: "harborPulse")
     }
 }
 

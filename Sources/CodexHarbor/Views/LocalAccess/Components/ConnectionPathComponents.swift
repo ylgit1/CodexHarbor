@@ -8,59 +8,62 @@ struct HarborConnectionStage: View {
     let state: BridgeNodeState
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
 
     private var color: Color {
         state.harborColor
     }
 
     var body: some View {
-        TimelineView(.animation) { timeline in
-            let time = timeline.date.timeIntervalSinceReferenceDate
-            let wave = (sin(time * 2.6) + 1) * 0.5
-            let shouldPulse = !reduceMotion && state != .waiting && state != .failed
-
-            VStack(spacing: 6) {
-                ZStack {
-                    if shouldPulse {
+        VStack(spacing: 6) {
+            ZStack {
+                if !reduceMotion && state != .waiting && state != .failed {
+                    // Only the pulse redraws; labels and the surrounding
+                    // layout must not recompute on every animation frame.
+                    TimelineView(.animation(
+                        minimumInterval: 1.0 / 24.0,
+                        paused: scenePhase != .active
+                    )) { timeline in
+                        let wave = (sin(timeline.date.timeIntervalSinceReferenceDate * 2.6) + 1) * 0.5
                         Circle()
                             .stroke(color.opacity(0.20 + wave * 0.08), lineWidth: 1.2)
                             .frame(width: 49, height: 49)
                             .scaleEffect(1 + wave * 0.10)
                     }
-
-                    Circle()
-                        .fill(color.opacity(state == .failed ? 0.11 : 0.10))
-                        .frame(width: 44, height: 44)
-                        .overlay(
-                            Circle()
-                                .stroke(color.opacity(state == .waiting ? 0.10 : 0.24), lineWidth: 1)
-                        )
-
-                    Image(systemName: icon)
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(color)
-
-                    if state == .failed {
-                        Image(systemName: "exclamationmark.circle.fill")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(HarborColors.red)
-                            .background(Circle().fill(HarborColors.cardBackground))
-                            .offset(x: 16, y: -16)
-                    }
                 }
-                .frame(width: 54, height: 54)
 
-                Text(title)
-                    .font(.system(size: 9.5, weight: .semibold))
-                    .lineLimit(1)
+                Circle()
+                    .fill(color.opacity(state == .failed ? 0.11 : 0.10))
+                    .frame(width: 44, height: 44)
+                    .overlay(
+                        Circle()
+                            .stroke(color.opacity(state == .waiting ? 0.10 : 0.24), lineWidth: 1)
+                    )
 
-                Text(detail)
-                    .font(.system(size: 8.5, weight: .medium))
+                Image(systemName: icon)
+                    .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(color)
-                    .lineLimit(1)
+
+                if state == .failed {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(HarborColors.red)
+                        .background(Circle().fill(HarborColors.cardBackground))
+                        .offset(x: 16, y: -16)
+                }
             }
-            .frame(maxWidth: .infinity)
+            .frame(width: 54, height: 54)
+
+            Text(title)
+                .font(.system(size: 9.5, weight: .semibold))
+                .lineLimit(1)
+
+            Text(detail)
+                .font(.system(size: 8.5, weight: .medium))
+                .foregroundStyle(color)
+                .lineLimit(1)
         }
+        .frame(maxWidth: .infinity)
     }
 }
 
@@ -92,6 +95,7 @@ struct HarborAnimatedFlowConnector: View {
     let failed: Bool
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
 
     private var color: Color {
         if failed { return HarborColors.red }
@@ -105,7 +109,12 @@ struct HarborAnimatedFlowConnector: View {
     }
 
     var body: some View {
-        TimelineView(.animation) { timeline in
+        // Limit the animated Canvas to 24 Hz; static connectors and inactive
+        // windows require no continuous updates.
+        TimelineView(.animation(
+            minimumInterval: 1.0 / 24.0,
+            paused: reduceMotion || scenePhase != .active || !isFlowing
+        )) { timeline in
             Canvas { context, size in
                 let time = timeline.date.timeIntervalSinceReferenceDate
                 let speed = active && !ready ? 0.58 : 0.34

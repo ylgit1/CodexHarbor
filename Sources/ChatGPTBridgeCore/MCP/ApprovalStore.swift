@@ -41,6 +41,10 @@ public final class BridgeApprovalStore: @unchecked Sendable {
         self.directory = paths.root.appendingPathComponent("approvals", isDirectory: true)
         self.ttl = ttl
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: directory.path
+        )
     }
 
     public static func requestID(
@@ -174,6 +178,10 @@ public final class BridgeApprovalStore: @unchecked Sendable {
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(request) else { return }
         try? data.write(to: url, options: .atomic)
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
     }
 
     private func withLock<T>(_ operation: () -> T) -> T {

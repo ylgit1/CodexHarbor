@@ -48,9 +48,10 @@ public actor WorkspaceSessionStore {
     }
 
     public func resolve(sessionID: String?) -> UUID? {
-        if let sessionID = Self.normalized(sessionID),
-           let workspaceID = sessions[sessionID]?.workspaceID {
-            return workspaceID
+        // Never inherit another MCP client's last workspace. Legacy clients
+        // that send no session ID retain the historic single-workspace flow.
+        if let sessionID = Self.normalized(sessionID) {
+            return sessions[sessionID]?.workspaceID
         }
         return lastWorkspaceID
     }

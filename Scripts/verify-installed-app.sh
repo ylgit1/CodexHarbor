@@ -7,6 +7,7 @@ helper_path="$installed_app_path/Contents/Helpers/HarborChatGPTAgent"
 launch_agent_label="com.codexharbor.chatgpt-agent"
 launch_agent_domain="gui/$(id -u)"
 health_url="http://127.0.0.1:19473/health"
+bridge_config_path="$HOME/Library/Application Support/CodexHarbor/ChatGPTBridge/config.json"
 expected_catalog_version=""
 expected_tool_count=""
 
@@ -48,7 +49,25 @@ verify_static_install() {
   read_expected_catalog || return 1
 }
 
+resolve_health_url() {
+  # BridgeConfiguration.localMCPPort is derived from the HTTPS config, even
+  # when Secure Tunnel is selected. Hardcoding 19473 makes custom-port
+  # installations fail health verification and incorrectly roll back.
+  local configured_port=""
+  if [[ -f "$bridge_config_path" ]]; then
+    configured_port="$(/usr/bin/plutil -extract httpsCompatibility.localPort raw -o - "$bridge_config_path" 2>/dev/null || true)"
+  fi
+  if [[ -n "$configured_port" ]]; then
+    if [[ "$configured_port" != <-> ]] || (( configured_port < 1 || configured_port > 65535 )); then
+      echo "MCP 配置端口无效：$configured_port" >&2
+      return 1
+    fi
+    health_url="http://127.0.0.1:$configured_port/health"
+  fi
+}
+
 verify_agent_health() {
+  resolve_health_url || return 1
   local health_json=""
   local attempt=0
   while (( attempt < 24 )); do
@@ -81,7 +100,7 @@ if [[ "${1:-}" == "--offline" ]]; then
 fi
 
 if ! verify_agent_health; then
-  rollback "重载后的 19473 health 与安装包 Tool Catalog 不一致"
+  rollback "重载后的 $health_url 与安装包 Tool Catalog 不一致"
   exit 11
 fi
 

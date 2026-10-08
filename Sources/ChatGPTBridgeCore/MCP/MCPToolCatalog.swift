@@ -66,6 +66,24 @@ enum MCPToolCatalog {
             annotations: readOnlyAnnotations
         ),
         MCPToolDefinition(
+            name: "tail_file",
+            title: "Read end of large project log",
+            description: "Read at most 256 KiB from the end of an authorized workspace file, including files larger than the normal read limit.",
+            inputSchema: objectSchema(properties: [
+                "workspaceId": stringSchema(description: "Optional workspace UUID"),
+                "path": stringSchema(description: "Workspace-relative log path"),
+                "limitBytes": integerSchema(minimum: 1, maximum: WorkspaceTailTool.maximumTailBytes)
+            ], required: ["path"]),
+            outputSchema: objectSchema(properties: [
+                "path": stringSchema(description: "Log path"),
+                "startOffset": integerSchema(minimum: 0),
+                "totalBytes": integerSchema(minimum: 0),
+                "content": stringSchema(description: "Last bytes of the file"),
+                "truncated": booleanSchema(description: "File has earlier content")
+            ], required: ["path", "startOffset", "totalBytes", "content", "truncated"]),
+            annotations: readOnlyAnnotations
+        ),
+        MCPToolDefinition(
             name: "search",
             title: "Search workspace",
             description: "Search UTF-8 project files inside an opened workspace.",
@@ -234,6 +252,67 @@ enum MCPToolCatalog {
                 required: ["path", "bytesWritten", "created"]
             ),
             annotations: mutatingAnnotations
+        ),
+        MCPToolDefinition(
+            name: "create_directory",
+            title: "Create project directory",
+            description: "Create a directory inside the authorized workspace; never modify the workspace root or Git metadata.",
+            inputSchema: objectSchema(properties: [
+                "workspaceId": stringSchema(description: "Workspace UUID; optional within a bound session"),
+                "path": stringSchema(description: "Workspace-relative directory path")
+            ], required: ["path"]),
+            outputSchema: workspacePathOperationSchema,
+            annotations: mutatingAnnotations
+        ),
+        MCPToolDefinition(
+            name: "move_path",
+            title: "Move project file or directory",
+            description: "Move a workspace-relative file or directory without overwriting existing destinations.",
+            inputSchema: objectSchema(properties: [
+                "workspaceId": stringSchema(description: "Workspace UUID"),
+                "path": stringSchema(description: "Workspace-relative source path"),
+                "destination": stringSchema(description: "Workspace-relative destination path")
+            ], required: ["path", "destination"]),
+            outputSchema: workspacePathOperationSchema,
+            annotations: mutatingAnnotations
+        ),
+        MCPToolDefinition(
+            name: "trash_path",
+            title: "Reversibly remove project file or directory",
+            description: "Move an authorized project file or directory into private recoverable storage, returning a trash ID.",
+            inputSchema: objectSchema(properties: [
+                "workspaceId": stringSchema(description: "Workspace UUID"),
+                "path": stringSchema(description: "Workspace-relative file or directory path")
+            ], required: ["path"]),
+            outputSchema: workspacePathOperationSchema,
+            annotations: mutatingAnnotations
+        ),
+        MCPToolDefinition(
+            name: "restore_path",
+            title: "Restore project file or directory",
+            description: "Restore a previously trashed path, rejecting destination collisions.",
+            inputSchema: objectSchema(properties: [
+                "workspaceId": stringSchema(description: "Workspace UUID"),
+                "trashId": stringSchema(description: "Trash entry UUID")
+            ], required: ["trashId"]),
+            outputSchema: workspacePathOperationSchema,
+            annotations: mutatingAnnotations
+        ),
+        MCPToolDefinition(
+            name: "list_trash",
+            title: "List recoverable project entries",
+            description: "List recoverable entries belonging to an open authorized workspace.",
+            inputSchema: objectSchema(properties: [
+                "workspaceId": stringSchema(description: "Workspace UUID")
+            ], required: []),
+            outputSchema: arraySchema(items: objectSchema(properties: [
+                "id": stringSchema(description: "Trash UUID"),
+                "workspaceID": stringSchema(description: "Workspace UUID"),
+                "workspaceRoot": stringSchema(description: "Workspace root"),
+                "originalPath": stringSchema(description: "Original relative path"),
+                "deletedAt": .object(["type": .string("number")])
+            ], required: ["id", "workspaceID", "workspaceRoot", "originalPath", "deletedAt"])),
+            annotations: readOnlyAnnotations
         ),
         MCPToolDefinition(
             name: "run_command",
@@ -427,6 +506,21 @@ enum MCPToolCatalog {
             annotations: mutatingAnnotations
         ),
         MCPToolDefinition(
+            name: "list_tasks",
+            title: "Discover ongoing and recent development tasks",
+            description: "Return task IDs and statuses for commands, workflows and Coding Tasks across ChatGPT conversations; optionally filter by workspace.",
+            inputSchema: objectSchema(
+                properties: ["workspaceId": stringSchema(description: "Optional workspace UUID filter")],
+                required: []
+            ),
+            outputSchema: objectSchema(properties: [
+                "codingTasks": arraySchema(items: codingTaskResponseSchema),
+                "commands": arraySchema(items: commandSessionStatusSchema),
+                "workflows": arraySchema(items: workflowSessionStatusSchema)
+            ], required: ["codingTasks", "commands", "workflows"]),
+            annotations: readOnlyAnnotations
+        ),
+        MCPToolDefinition(
             name: "coding_task",
             title: "Coding Task",
             description: "Run a stateful coding task around one Task ID. Actions: start applies model-supplied precise changes then automatically diff/tests/builds/packages; status inspects progress; output reads current command output; repair applies a repair patch to the same task and automatically re-verifies; cancel stops the active command. Harbor owns orchestration and verification while the model remains responsible for understanding requirements and generating code changes.",
@@ -468,6 +562,16 @@ enum MCPToolCatalog {
             annotations: mutatingAnnotations
         )
     ]
+
+    private static let workspacePathOperationSchema = objectSchema(
+        properties: [
+            "operation": stringSchema(description: "Completed operation"),
+            "path": stringSchema(description: "Workspace-relative source path"),
+            "destination": stringSchema(description: "Destination if moved"),
+            "trashID": stringSchema(description: "Recovery ID if moved to trash")
+        ],
+        required: ["operation", "path"]
+    )
 
     private static let readOnlyAnnotations: JSONValue = .object([
         "readOnlyHint": .bool(true),

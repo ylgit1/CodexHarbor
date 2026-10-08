@@ -161,7 +161,7 @@ public struct WriteFileTool: Sendable {
 }
 
 public struct ShellTool: Sendable {
-    public static let maximumTimeoutSeconds = 300
+    public static let maximumTimeoutSeconds = 1_800
     public static let maximumStdoutBytes = 2 * 1_024 * 1_024
     public static let maximumStderrBytes = 1 * 1_024 * 1_024
 
@@ -211,11 +211,14 @@ public struct ShellTool: Sendable {
 
             let temp = FileManager.default.temporaryDirectory.appendingPathComponent("harbor-shell-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: temp.path)
             defer { try? FileManager.default.removeItem(at: temp) }
             let stdoutURL = temp.appendingPathComponent("stdout")
             let stderrURL = temp.appendingPathComponent("stderr")
             FileManager.default.createFile(atPath: stdoutURL.path, contents: nil)
             FileManager.default.createFile(atPath: stderrURL.path, contents: nil)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stdoutURL.path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stderrURL.path)
             let out = try FileHandle(forWritingTo: stdoutURL)
             let err = try FileHandle(forWritingTo: stderrURL)
             process.standardOutput = out
@@ -224,20 +227,40 @@ public struct ShellTool: Sendable {
             try process.run()
             let deadline = Date().addingTimeInterval(TimeInterval(timeout))
             while process.isRunning && Date() < deadline {
+                let outSize = (try? FileManager.default.attributesOfItem(atPath: stdoutURL.path)[.size] as? NSNumber)?.intValue ?? 0
+                let errSize = (try? FileManager.default.attributesOfItem(atPath: stderrURL.path)[.size] as? NSNumber)?.intValue ?? 0
+                if outSize + errSize > CommandSessionManager.maximumStoredOutputBytes {
+                    process.terminate()
+                    try? await Task.sleep(for: .milliseconds(200))
+                    if process.isRunning { process.interrupt() }
+                    throw BridgeError.writeFailed("命令输出超过 256 MiB 安全限额，已终止任务")
+                }
                 try await Task.sleep(for: .milliseconds(100))
             }
-            if process.isRunning {
-                process.terminate()
-                try await Task.sleep(for: .milliseconds(200))
-                if process.isRunning { process.interrupt() }
+            // Check the wall-clock deadline even when the child exited just
+            // before a heavily loaded executor resumed this task. Otherwise a
+            // five-second command can incorrectly pass a one-second timeout.
+            if Date() >= deadline {
+                if process.isRunning {
+                    process.terminate()
+                    try await Task.sleep(for: .milliseconds(200))
+                    if process.isRunning { process.interrupt() }
+                }
                 try? out.close(); try? err.close()
                 throw BridgeError.commandTimedOut(timeout)
             }
             try out.close(); try err.close()
-            let stdoutData = try Data(contentsOf: stdoutURL)
-            let stderrData = try Data(contentsOf: stderrURL)
-            let stdout = Self.text(stdoutData, max: Self.maximumStdoutBytes)
-            let stderr = Self.text(stderrData, max: Self.maximumStderrBytes)
+            let finalOutBytes = (try FileManager.default.attributesOfItem(atPath: stdoutURL.path)[.size] as? NSNumber)?.intValue ?? 0
+            let finalErrBytes = (try FileManager.default.attributesOfItem(atPath: stderrURL.path)[.size] as? NSNumber)?.intValue ?? 0
+            guard finalOutBytes + finalErrBytes <= CommandSessionManager.maximumStoredOutputBytes else {
+                throw BridgeError.writeFailed("命令输出超过 256 MiB 安全限额")
+            }
+            // Read only bounded output, even if the child emitted a large burst
+            // immediately before exiting.
+            let stdoutData = try Self.readTail(stdoutURL, maximum: Self.maximumStdoutBytes)
+            let stderrData = try Self.readTail(stderrURL, maximum: Self.maximumStderrBytes)
+            let stdout = Self.text(stdoutData.data, max: Self.maximumStdoutBytes)
+            let stderr = Self.text(stderrData.data, max: Self.maximumStderrBytes)
             let redactedStdout = redactor.redact(stdout)
             let redactedStderr = redactor.redact(stderr)
             let duration = Int(Date().timeIntervalSince(startedAt) * 1_000)
@@ -248,7 +271,7 @@ public struct ShellTool: Sendable {
                 stdout: redactedStdout,
                 stderr: redactedStderr,
                 durationMilliseconds: duration,
-                truncated: stdoutData.count > Self.maximumStdoutBytes || stderrData.count > Self.maximumStderrBytes,
+                truncated: stdoutData.truncated || stderrData.truncated,
                 errors: BuildErrorParser().parse(redactedStdout + "\n" + redactedStderr)
             )
             try await auditLogger.record(AuditEntry(
@@ -271,6 +294,16 @@ public struct ShellTool: Sendable {
             ))
             throw error
         }
+    }
+
+    private static func readTail(_ url: URL, maximum: Int) throws -> (data: Data, truncated: Bool) {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        let offset = size > UInt64(maximum) ? size - UInt64(maximum) : 0
+        try handle.seek(toOffset: offset)
+        let data = try handle.read(upToCount: maximum) ?? Data()
+        return (data, offset > 0)
     }
 
     private static func text(_ data: Data, max: Int) -> String {

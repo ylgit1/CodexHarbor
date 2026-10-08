@@ -3,6 +3,9 @@ import Foundation
 /// Runtime health policy. Keeps background work cheap and reserves protocol checks for demand-driven diagnostics.
 public enum BridgeHealthPolicy {
     public static let runtimeHeartbeatInterval: TimeInterval = 5
+    /// A cheap process check can run frequently; audit log decoding should not.
+    public static let agentMonitorInterval: TimeInterval = 5
+    public static let auditRefreshInterval: TimeInterval = 15
     public static let normalHealthInterval: TimeInterval = 300
     public static let recoveryHealthInterval: TimeInterval = 10
     public static let remoteHealthInterval = normalHealthInterval
@@ -10,6 +13,14 @@ public enum BridgeHealthPolicy {
     public static let deepDiagnosticsEnabledByDefault = false
 
     private static let tunnelSelfHealDelays: [TimeInterval] = [90, 180, 300, 600]
+
+    /// Both the installed App and the running Agent must agree on the MCP
+    /// catalog. A successful HTTP 200 alone does not prove an updated Agent
+    /// is serving the current tools.
+    public static func catalogMatches(version: String?, count: Int?) -> Bool {
+        version == MCPToolCatalogMetadata.version
+            && count == MCPToolCatalogMetadata.toolCount
+    }
 
     public static func healthInterval(for diagnostics: BridgePipelineDiagnostics) -> TimeInterval {
         diagnostics.requiresFastRecoveryCheck ? recoveryHealthInterval : normalHealthInterval

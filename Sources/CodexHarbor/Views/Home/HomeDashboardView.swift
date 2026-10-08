@@ -560,8 +560,14 @@ struct HarborHomeDashboardView: View {
                         .font(.system(size: 14, weight: .semibold))
                     Spacer()
                     HarborStatusBadge(
-                        title: bridge.configuration.enabled ? "已启用" : "未启用",
-                        color: bridge.configuration.enabled ? HarborColors.green : .secondary
+                        title: bridge.configuration.enabled
+                            ? (bridge.toolCatalogRefreshRequired ? "工具待刷新"
+                                : (bridge.overallReady ? "已连接" : "恢复中"))
+                            : "未启用",
+                        color: bridge.configuration.enabled
+                            ? (bridge.overallReady && !bridge.toolCatalogRefreshRequired
+                                ? HarborColors.green : HarborColors.orange)
+                            : .secondary
                     )
                 }
 
@@ -588,7 +594,11 @@ struct HarborHomeDashboardView: View {
     }
 
     private func localStatusRow(_ title: String, active: Bool, configured: Bool) -> some View {
-        HStack(spacing: 9) {
+        let healthy = active && bridge.overallReady && !bridge.toolCatalogRefreshRequired
+        let status = active ? (healthy ? "已连接" : "恢复中") : (configured ? "待使用" : "未配置")
+        let statusColor = healthy ? HarborColors.green
+            : (active || configured ? HarborColors.orange : Color.secondary)
+        return HStack(spacing: 9) {
             Image(systemName: title.contains("HTTPS") ? "globe" : "point.3.connected.trianglepath.dotted")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(HarborColors.blue)
@@ -598,11 +608,11 @@ struct HarborHomeDashboardView: View {
                 .font(.system(size: 11.5, weight: .semibold))
             Spacer()
             Circle()
-                .fill(active ? HarborColors.green : (configured ? HarborColors.orange : Color.secondary.opacity(0.4)))
+                .fill(statusColor)
                 .frame(width: 7, height: 7)
-            Text(active ? "使用中" : (configured ? "待使用" : "未配置"))
+            Text(status)
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(active ? HarborColors.green : (configured ? HarborColors.orange : .secondary))
+                .foregroundStyle(statusColor)
         }
         .padding(.horizontal, 10)
         .frame(height: 38)

@@ -42,6 +42,10 @@ public struct CommandSessionOutput: Codable, Equatable, Sendable {
 public actor CommandSessionManager {
     public static let maximumOutputChunkBytes = 256 * 1_024
     public static let maximumSessionCount = 20
+    public static let maximumConcurrentCommands = 3
+    // Keep large build logs on disk and let clients page through them.
+    // A generous disk safety cap remains to prevent runaway processes.
+    public static let maximumStoredOutputBytes = 256 * 1_024 * 1_024
     public static let completedRetention: TimeInterval = 30 * 60
 
     private final class Session {
@@ -126,6 +130,9 @@ public actor CommandSessionManager {
         auditTool: String = "start_command"
     ) async throws -> CommandSessionStarted {
         pruneExpiredSessions()
+        guard sessions.values.filter({ $0.state == .running }).count < Self.maximumConcurrentCommands else {
+            throw BridgeError.writeFailed("同时执行的命令已达到上限（\(Self.maximumConcurrentCommands)）；请等待或取消已有任务")
+        }
 
         let request = CommandRequest(
             executable: executable,
@@ -150,16 +157,23 @@ public actor CommandSessionManager {
         guard try cwd.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
             throw BridgeError.invalidPath(cwd.path)
         }
+        // An actor can be reentered during the workspace lookup above.
+        guard sessions.values.filter({ $0.state == .running }).count < Self.maximumConcurrentCommands else {
+            throw BridgeError.writeFailed("同时执行的命令已达到上限（\(Self.maximumConcurrentCommands)）")
+        }
 
         let timeout = max(1, min(timeoutSeconds, ShellTool.maximumTimeoutSeconds))
         let id = UUID()
         let temporaryDirectory = fileManager.temporaryDirectory
             .appendingPathComponent("harbor-command-session-\(id.uuidString)", isDirectory: true)
         try fileManager.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: temporaryDirectory.path)
         let stdoutURL = temporaryDirectory.appendingPathComponent("stdout")
         let stderrURL = temporaryDirectory.appendingPathComponent("stderr")
         fileManager.createFile(atPath: stdoutURL.path, contents: nil)
         fileManager.createFile(atPath: stderrURL.path, contents: nil)
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stdoutURL.path)
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stderrURL.path)
 
         do {
             let stdoutHandle = try FileHandle(forWritingTo: stdoutURL)
@@ -209,6 +223,13 @@ public actor CommandSessionManager {
             try? fileManager.removeItem(at: temporaryDirectory)
             throw error
         }
+    }
+
+    public func list(workspaceID: UUID? = nil) -> [CommandSessionStatus] {
+        pruneExpiredSessions()
+        return sessions.values.filter { workspaceID == nil || $0.workspaceID == workspaceID }
+            .sorted { $0.startedAt > $1.startedAt }
+            .map { statusValue(for: $0) }
     }
 
     public func status(commandID: UUID) async throws -> CommandSessionStatus {
@@ -286,6 +307,16 @@ public actor CommandSessionManager {
         let deadline = session.startedAt.addingTimeInterval(TimeInterval(timeoutSeconds))
 
         while session.state == .running && session.process.isRunning {
+            let outputBytes = fileSize(at: session.stdoutURL) + fileSize(at: session.stderrURL)
+            if outputBytes > Self.maximumStoredOutputBytes {
+                session.state = .failed
+                session.process.terminate()
+                try? await Task.sleep(for: .milliseconds(250))
+                if session.process.isRunning { session.process.interrupt() }
+                await waitForExit(session, maximumWaitMilliseconds: 1_000)
+                await finalize(session, state: .failed)
+                return
+            }
             if Date() >= deadline {
                 session.state = .timedOut
                 session.process.terminate()
@@ -305,7 +336,8 @@ public actor CommandSessionManager {
     }
 
     private func finalizeNaturally(_ session: Session) async {
-        let state: CommandSessionState = session.process.terminationStatus == 0 ? .completed : .failed
+        let outputExceeded = fileSize(at: session.stdoutURL) + fileSize(at: session.stderrURL) > Self.maximumStoredOutputBytes
+        let state: CommandSessionState = session.process.terminationStatus == 0 && !outputExceeded ? .completed : .failed
         await finalize(session, state: state)
     }
 
@@ -319,14 +351,12 @@ public actor CommandSessionManager {
             session.exitCode = session.process.terminationStatus
         }
 
-        let combined = (
-            (try? String(contentsOf: session.stdoutURL, encoding: .utf8)) ?? ""
-        ) + "\n" + (
-            (try? String(contentsOf: session.stderrURL, encoding: .utf8)) ?? ""
-        )
-        let capped = String(combined.prefix(
-            ShellTool.maximumStdoutBytes + ShellTool.maximumStderrBytes
-        ))
+        // Do not read unbounded command output into memory when a build ends.
+        let stdoutOffset = max(0, fileSize(at: session.stdoutURL) - ShellTool.maximumStdoutBytes)
+        let stderrOffset = max(0, fileSize(at: session.stderrURL) - ShellTool.maximumStderrBytes)
+        let stdout = (try? readChunk(at: session.stdoutURL, offset: stdoutOffset, limit: ShellTool.maximumStdoutBytes).data) ?? Data()
+        let stderr = (try? readChunk(at: session.stderrURL, offset: stderrOffset, limit: ShellTool.maximumStderrBytes).data) ?? Data()
+        let capped = String(decoding: stdout, as: UTF8.self) + "\n" + String(decoding: stderr, as: UTF8.self)
         session.errors = BuildErrorParser().parse(redactor.redact(capped))
 
         guard !session.auditRecorded else { return }
@@ -382,6 +412,11 @@ public actor CommandSessionManager {
         let data = try handle.read(upToCount: limit) ?? Data()
         let next = safeOffset + data.count
         return (data, next, next < size)
+    }
+
+    private func fileSize(at url: URL) -> Int {
+        let attributes = try? fileManager.attributesOfItem(atPath: url.path)
+        return (attributes?[.size] as? NSNumber)?.intValue ?? 0
     }
 
     private func pruneExpiredSessions() {

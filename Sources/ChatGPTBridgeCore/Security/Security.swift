@@ -100,14 +100,9 @@ public struct CommandPolicy: Sendable {
             if riskyMarkers.contains(where: script.contains) {
                 return CommandAssessment(risk: .review, reason: "Shell 脚本包含潜在写入、下载执行或复合命令")
             }
-            if arguments.first == "-c",
-               arguments.count == 2 {
-                let command = arguments[1].trimmingCharacters(in: .whitespacesAndNewlines)
-                let safePrefixes = ["echo ", "printf ", "pwd", "date", "ls ", "ls", "cat ", "head ", "tail ", "wc ", "stat ", "file ", "which "]
-                if safePrefixes.contains(where: command.hasPrefix) {
-                    return CommandAssessment(risk: .safe, reason: "Shell 中的简单只读命令")
-                }
-            }
+            // Even a seemingly read-only shell script can use expansion,
+            // substitution or redirection to access files outside Allowed Roots.
+            // Shell interpreters must always require an explicit approval.
             return CommandAssessment(risk: .review, reason: "Shell 解释器或脚本文件可执行任意逻辑，需要用户确认")
         }
 
@@ -115,9 +110,11 @@ public struct CommandPolicy: Sendable {
             guard let subcommand = arguments.first else {
                 return CommandAssessment(risk: .safe, reason: "只读 Git 信息查询")
             }
-            let safeGit = ["status", "branch", "log", "diff", "show", "rev-parse", "remote", "tag"]
-            if safeGit.contains(subcommand) {
-                return CommandAssessment(risk: .safe, reason: "只读 Git 操作")
+            // Git options such as -C/--git-dir and external diff drivers
+            // can escape the selected workspace or invoke other programs.
+            // Allow only the no-argument status query without review.
+            if subcommand == "status", arguments.count == 1 {
+                return CommandAssessment(risk: .safe, reason: "当前工作区 Git 状态查询")
             }
             let blockedGit = ["reset", "clean"]
             if blockedGit.contains(subcommand) {
@@ -133,19 +130,18 @@ public struct CommandPolicy: Sendable {
             return CommandAssessment(risk: .review, reason: "网络命令可能发送数据、下载内容或执行远端操作")
         }
 
+        // The process cwd is not a sandbox: cat/find/grep and even env can
+        // disclose files and credentials outside the user's approved roots.
+        // File inspection should go through PathValidator-backed MCP tools.
         let safeExecutables: Set<String> = [
-            "pwd", "ls", "find", "grep", "rg", "cat", "head", "tail", "wc", "stat",
-            "file", "which", "whereis", "date", "echo", "printf", "env", "printenv"
+            "pwd", "date", "echo", "printf", "which", "whereis"
         ]
         if safeExecutables.contains(executable) {
             return CommandAssessment(risk: .safe, reason: "只读系统命令")
         }
 
-        if executable == "swift",
-           let subcommand = arguments.first,
-           ["build", "test"].contains(subcommand) {
-            return CommandAssessment(risk: .safe, reason: "Swift 构建或测试命令")
-        }
+        // Builds and tests execute arbitrary project code and build plugins.
+        // They are never safe merely because their names say "test".
 
         let codeExecutionTools: Set<String> = [
             "swift", "swiftc", "xcodebuild", "python", "python3", "node", "npm", "npx",
@@ -157,6 +153,103 @@ public struct CommandPolicy: Sendable {
         }
 
         return CommandAssessment(risk: .review, reason: "未识别的可执行程序需要用户确认")
+    }
+}
+
+/// Trusted development is a deliberate opt-in for selected Allowed Roots.
+/// It removes repeat prompts for standard project workflows, not for arbitrary
+/// shell commands. Running trusted project code is not an OS sandbox.
+public struct TrustedDevelopmentPolicy: Sendable {
+    private let configuration: BridgeConfiguration
+    private let validator = PathValidator()
+
+    public init(configuration: BridgeConfiguration) {
+        self.configuration = configuration
+    }
+
+    public func trusts(_ workspace: BridgeWorkspace) -> Bool {
+        let root = URL(fileURLWithPath: workspace.rootPath, isDirectory: true)
+        return configuration.trustedDevelopmentRoots.contains { trusted in
+            let trustedURL = URL(fileURLWithPath: trusted, isDirectory: true)
+            return configuration.allowedRoots.contains {
+                AllowedRootsManager.canonicalURL(URL(fileURLWithPath: $0, isDirectory: true)) ==
+                    AllowedRootsManager.canonicalURL(trustedURL)
+            } && AllowedRootsManager.isSameOrDescendant(root, of: trustedURL)
+        }
+    }
+
+    public func autoApprovesModification(in workspace: BridgeWorkspace) -> Bool {
+        trusts(workspace) && configuration.modificationPermission != .deny
+    }
+
+    public func autoApprovesCommand(_ request: CommandRequest, in workspace: BridgeWorkspace) -> Bool {
+        guard trusts(workspace), configuration.shellPermission != .deny else { return false }
+        guard CommandPolicy().assess(request).risk != .blocked else { return false }
+
+        // No auto approval of absolute executable paths outside the default
+        // toolchain, shell -c, flags that redirect to another directory, or
+        // arbitrary networking and destructive operations.
+        guard !request.executable.hasPrefix("/") || request.executable == "/bin/zsh" else { return false }
+        let executable = URL(fileURLWithPath: request.executable).lastPathComponent.lowercased()
+        let args = request.arguments
+        guard args.allSatisfy({ argument in
+            !argument.hasPrefix("/") &&
+            !argument.contains("../") &&
+            argument != ".." &&
+            !argument.contains("\n") &&
+            !argument.contains("\r")
+        }) else { return false }
+
+        switch executable {
+        case "swift":
+            return args.first.map { ["build", "test"].contains($0) } == true &&
+                !args.contains("--package-path") && !args.contains("--scratch-path")
+        case "xcodebuild":
+            return args.contains("build") || args.contains("test")
+        case "npm":
+            return args.first == "test" ||
+                (args.first == "run" && args.count >= 2 && ["build", "test", "package"].contains(args[1]))
+        case "mvn", "mvnw":
+            return args.contains(where: { ["test", "compile", "package", "verify"].contains($0) })
+        case "gradle", "gradlew":
+            return args.contains(where: { ["test", "build", "assemble"].contains($0) })
+        case "cargo":
+            return args.first.map { ["build", "test", "check"].contains($0) } == true
+        case "go":
+            return args.first.map { ["build", "test"].contains($0) } == true
+        case "git":
+            guard let operation = args.first else { return false }
+            if operation == "push" {
+                return configuration.gitPushPermission == .allow
+            }
+            return ["status", "diff", "log", "show", "add", "commit"].contains(operation)
+        case "python", "python3":
+            if args.count >= 2 && args[0] == "-m" {
+                return ["pytest", "compileall", "unittest"].contains(args[1])
+            }
+            return isTrustedScript(args.first, suffix: "py", workspace: workspace)
+        case "sh", "bash", "zsh":
+            // Only a checked-in relative script file, never -c or stdin.
+            return isTrustedScript(args.first, suffix: "sh", workspace: workspace)
+        default:
+            // Recognize directly invoked project-local packaging scripts as
+            // well as shells that receive a relative script path.
+            if request.executable.hasPrefix("./") {
+                return isTrustedScript(request.executable, suffix: "sh", workspace: workspace)
+            }
+            return false
+        }
+    }
+
+    private func isTrustedScript(_ path: String?, suffix ext: String, workspace: BridgeWorkspace) -> Bool {
+        guard let path, !path.hasPrefix("-"), !path.hasPrefix("/"),
+              !path.contains(".."), !path.contains("\\") else { return false }
+        guard let file = try? validator.resolve(workspace: workspace, relativePath: path),
+              file.pathExtension.lowercased() == ext,
+              (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+            return false
+        }
+        return true
     }
 }
 
@@ -293,6 +386,7 @@ public struct SecretRedactor: Sendable {
         let patterns = [
             #"(?i)(authorization\s*:\s*bearer\s+)([^\s]+)"#,
             #"(?i)((?:api[_-]?key|openai_api_key|password|token)\s*[=:]\s*)([^\s]+)"#,
+            #"(?i)((?:https?://[^\s/]+)?/mcp/)([a-f0-9]{32,}|[A-Za-z0-9_-]{40,})"#,
             #"\bsk-[A-Za-z0-9_-]{8,}\b"#
         ]
         for pattern in patterns {
@@ -306,10 +400,18 @@ public struct SecretRedactor: Sendable {
 }
 
 public actor AuditLogger {
+    private struct FileFingerprint: Equatable {
+        let size: UInt64
+        let modifiedAt: Date?
+        let fileNumber: UInt64?
+    }
+
     private let fileURL: URL
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
     private let redactor: SecretRedactor
+    private var cachedLatestFingerprint: FileFingerprint?
+    private var cachedLatestEntry: AuditEntry?
 
     public init(paths: BridgePaths, redactor: SecretRedactor = SecretRedactor()) {
         self.fileURL = paths.logsDirectory.appendingPathComponent("audit.log")
@@ -322,7 +424,6 @@ public actor AuditLogger {
     }
 
     public func record(_ entry: AuditEntry) throws {
-        BridgeLogRotator.rotateIfNeeded(fileURL)
         let sanitized = AuditEntry(
             id: entry.id,
             timestamp: entry.timestamp,
@@ -339,12 +440,15 @@ public actor AuditLogger {
         if !FileManager.default.fileExists(atPath: fileURL.path) {
             try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try data.write(to: fileURL, options: .atomic)
-            return
+        } else {
+            let handle = try FileHandle(forWritingTo: fileURL)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
         }
-        let handle = try FileHandle(forWritingTo: fileURL)
-        defer { try? handle.close() }
-        try handle.seekToEnd()
-        try handle.write(contentsOf: data)
+        // The Agent and tool router may use different AuditLogger actors.
+        // Invalidate our own snapshot after a successful append.
+        cachedLatestFingerprint = nil
     }
 
     public func entries() throws -> [AuditEntry] {
@@ -353,5 +457,55 @@ public actor AuditLogger {
         return try text.split(separator: "\n").map { line in
             try decoder.decode(AuditEntry.self, from: Data(line.utf8))
         }
+    }
+
+    /// Dashboard and Agent polling must not decode the entire rotated audit
+    /// log on every refresh. Read only a bounded suffix and ignore any partial
+    /// first line when seeking into the middle of a record.
+    public func recentEntries(limit: Int = 12) throws -> [AuditEntry] {
+        guard limit > 0, FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        let maximumBytes = 512 * 1_024
+        let offset = size > UInt64(maximumBytes) ? size - UInt64(maximumBytes) : 0
+        try handle.seek(toOffset: offset)
+        let data = try handle.read(upToCount: maximumBytes) ?? Data()
+        var lines = String(decoding: data, as: UTF8.self)
+            .split(separator: "\n", omittingEmptySubsequences: true)
+        if offset > 0 && !lines.isEmpty { lines.removeFirst() }
+        // A writer can still be appending the last JSON line. Skip incomplete
+        // records and return the requested number of *valid* recent entries.
+        var entries: [AuditEntry] = []
+        for line in lines.reversed() {
+            if let entry = try? decoder.decode(AuditEntry.self, from: Data(line.utf8)) {
+                entries.append(entry)
+                if entries.count == min(limit, 1_000) { break }
+            }
+        }
+        return Array(entries.reversed())
+    }
+
+    private func currentFingerprint() -> FileFingerprint? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+              let size = (attributes[.size] as? NSNumber)?.uint64Value else { return nil }
+        return FileFingerprint(
+            size: size,
+            modifiedAt: attributes[.modificationDate] as? Date,
+            fileNumber: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value
+        )
+    }
+
+    public func latestEntry() throws -> AuditEntry? {
+        // A cheap stat avoids rereading and decoding an unchanged audit log.
+        // Size + modification time + inode also detects most rotations and replacements.
+        let fingerprint = currentFingerprint()
+        if let fingerprint, fingerprint == cachedLatestFingerprint {
+            return cachedLatestEntry
+        }
+        let latest = try recentEntries(limit: 1).last
+        cachedLatestEntry = latest
+        cachedLatestFingerprint = fingerprint
+        return latest
     }
 }

@@ -96,16 +96,23 @@ final class ChatGPTBridgeViewModel: ObservableObject {
     }
 
     var toolCatalogRefreshRequired: Bool {
-        guard let current = runtime.toolCatalogVersion,
-              let discovered = discoveredToolCatalogVersion else {
-            return false
-        }
-        return current != discovered || runtime.toolCatalogCount != discoveredToolCount
+        guard let current = runtime.toolCatalogVersion else { return false }
+        return !BridgeHealthPolicy.catalogMatches(
+            version: current, count: runtime.toolCatalogCount
+        ) || (discoveredToolCatalogVersion.map {
+            $0 != current || discoveredToolCount != runtime.toolCatalogCount
+        } ?? false)
     }
 
     var toolCatalogWarningText: String? {
         guard let currentVersion = runtime.toolCatalogVersion,
               let currentCount = runtime.toolCatalogCount else { return nil }
+
+        guard BridgeHealthPolicy.catalogMatches(
+            version: currentVersion, count: currentCount
+        ) else {
+            return "主应用与运行中的 Agent 工具版本不一致；请重新连接以更新 Agent，然后在 ChatGPT 中刷新工具目录。"
+        }
 
         if let discoveredVersion = discoveredToolCatalogVersion {
             guard currentVersion != discoveredVersion || currentCount != discoveredToolCount else {
@@ -127,6 +134,44 @@ final class ChatGPTBridgeViewModel: ObservableObject {
         configuration.modificationPermission == .allow
             && configuration.shellPermission == .allow
             && configuration.gitPushPermission == .allow
+    }
+
+    var trustedDevelopmentEnabled: Bool {
+        configuration.allowedRoots.contains { isTrustedDevelopmentRoot($0) }
+    }
+
+    func isTrustedDevelopmentRoot(_ root: String) -> Bool {
+        let canonical = URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath().path
+        return configuration.trustedDevelopmentRoots.contains(canonical)
+            && configuration.allowedRoots.contains(canonical)
+    }
+
+    func setTrustedDevelopment(_ enabled: Bool, root: String? = nil) async {
+        var updated = configuration
+        let candidateRoots = root.map { [$0] } ?? updated.allowedRoots
+        let selected = candidateRoots.map {
+            URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath().path
+        }
+        guard selected.allSatisfy({ updated.allowedRoots.contains($0) }) else {
+            statusMessage = "只能信任已经添加到允许目录的路径。"
+            return
+        }
+        if enabled {
+            updated.trustedDevelopmentRoots = Array(Set(updated.trustedDevelopmentRoots + selected)).sorted()
+            // Replace legacy global full-access with a scope-limited mode.
+            if unrestrictedDevelopmentAccessEnabled {
+                updated.modificationPermission = .ask
+                updated.shellPermission = .safeOnly
+                updated.gitPushPermission = .ask
+            }
+        } else {
+            updated.trustedDevelopmentRoots.removeAll { selected.contains($0) }
+        }
+        guard await save(updated) else { return }
+        if updated.enabled { await startAgent() }
+        statusMessage = enabled
+            ? "已信任所选项目目录：项目文件修改和常规构建可自动执行；危险命令仍需确认。"
+            : "已取消所选目录的可信开发授权。"
     }
 
     func tunnelRuntimeKeyForCopy() -> String? {
@@ -155,10 +200,12 @@ final class ChatGPTBridgeViewModel: ObservableObject {
             endpoint = tunnel.controlPlaneBaseURL + "/mcp"
             token = key
         case .httpsCompatibility:
-            guard let url = publicHTTPSMCPURL,
+            guard let hostname = configuration.httpsCompatibility?.hostname,
                   let key = try? secretStore.string(for: .httpsCompatibilityAccessToken),
                   !key.isEmpty else { return nil }
-            endpoint = url.absoluteString
+            // Prefer Authorization header over embedding bearer tokens in
+            // the public URL. Existing configured secret-path URLs still work.
+            endpoint = "https://\(hostname)/mcp"
             token = key
         }
 
@@ -210,8 +257,8 @@ final class ChatGPTBridgeViewModel: ObservableObject {
            statusMessage?.hasSuffix("远端链路仍在连接。") == true {
             statusMessage = "\(configuration.transportMode.displayName)已连接 · 本地 MCP 127.0.0.1:\(configuration.localMCPPort)"
         }
-        if let entries = try? await AuditLogger(paths: paths).entries() {
-            recentAuditEntries = Array(entries.suffix(12).reversed())
+        if let entries = try? await AuditLogger(paths: paths).recentEntries(limit: 12) {
+            recentAuditEntries = entries.reversed()
         }
         pendingApprovalRequests = BridgeApprovalStore(paths: paths).pendingRequests()
     }
@@ -313,12 +360,14 @@ final class ChatGPTBridgeViewModel: ObservableObject {
         var updated = configuration
         let canonical = url.standardizedFileURL.resolvingSymlinksInPath().path
         updated.allowedRoots = [canonical]
+        updated.trustedDevelopmentRoots.removeAll { $0 != canonical }
         await save(updated)
     }
 
     func removeAllowedRoot(_ path: String) async {
         var updated = configuration
         updated.allowedRoots.removeAll { $0 == path }
+        updated.trustedDevelopmentRoots.removeAll { $0 == path }
         await save(updated)
     }
 

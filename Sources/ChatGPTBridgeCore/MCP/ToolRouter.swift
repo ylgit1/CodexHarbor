@@ -4,12 +4,14 @@ public actor ToolRouter {
     private let workspaceManager: WorkspaceManager
     private let openWorkspaceTool: OpenWorkspaceTool
     private let readTool: ReadFileTool
+    private let tailTool: WorkspaceTailTool
     private let searchTool: SearchTool
     private let editTool: EditFileTool
     private let patchTool: PatchFileTool
     private let gitService: GitService
     private let workspaceInspectionTool: WorkspaceInspectionTool
     private let writeTool: WriteFileTool
+    private let fileOperations: WorkspaceFileOperations
     private let commandService: CommandService
     private let commandSessionManager: CommandSessionManager
     private let repairAgent: RepairAgent
@@ -17,6 +19,7 @@ public actor ToolRouter {
     private let workflowSessionManager: WorkflowSessionManager
     private let codingTaskManager: CodingTaskManager
     private let permissionEngine: PermissionEngine
+    private let trustedDevelopment: TrustedDevelopmentPolicy
     private let auditLogger: AuditLogger
     private let approvalStore: BridgeApprovalStore?
     private let workspaceSessionStore: WorkspaceSessionStore
@@ -26,7 +29,8 @@ public actor ToolRouter {
         configuration: BridgeConfiguration,
         auditLogger: AuditLogger,
         approvalStore: BridgeApprovalStore? = nil,
-        workspaceSessionStore: WorkspaceSessionStore = WorkspaceSessionStore()
+        workspaceSessionStore: WorkspaceSessionStore = WorkspaceSessionStore(),
+        trashRoot: URL? = nil
     ) {
         self.workspaceManager = workspaceManager
         self.auditLogger = auditLogger
@@ -34,8 +38,10 @@ public actor ToolRouter {
         self.workspaceSessionStore = workspaceSessionStore
         let permissions = PermissionEngine(configuration: configuration)
         self.permissionEngine = permissions
+        self.trustedDevelopment = TrustedDevelopmentPolicy(configuration: configuration)
         self.openWorkspaceTool = OpenWorkspaceTool(workspaceManager: workspaceManager)
         self.readTool = ReadFileTool(workspaceManager: workspaceManager)
+        self.tailTool = WorkspaceTailTool(workspaceManager: workspaceManager)
         self.searchTool = SearchTool(workspaceManager: workspaceManager)
         self.editTool = EditFileTool(
             workspaceManager: workspaceManager,
@@ -55,6 +61,13 @@ public actor ToolRouter {
             workspaceManager: workspaceManager,
             permissionEngine: permissions,
             auditLogger: auditLogger
+        )
+        self.fileOperations = WorkspaceFileOperations(
+            workspaceManager: workspaceManager,
+            permissionEngine: permissions,
+            auditLogger: auditLogger,
+            trashRoot: trashRoot ?? ((try? BridgePaths.live().root.appendingPathComponent("workspace-trash", isDirectory: true))
+                ?? FileManager.default.temporaryDirectory.appendingPathComponent("harbor-workspace-trash", isDirectory: true))
         )
         let shellTool = ShellTool(
             workspaceManager: workspaceManager,
@@ -139,6 +152,15 @@ public actor ToolRouter {
                 )
                 return try JSONValue.encoded(result)
 
+            case "tail_file":
+                let workspaceID = try await resolveWorkspaceID(in: arguments, sessionID: context.sessionID)
+                let result = try await tailTool.execute(
+                    workspaceID: workspaceID,
+                    path: try requiredString("path", in: arguments),
+                    limitBytes: try optionalInt("limitBytes", in: arguments) ?? 64 * 1_024
+                )
+                return try JSONValue.encoded(result)
+
             case "search":
                 let workspaceID = try await resolveWorkspaceID(in: arguments, sessionID: context.sessionID)
                 let query = try requiredString("query", in: arguments)
@@ -205,7 +227,7 @@ public actor ToolRouter {
                     workspaceID: targetWorkspace,
                     target: path,
                     details: [try requiredString("oldText", in: arguments), try requiredString("newText", in: arguments)],
-                    fallback: context.approvalGranted
+                    fallback: await automaticApproval(workspaceID: targetWorkspace, context: context, modifyingFiles: true)
                 )
                 let result = try await editTool.execute(
                     workspaceID: targetWorkspace,
@@ -225,7 +247,7 @@ public actor ToolRouter {
                     workspaceID: targetWorkspace,
                     target: path,
                     details: patchApprovalDetails(arguments),
-                    fallback: context.approvalGranted
+                    fallback: await automaticApproval(workspaceID: targetWorkspace, context: context, modifyingFiles: true)
                 )
                 let result = try await patchTool.execute(
                     workspaceID: targetWorkspace,
@@ -279,7 +301,7 @@ public actor ToolRouter {
                     workspaceID: targetWorkspace,
                     target: path,
                     details: [overwrite ? "overwrite" : "create", try requiredString("content", in: arguments)],
-                    fallback: context.approvalGranted
+                    fallback: await automaticApproval(workspaceID: targetWorkspace, context: context, modifyingFiles: true)
                 )
                 let result = try await writeTool.execute(
                     workspaceID: targetWorkspace,
@@ -289,6 +311,59 @@ public actor ToolRouter {
                     approvalGranted: approvalGranted
                 )
                 return try JSONValue.encoded(result)
+
+            case "restore_path":
+                let workspaceID = try await resolveWorkspaceID(in: arguments, sessionID: context.sessionID)
+                let id = try requiredUUID("trashId", in: arguments)
+                let approved = try approvalState(
+                    tool: name, workspaceID: workspaceID, target: id.uuidString,
+                    details: approvalDetails(name: name, arguments: arguments),
+                    fallback: await automaticApproval(workspaceID: workspaceID, context: context, modifyingFiles: true)
+                )
+                return try JSONValue.encoded(try await fileOperations.restore(
+                    workspaceID: workspaceID, trashID: id, approvalGranted: approved
+                ))
+
+            case "list_trash":
+                let workspaceID = try await resolveWorkspaceID(in: arguments, sessionID: context.sessionID)
+                return try JSONValue.encoded(await fileOperations.listTrash(workspaceID: workspaceID))
+
+            case "trash_path":
+                let workspaceID = try await resolveWorkspaceID(in: arguments, sessionID: context.sessionID)
+                let path = try requiredString("path", in: arguments)
+                let approved = try approvalState(
+                    tool: name, workspaceID: workspaceID, target: path,
+                    details: approvalDetails(name: name, arguments: arguments),
+                    fallback: await automaticApproval(workspaceID: workspaceID, context: context, modifyingFiles: true)
+                )
+                return try JSONValue.encoded(try await fileOperations.trash(
+                    workspaceID: workspaceID, path: path, approvalGranted: approved
+                ))
+
+            case "move_path":
+                let workspaceID = try await resolveWorkspaceID(in: arguments, sessionID: context.sessionID)
+                let path = try requiredString("path", in: arguments)
+                let destination = try requiredString("destination", in: arguments)
+                let approved = try approvalState(
+                    tool: name, workspaceID: workspaceID, target: path,
+                    details: approvalDetails(name: name, arguments: arguments),
+                    fallback: await automaticApproval(workspaceID: workspaceID, context: context, modifyingFiles: true)
+                )
+                return try JSONValue.encoded(try await fileOperations.move(
+                    workspaceID: workspaceID, source: path, destination: destination, approvalGranted: approved
+                ))
+
+            case "create_directory":
+                let workspaceID = try await resolveWorkspaceID(in: arguments, sessionID: context.sessionID)
+                let path = try requiredString("path", in: arguments)
+                let approved = try approvalState(
+                    tool: name, workspaceID: workspaceID, target: path,
+                    details: approvalDetails(name: name, arguments: arguments),
+                    fallback: await automaticApproval(workspaceID: workspaceID, context: context, modifyingFiles: true)
+                )
+                return try JSONValue.encoded(try await fileOperations.createDirectory(
+                    workspaceID: workspaceID, path: path, approvalGranted: approved
+                ))
 
             case "bash", "run_command":
                 let targetWorkspace = try await resolveWorkspaceID(in: arguments, sessionID: context.sessionID)
@@ -306,7 +381,11 @@ public actor ToolRouter {
                     workspaceID: targetWorkspace,
                     target: workingDirectory,
                     details: [executable] + commandArguments,
-                    fallback: context.approvalGranted
+                    fallback: await automaticApproval(
+                        workspaceID: targetWorkspace, context: context,
+                        command: CommandRequest(executable: executable, arguments: commandArguments,
+                                                workingDirectory: workingDirectory)
+                    )
                 )
                 let result = try await commandService.run(
                     workspaceID: targetWorkspace,
@@ -335,7 +414,11 @@ public actor ToolRouter {
                     workspaceID: targetWorkspace,
                     target: workingDirectory,
                     details: [executable] + commandArguments,
-                    fallback: context.approvalGranted
+                    fallback: await automaticApproval(
+                        workspaceID: targetWorkspace, context: context,
+                        command: CommandRequest(executable: executable, arguments: commandArguments,
+                                                workingDirectory: workingDirectory)
+                    )
                 )
                 let result = try await commandSessionManager.start(
                     workspaceID: targetWorkspace,
@@ -383,7 +466,12 @@ public actor ToolRouter {
                         includeTests ? "tests" : "no-tests",
                         includeBuild ? "build" : "no-build"
                     ],
-                    fallback: context.approvalGranted
+                    fallback: await automaticApproval(
+                        workspaceID: targetWorkspace, context: context,
+                        workflowCommands: try await workflowAgent.plan(
+                            workspaceID: targetWorkspace, includeTests: includeTests, includeBuild: includeBuild
+                        ).commands
+                    )
                 )
                 let result = try await workflowSessionManager.start(
                     workspaceID: targetWorkspace,
@@ -429,7 +517,12 @@ public actor ToolRouter {
                         includeTests ? "tests" : "no-tests",
                         includeBuild ? "build" : "no-build"
                     ],
-                    fallback: context.approvalGranted
+                    fallback: await automaticApproval(
+                        workspaceID: targetWorkspace, context: context,
+                        workflowCommands: try await workflowAgent.plan(
+                            workspaceID: targetWorkspace, includeTests: includeTests, includeBuild: includeBuild
+                        ).commands
+                    )
                 )
                 let result = try await workflowAgent.run(
                     workspaceID: targetWorkspace,
@@ -457,7 +550,7 @@ public actor ToolRouter {
                     workspaceID: targetWorkspace,
                     target: patchPath ?? ".",
                     details: [patchPath ?? "", unifiedDiff ?? ""],
-                    fallback: context.approvalGranted
+                    fallback: await automaticApproval(workspaceID: targetWorkspace, context: context, modifyingFiles: true)
                 )
                 let result = try await repairAgent.repair(
                     workspaceID: targetWorkspace,
@@ -475,6 +568,19 @@ public actor ToolRouter {
                     summary: result.state.rawValue
                 )
                 return try JSONValue.encoded(result)
+
+            case "list_tasks":
+                // A different ChatGPT session can discover existing task IDs
+                // without guessing the last workspace or inheriting its binding.
+                let workspaceID = try optionalUUID("workspaceId", in: arguments)
+                if let workspaceID {
+                    _ = try await workspaceManager.workspace(id: workspaceID)
+                }
+                return .object([
+                    "codingTasks": try JSONValue.encoded(await codingTaskManager.list(workspaceID: workspaceID)),
+                    "commands": try JSONValue.encoded(await commandSessionManager.list(workspaceID: workspaceID)),
+                    "workflows": try JSONValue.encoded(await workflowSessionManager.list(workspaceID: workspaceID))
+                ])
 
             case "coding_task":
                 let action = optionalString("action", in: arguments) ?? "start"
@@ -507,8 +613,11 @@ public actor ToolRouter {
                         tool: name,
                         workspaceID: targetWorkspace,
                         target: ".",
-                        details: [requirement] + changes.map(\.path),
-                        fallback: context.approvalGranted
+                        details: approvalDetails(name: name, arguments: arguments),
+                        fallback: await automaticApproval(
+                            workspaceID: targetWorkspace, context: context,
+                            modifyingFiles: true, workflowCommands: commands
+                        )
                     )
                     try authorizeCodingTask(
                         changes: changes,
@@ -558,8 +667,12 @@ public actor ToolRouter {
                         tool: name,
                         workspaceID: taskStatus.workspaceID,
                         target: ".",
-                        details: ["repair", taskID.uuidString] + changes.map(\.path),
-                        fallback: context.approvalGranted
+                        details: approvalDetails(name: name, arguments: arguments),
+                        fallback: await automaticApproval(
+                            workspaceID: taskStatus.workspaceID, context: context,
+                            modifyingFiles: true,
+                            workflowCommands: try await codingTaskManager.commands(taskID: taskID)
+                        )
                     )
                     try authorizeCodingTask(
                         changes: changes,
@@ -584,7 +697,7 @@ public actor ToolRouter {
 
                 default:
                     throw ToolRouterError.invalidArguments(
-                        "coding_task action 仅支持 start/status/output/repair/cancel"
+                        "coding_task action 仅支持 start/list/status/output/repair/cancel"
                     )
                 }
 
@@ -598,7 +711,7 @@ public actor ToolRouter {
                     in: arguments,
                     sessionID: context.sessionID
                 )
-                let target = arguments["path"]?.stringValue ?? arguments["workingDirectory"]?.stringValue
+                let target = approvalTarget(name: name, arguments: arguments)
                 let details = approvalDetails(name: name, arguments: arguments)
                 let requestID = BridgeApprovalStore.requestID(
                     tool: name,
@@ -718,16 +831,8 @@ public actor ToolRouter {
             }
         }
 
-        for candidate in await workspaceManager.list() {
-            do {
-                let workspace = try await workspaceManager.workspace(id: candidate.id)
-                await workspaceSessionStore.bind(sessionID: sessionID, workspace: workspace)
-                return workspace.id
-            } catch {
-                await workspaceSessionStore.invalidate(workspaceID: candidate.id)
-            }
-        }
-
+        // An unrelated workspace must never be selected automatically.
+        // If this session has no surviving binding, ask the client to open it.
         return nil
     }
 
@@ -755,6 +860,14 @@ public actor ToolRouter {
 
     private func optionalString(_ key: String, in arguments: [String: JSONValue]) -> String? {
         arguments[key]?.stringValue
+    }
+
+    private func optionalUUID(_ key: String, in arguments: [String: JSONValue]) throws -> UUID? {
+        guard let raw = arguments[key]?.stringValue else { return nil }
+        guard let value = UUID(uuidString: raw) else {
+            throw ToolRouterError.invalidArguments("参数 \(key) 必须是有效 UUID")
+        }
+        return value
     }
 
     private func requiredUUID(_ key: String, in arguments: [String: JSONValue]) throws -> UUID {
@@ -852,8 +965,56 @@ public actor ToolRouter {
         }
     }
 
+    private func automaticApproval(
+        workspaceID: UUID,
+        context: ToolExecutionContext,
+        modifyingFiles: Bool = false,
+        command: CommandRequest? = nil,
+        workflowCommands: [ProjectWorkflowCommand]? = nil
+    ) async -> Bool {
+        if context.approvalGranted { return true }
+        guard let workspace = try? await workspaceManager.workspace(id: workspaceID) else { return false }
+        if modifyingFiles && !trustedDevelopment.autoApprovesModification(in: workspace) {
+            return false
+        }
+        if let command, !trustedDevelopment.autoApprovesCommand(command, in: workspace) {
+            return false
+        }
+        if let workflowCommands {
+            for step in workflowCommands {
+                guard trustedDevelopment.autoApprovesCommand(CommandRequest(
+                    executable: step.executable,
+                    arguments: step.arguments,
+                    workingDirectory: step.workingDirectory
+                ), in: workspace) else {
+                    return false
+                }
+            }
+        }
+        return modifyingFiles || command != nil || workflowCommands != nil
+    }
+
+    private func approvalTarget(name: String, arguments: [String: JSONValue]) -> String? {
+        switch name {
+        case "bash", "run_command", "start_command":
+            return arguments["workingDirectory"]?.stringValue ?? "."
+        case "create_directory", "move_path", "trash_path":
+            return arguments["path"]?.stringValue
+        case "restore_path":
+            return arguments["trashId"]?.stringValue
+        case "start_workflow", "run_workflow", "coding_task":
+            return "."
+        case "repair_project":
+            return arguments["path"]?.stringValue ?? "."
+        default:
+            return arguments["path"]?.stringValue
+        }
+    }
+
     private func approvalDetails(name: String, arguments: [String: JSONValue]) -> [String] {
         switch name {
+        case "create_directory", "move_path", "trash_path", "restore_path":
+            return [arguments["path"]?.stringValue ?? "", arguments["destination"]?.stringValue ?? "", arguments["trashId"]?.stringValue ?? ""]
         case "edit":
             return [
                 arguments["oldText"]?.stringValue ?? "",
@@ -878,12 +1039,15 @@ public actor ToolRouter {
         case "repair_project":
             return [arguments["path"]?.stringValue ?? "", arguments["patch"]?.stringValue ?? ""]
         case "coding_task":
-            let action = arguments["action"]?.stringValue ?? "start"
-            let requirement = arguments["requirement"]?.stringValue ?? ""
-            let paths = (arguments["changes"]?.arrayValue ?? []).compactMap {
-                $0.objectValue?["path"]?.stringValue
+            // The approval must be tied to the exact patch, task ID, flags,
+            // and every argument -- never only the list of file paths.
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            guard let data = try? encoder.encode(arguments),
+                  let canonical = String(data: data, encoding: .utf8) else {
+                return ["invalid-request"]
             }
-            return [action, requirement] + paths
+            return [canonical]
         default:
             return []
         }

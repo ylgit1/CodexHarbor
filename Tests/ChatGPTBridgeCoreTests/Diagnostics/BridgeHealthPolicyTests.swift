@@ -4,6 +4,22 @@ import Testing
 
 @Suite("Bridge health policy")
 struct BridgeHealthPolicyTests {
+    @Test("App and Agent tool catalogs must match exactly")
+    func detectsStaleAgentCatalog() {
+        #expect(BridgeHealthPolicy.catalogMatches(
+            version: MCPToolCatalogMetadata.version, count: MCPToolCatalogMetadata.toolCount
+        ))
+        #expect(!BridgeHealthPolicy.catalogMatches(version: nil, count: nil))
+        #expect(!BridgeHealthPolicy.catalogMatches(
+            version: "obsolete", count: MCPToolCatalogMetadata.toolCount
+        ))
+        #expect(!BridgeHealthPolicy.catalogMatches(
+            version: MCPToolCatalogMetadata.version, count: MCPToolCatalogMetadata.toolCount - 1
+        ))
+        #expect(BridgeHealthPolicy.agentMonitorInterval >= 5)
+        #expect(BridgeHealthPolicy.auditRefreshInterval > BridgeHealthPolicy.agentMonitorInterval)
+    }
+
     @Test("Healthy checks use five minutes and recovery checks use ten seconds")
     func adaptiveHealthIntervals() {
         let healthy = BridgePipelineDiagnostics(nodes: [

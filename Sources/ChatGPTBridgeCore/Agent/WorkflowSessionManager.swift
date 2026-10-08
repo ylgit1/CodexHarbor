@@ -193,6 +193,13 @@ public actor WorkflowSessionManager {
         )
     }
 
+    public func list(workspaceID: UUID? = nil) -> [WorkflowSessionStatus] {
+        pruneExpiredSessions()
+        return sessions.values.filter { workspaceID == nil || $0.workspaceID == workspaceID }
+            .sorted { $0.startedAt > $1.startedAt }
+            .map { statusValue(for: $0) }
+    }
+
     public func status(workflowID: UUID) async throws -> WorkflowSessionStatus {
         guard let session = sessions[workflowID] else {
             throw BridgeError.workflowSessionNotFound(workflowID)
@@ -267,17 +274,23 @@ public actor WorkflowSessionManager {
 
         session.state = .cancelled
         session.message = "Workflow cancelled"
+        session.finishedAt = Date()
+
         if let index = session.currentStepIndex,
-           session.commandIDs.indices.contains(index),
-           let commandID = session.commandIDs[index] {
-            _ = try? await commandSessionManager.cancel(commandID: commandID)
+           session.commandIDs.indices.contains(index) {
+            // The workflow may be awaiting commandSessionManager.start and
+            // have a running step without a command ID yet. Mark cancellation
+            // before yielding so status never reports a cancelled workflow
+            // with a still-running step.
             session.stepStates[index] = .cancelled
-            if let commandStatus = try? await commandSessionManager.status(commandID: commandID) {
-                session.exitCodes[index] = commandStatus.exitCode
-                session.errors[index] = commandStatus.errors
+            if let commandID = session.commandIDs[index] {
+                _ = try? await commandSessionManager.cancel(commandID: commandID)
+                if let commandStatus = try? await commandSessionManager.status(commandID: commandID) {
+                    session.exitCodes[index] = commandStatus.exitCode
+                    session.errors[index] = commandStatus.errors
+                }
             }
         }
-        session.finishedAt = Date()
         await recordAuditIfNeeded(session)
         return statusValue(for: session)
     }
@@ -308,6 +321,12 @@ public actor WorkflowSessionManager {
                     auditTool: "start_workflow"
                 )
                 session.commandIDs[index] = started.commandID
+                // Cancellation may have arrived while command startup was
+                // suspended. Stop the late-starting process immediately.
+                guard session.state == .running else {
+                    _ = try? await commandSessionManager.cancel(commandID: started.commandID)
+                    return
+                }
 
                 let terminal = try await waitForCommand(
                     commandID: started.commandID,

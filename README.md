@@ -87,17 +87,23 @@ flowchart LR
 
 ### 本地 MCP 开发工具
 
-当前版本内置 **23 个 MCP 工具**（实际数量以运行时 `tools/list` 为准），覆盖项目浏览、文件修改、Git、命令、工作流和 Coding Task。
+当前版本内置 **30 个 MCP 工具**（实际数量以运行时 `tools/list` 为准），覆盖项目浏览、文件修改、Git、命令、工作流和 Coding Task。
 
 | 类别 | 工具 |
 | --- | --- |
-| 工作区 | `open_workspace`, `read`, `search`, `list_directory`, `workspace_tree` |
-| 文件与 Git | `edit`, `patch_file`, `write`, `git_diff`, `git_status` |
+| 工作区 | `open_workspace`, `read`, `tail_file`, `search`, `list_directory`, `workspace_tree` |
+| 文件与 Git | `edit`, `patch_file`, `write`, `create_directory`, `move_path`, `trash_path`, `restore_path`, `list_trash`, `git_diff`, `git_status` |
 | 命令 | `run_command`, `bash`, `start_command`, `command_status`, `command_output`, `cancel_command` |
 | 工作流 | `start_workflow`, `workflow_status`, `workflow_output`, `cancel_workflow`, `run_workflow`, `repair_project` |
-| 高阶任务 | `coding_task` |
+| 高阶任务 | `coding_task`, `list_tasks` |
 
 MCP Catalog 会根据工具定义自动生成版本号。服务端 `/health` 会同时返回协议版本、Catalog 版本、工具数量、Host 和 Port，便于检查 ChatGPT 是否仍缓存旧工具目录。
+
+**项目重构与恢复：**可信 Workspace 内可使用 `create_directory` 建目录、`move_path` 移动文件/目录、`trash_path` 将废弃路径移入独立的可恢复储存区，再凭 `trashId` 使用 `restore_path` 恢复。恢复不会覆盖原位置现有文件。操作拒绝 Workspace 根目录、Git 元数据、越界和符号链接路径；仍需在代码变更后运行测试并检查 Git Diff。直接 `rm -rf` 依然被拦截。
+
+**长命令与日志：**命令最长允许 30 分钟，最多可写入 256 MiB 的 stdout/stderr 日志；大输出按偏移调用 `command_output` 分页读取，单次最多 256 KiB。大型项目日志可用 `tail_file` 查看最后 256 KiB，不需要读取整个日志文件。超过 256 MiB 仍可能终止命令，以避免无限磁盘写入。
+
+**多聊天使用：**`list_tasks` 返回同一 Agent 中最近的命令、工作流和 Coding Task（支持按 Workspace 过滤）。不同 Workspace 可同时执行 Coding Task；同一个 Workspace 仍限制并发修改。任务发现依赖运行中的 Agent，任务内存记录及正在运行的子进程**不能在 Agent 重启后自动恢复**，并发命令仍存在全局上限。
 
 ### Coding Task
 
@@ -172,6 +178,14 @@ Telemetry 使用增量游标和文件变化监听，避免持续全量扫描大�
 
 ChatGPT 接入侧当前记录的是 **MCP 工具调用审计、状态与诊断信息**。它不等同于整个 ChatGPT 账号的消息数、Token 使用量或订阅额度。
 
+### 常驻运行与更新一致性
+
+- Agent 的轻量进程巡检以 5 秒为间隔，审计活动每 15 秒最多检查一次；审计只读取最多 512 KiB 的日志尾部，不在轮询中重复解析整份日志。
+- 健康检查中的远端深度检测仍由恢复状态动态调度：正常时约 5 分钟，连接恢复期间约 10 秒。没有新状态变化时，Agent 不重复写相同的 `runtime.json`。
+- App 会同时核对 MCP `/health` 返回的工具目录版本和工具数量；旧 Agent 仅返回 HTTP 200 不再被判为健康。启动、恢复时由现有生命周期管理器完成版本失配处理。
+- 首页 ChatGPT 接入状态区分“已连接”“恢复中”“工具待刷新”；配置启用不代表链路健康。更新 Agent 后，ChatGPT 端仍可能需要重新发现 MCP 工具。
+- 上述措施旨在减少空闲时的无意义文件读取与写盘；CPU、内存改善程度需在实际空闲和断网场景下测量，不能仅凭代码改动推断具体百分比。
+
 ## 安全模型
 
 Codex Harbor 对本地开发能力默认采用“限定范围 + 显式权限 + 可审计”的方式。
@@ -192,6 +206,16 @@ Codex Harbor 对本地开发能力默认采用“限定范围 + 显式权限 + �
 - Git Push：`allow / ask / deny`
 
 高风险命令会被额外分类。即使处于宽松模式，明确禁止的提权、递归强制删除、下载后直接执行等操作仍会被拦截。
+
+### 可信项目开发（按目录授权）
+
+为了减少连续开发中的重复授权，可以在「设置」开启可信项目开发，也可以在 ChatGPT 接入的「允许访问的目录」旁单独点击「信任」。新安装及旧配置均默认不启用该权限。
+
+- 仅当 Workspace 属于受信任且仍处于 Allowed Roots 中的目录时，文件修改工具可免重复审批；移除目录将撤销信任。
+- 已信任项目内的 Swift 测试/构建、Node/Python/Maven/Gradle 工作流、相对路径 Shell 脚本、Git Add/Commit 等可免重复审批；Coding Task 的修改和验证也适用。
+- Git Push 仍由独立权限决定，默认需要确认；提权、破坏性命令和任意 Shell -c 不属于自动审批范围。
+- 注意：可信项目脚本以当前 macOS 用户身份执行，Allowed Roots **不是**操作系统级 Shell 沙箱。不要信任来源不明的仓库、脚本或依赖。
+- 同时运行命令与日志输出仍受资源限额约束。旧版「完全授权」作为单独的高风险选项保留，不建议日常开启。
 
 ### 本地凭据
 

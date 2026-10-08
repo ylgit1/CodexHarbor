@@ -207,6 +207,13 @@ public actor CodingTaskManager {
         approvalGranted: Bool = false
     ) async throws -> CodingTaskResponse {
         pruneExpiredSessions()
+        // Running tasks are serialized per project, not across unrelated
+        // workspaces. Paused needsRepair tasks must not monopolize the Agent.
+        guard !sessions.values.contains(where: {
+            $0.workspaceID == workspaceID && [.planned, .running].contains($0.state)
+        }) else {
+            throw BridgeError.writeFailed("当前 Workspace 已有活动 Coding Task，请在完成后重试")
+        }
 
         let trimmedRequirement = requirement.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedRequirement.isEmpty else {
@@ -276,6 +283,12 @@ public actor CodingTaskManager {
         guard session.state == .needsRepair else {
             throw ToolRouterError.invalidArguments("Coding Task 当前不是 needsRepair 状态")
         }
+        guard !sessions.values.contains(where: {
+            $0.id != taskID && $0.workspaceID == session.workspaceID &&
+                [.planned, .running].contains($0.state)
+        }) else {
+            throw BridgeError.writeFailed("当前项目有另一任务运行，完成后才能修复旧任务")
+        }
         guard session.repairAttempt < session.maximumRepairAttempts else {
             finish(session, state: .failed, message: "Maximum repair attempts reached")
             await recordAuditIfNeeded(session)
@@ -315,6 +328,16 @@ public actor CodingTaskManager {
             await self?.run(taskID: taskID)
         }
         return response(for: session)
+    }
+
+    /// Cross-chat task discovery: a new MCP session can recover task IDs and
+    /// inspect the latest state without inheriting another session's workspace.
+    public func list(workspaceID: UUID? = nil) -> [CodingTaskResponse] {
+        pruneExpiredSessions()
+        return sessions.values
+            .filter { workspaceID == nil || $0.workspaceID == workspaceID }
+            .sorted { $0.startedAt > $1.startedAt }
+            .map { response(for: $0) }
     }
 
     public func status(taskID: UUID) async throws -> CodingTaskResponse {

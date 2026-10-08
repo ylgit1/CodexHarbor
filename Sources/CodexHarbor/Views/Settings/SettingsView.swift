@@ -23,8 +23,17 @@ struct HarborSettingsView: View {
                         )
                         Divider().opacity(0.4).padding(.horizontal, 16)
                         toggleRow(
-                            "开发模式（完全开放）",
-                            subtitle: "开启后文件修改、Shell 与 Git Push 直接执行；关闭后恢复高风险操作确认。",
+                            "可信项目开发",
+                            subtitle: "对已信任目录自动执行文件修改、构建和本地项目脚本。项目脚本以当前用户权限运行，可能执行任意操作；只信任自己确认过的源码。",
+                            isOn: Binding(
+                                get: { bridge.trustedDevelopmentEnabled },
+                                set: { value in Task { await bridge.setTrustedDevelopment(value) } }
+                            )
+                        )
+                        Divider().opacity(0.4).padding(.horizontal, 16)
+                        toggleRow(
+                            "完全授权（高风险）",
+                            subtitle: "旧版兼容：直接放开 Shell、文件修改和 Git Push，仅适合明确需要的场景，不建议日常启用。",
                             isOn: Binding(
                                 get: { bridge.unrestrictedDevelopmentAccessEnabled },
                                 set: { value in Task { await bridge.setUnrestrictedDevelopmentAccess(value) } }

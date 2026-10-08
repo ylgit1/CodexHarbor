@@ -36,6 +36,9 @@ private actor AgentLifecycle {
     private var endpointState: BridgeNodeState = .waiting
     private var pipelineDiagnostics = BridgePipelineDiagnostics()
     private var monitorTask: Task<Void, Never>?
+    private var lastAuditRefreshAt: Date?
+    private var lastWrittenRuntimeState: BridgeRuntimeState?
+    private let auditLogger: AuditLogger
     private var tunnelRetryAttempt = 0
     private var tunnelSelfHealAttempt = 0
     private var nextTunnelRetryAt: Date?
@@ -60,6 +63,7 @@ private actor AgentLifecycle {
         compatibilityAccessToken: String
     ) {
         self.paths = paths
+        self.auditLogger = AuditLogger(paths: paths)
         self.configuration = configuration
         self.httpServer = httpServer
         self.mcpPort = mcpPort
@@ -97,7 +101,7 @@ private actor AgentLifecycle {
         }
         monitorTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(2))
+                try? await Task.sleep(for: .seconds(BridgeHealthPolicy.agentMonitorInterval))
                 guard !Task.isCancelled else { return }
                 await self?.performScheduledHealthCheck()
                 await self?.refreshIntegrationRuntimeState()
@@ -460,18 +464,19 @@ private actor AgentLifecycle {
     }
 
     private func refreshIntegrationRuntimeState() async {
-        let entries = (try? await AuditLogger(paths: paths).entries()) ?? []
-        if let latest = entries.max(by: { $0.timestamp < $1.timestamp }), latest.timestamp >= startedAt {
+        let now = Date()
+        guard lastAuditRefreshAt.map({ now.timeIntervalSince($0) >= BridgeHealthPolicy.auditRefreshInterval }) ?? true else {
+            return
+        }
+        lastAuditRefreshAt = now
+        if let latest = try? await auditLogger.latestEntry(), latest.timestamp >= startedAt {
             lastToolCallAt = latest.timestamp
             lastToolCallName = latest.tool
             lastToolCallSucceeded = latest.status == .success
             lastToolCallMessage = latest.summary
-        } else {
-            lastToolCallAt = nil
-            lastToolCallName = nil
-            lastToolCallSucceeded = nil
-            lastToolCallMessage = nil
         }
+        // Retain the last in-memory activity when the log is rotating or a
+        // concurrent writer has not completed its newest JSON line yet.
         writeRuntimeState(agent: .running, mcp: .ready)
     }
 
@@ -524,7 +529,7 @@ private actor AgentLifecycle {
         mcp: MCPRuntimeState,
         health: BridgeHealthSnapshot
     ) -> BridgePipelineDiagnostics {
-        let checkedAt = transportHealthCheckedAt ?? Date()
+        let checkedAt = transportHealthCheckedAt ?? startedAt
         let transportTitle = configuration.transportMode == .secureTunnel
             ? "Tunnel Client"
             : "cloudflared"
@@ -662,11 +667,16 @@ private actor AgentLifecycle {
             health: health,
             pipelineDiagnostics: pipelineDiagnostics
         )
+        // Compare the typed snapshot before serializing. A monitor wake-up
+        // with no state change must not allocate JSON or rewrite runtime.json.
+        guard state != lastWrittenRuntimeState else { return }
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             encoder.dateEncodingStrategy = .iso8601
-            try encoder.encode(state).write(to: paths.runtimeURL, options: .atomic)
+            let data = try encoder.encode(state)
+            try data.write(to: paths.runtimeURL, options: .atomic)
+            lastWrittenRuntimeState = state
         } catch {
             FileHandle.standardError.write(Data("runtime state write failed: \(error.localizedDescription)\n".utf8))
         }

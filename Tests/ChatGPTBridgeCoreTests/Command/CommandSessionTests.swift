@@ -76,6 +76,62 @@ struct CommandSessionTests {
         #expect(terminal.state == .timedOut)
     }
 
+    @Test("command sessions reject a fourth simultaneous process")
+    func concurrencyLimit() async throws {
+        let fixture = try await CommandSessionFixture()
+        defer { fixture.cleanup() }
+        var started: [UUID] = []
+        defer {
+            // Commands time out independently if the test is interrupted.
+        }
+        for _ in 0..<CommandSessionManager.maximumConcurrentCommands {
+            let command = try await fixture.manager.start(
+                workspaceID: fixture.workspaceID,
+                executable: "sleep",
+                arguments: ["5"],
+                timeoutSeconds: 10,
+                approvalGranted: true
+            )
+            started.append(command.commandID)
+        }
+        await #expect(throws: BridgeError.self) {
+            _ = try await fixture.manager.start(
+                workspaceID: fixture.workspaceID,
+                executable: "sleep",
+                arguments: ["5"],
+                timeoutSeconds: 10,
+                approvalGranted: true
+            )
+        }
+        for id in started {
+            _ = try await fixture.manager.cancel(commandID: id)
+        }
+    }
+
+    @Test("command sessions bound output and stop noisy processes")
+    func outputLimit() async throws {
+        let fixture = try await CommandSessionFixture()
+        defer { fixture.cleanup() }
+        let started = try await fixture.manager.start(
+            workspaceID: fixture.workspaceID,
+            executable: "python3",
+            arguments: ["-c", "import sys; sys.stdout.write('x' * 9000000)"],
+            timeoutSeconds: 10,
+            approvalGranted: true
+        )
+        let terminal = try await waitForTerminal(
+            manager: fixture.manager,
+            commandID: started.commandID,
+            attempts: 80
+        )
+        #expect(terminal.state == .completed)
+        let output = try await fixture.manager.output(
+            commandID: started.commandID,
+            limitBytes: 1024
+        )
+        #expect(output.stdout.utf8.count <= 1024)
+    }
+
     private func waitForTerminal(
         manager: CommandSessionManager,
         commandID: UUID,

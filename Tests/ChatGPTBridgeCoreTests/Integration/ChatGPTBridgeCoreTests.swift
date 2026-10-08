@@ -380,12 +380,19 @@ struct ChatGPTBridgeCoreTests {
         )
         #expect(sameSessionRead.objectValue?["content"]?.stringValue?.contains("restoredSession") == true)
 
-        let newSessionRead = try await restartedRouter.execute(
-            name: "read",
-            arguments: ["path": .string("Session.swift")],
+        await #expect(throws: ToolRouterError.self) {
+            _ = try await restartedRouter.execute(
+                name: "read",
+                arguments: ["path": .string("Session.swift")],
+                context: ToolExecutionContext(sessionID: "session-B")
+            )
+        }
+
+        _ = try await restartedRouter.execute(
+            name: "open_workspace",
+            arguments: ["path": .string(project.path)],
             context: ToolExecutionContext(sessionID: "session-B")
         )
-        #expect(newSessionRead.objectValue?["content"]?.stringValue?.contains("restoredSession") == true)
 
         let invalidHandleRead = try await restartedRouter.execute(
             name: "read",
@@ -618,12 +625,101 @@ struct ChatGPTBridgeCoreTests {
         }
     }
 
+    @Test("MCP endpoint credentials are redacted from text and diagnostics")
+    func publicMCPURLRedaction() {
+        let secret = String(repeating: "f", count: 64)
+        let message = "Connection failed: https://example.com/mcp/\(secret)"
+        let redacted = SecretRedactor().redact(message)
+        #expect(!redacted.contains(secret))
+        #expect(redacted.contains("/mcp/[REDACTED]"))
+    }
+
+    @Test("Trusted development is opt-in and tied to allowed roots")
+    func trustedDevelopmentScope() async throws {
+        let fixture = try TestFixture()
+        defer { fixture.cleanup() }
+        let project = fixture.root.appendingPathComponent("trusted", isDirectory: true)
+        let other = fixture.root.appendingPathComponent("other", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        try Data("#!/bin/zsh\nexit 0\n".utf8).write(to: project.appendingPathComponent("build.sh"))
+
+        let allowed = [project.path, other.path]
+        let manager = WorkspaceManager(allowedRoots: AllowedRootsManager(roots: [project, other]))
+        let workspace = try await manager.open(path: project.path)
+        let otherWorkspace = try await manager.open(path: other.path)
+        let policy = TrustedDevelopmentPolicy(configuration: BridgeConfiguration(
+            allowedRoots: allowed, trustedDevelopmentRoots: [project.path]
+        ))
+        #expect(policy.trusts(workspace))
+        #expect(!policy.trusts(otherWorkspace))
+        #expect(policy.autoApprovesModification(in: workspace))
+        #expect(policy.autoApprovesCommand(CommandRequest(executable: "swift", arguments: ["test"]), in: workspace))
+        #expect(policy.autoApprovesCommand(CommandRequest(executable: "zsh", arguments: ["build.sh"]), in: workspace))
+        #expect(policy.autoApprovesCommand(CommandRequest(executable: "./build.sh"), in: workspace))
+        #expect(!policy.autoApprovesCommand(CommandRequest(executable: "zsh", arguments: ["-c", "echo hello"]), in: workspace))
+        #expect(!policy.autoApprovesCommand(CommandRequest(executable: "zsh", arguments: ["../other/build.sh"]), in: workspace))
+        #expect(!policy.autoApprovesCommand(CommandRequest(executable: "git", arguments: ["push"]), in: workspace))
+        #expect(!policy.autoApprovesCommand(CommandRequest(executable: "cat", arguments: ["/etc/passwd"]), in: workspace))
+
+        // A persisted trust grant never overrides removal from Allowed Roots.
+        let revoked = TrustedDevelopmentPolicy(configuration: BridgeConfiguration(
+            allowedRoots: [other.path], trustedDevelopmentRoots: [project.path]
+        ))
+        #expect(!revoked.trusts(workspace))
+
+        // Old Bridge configurations remain safe without an opt-in field.
+        let legacy = try JSONDecoder().decode(BridgeConfiguration.self, from:
+            Data(#"{"allowedRoots":[],"enabled":false}"#.utf8))
+        #expect(legacy.trustedDevelopmentRoots.isEmpty)
+    }
+
+    @Test("Trusted workspace can edit and run local project script without repeat approval")
+    func trustedDevelopmentRouter() async throws {
+        let fixture = try TestFixture()
+        defer { fixture.cleanup() }
+        let project = fixture.root.appendingPathComponent("project", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try Data("old".utf8).write(to: project.appendingPathComponent("README.md"))
+        try Data("printf 'trusted-works'\n".utf8).write(to: project.appendingPathComponent("build.sh"))
+        let paths = BridgePaths(root: fixture.root.appendingPathComponent("bridge"))
+        let store = BridgeApprovalStore(paths: paths)
+        let router = ToolRouter(
+            workspaceManager: WorkspaceManager(allowedRoots: AllowedRootsManager(roots: [project])),
+            configuration: BridgeConfiguration(
+                allowedRoots: [project.path],
+                trustedDevelopmentRoots: [project.path],
+                modificationPermission: .ask,
+                shellPermission: .safeOnly
+            ),
+            auditLogger: AuditLogger(paths: paths),
+            approvalStore: store
+        )
+        let context = ToolExecutionContext(sessionID: "trusted-test")
+        _ = try await router.execute(name: "open_workspace",
+            arguments: ["path": .string(project.path)], context: context)
+        _ = try await router.execute(name: "edit", arguments: [
+            "path": .string("README.md"), "oldText": .string("old"), "newText": .string("new")
+        ], context: context)
+        let result = try await router.execute(name: "run_command", arguments: [
+            "executable": .string("zsh"),
+            "arguments": .array([.string("build.sh")])
+        ], context: context)
+        #expect(result.objectValue?["stdout"]?.stringValue?.contains("trusted-works") == true)
+        #expect(try String(contentsOf: project.appendingPathComponent("README.md"), encoding: .utf8) == "new")
+        #expect(store.pendingRequests().isEmpty)
+    }
+
     @Test("Command policy classifies risky commands")
     func commandPolicy() throws {
         let policy = CommandPolicy()
-        #expect(policy.assess(CommandRequest(executable: "swift", arguments: ["build"])).risk == .safe)
+        #expect(policy.assess(CommandRequest(executable: "swift", arguments: ["build"])).risk == .review)
+        #expect(policy.assess(CommandRequest(executable: "cat", arguments: ["/etc/passwd"])).risk == .review)
+        #expect(policy.assess(CommandRequest(executable: "env")).risk == .review)
+        #expect(policy.assess(CommandRequest(executable: "git", arguments: ["-C", "/tmp", "status"])).risk == .review)
+        #expect(policy.assess(CommandRequest(executable: "git", arguments: ["status"])).risk == .safe)
         #expect(policy.assess(CommandRequest(executable: "git", arguments: ["push", "--force"])).risk == .review)
-        #expect(policy.assess(CommandRequest(executable: "zsh", arguments: ["-c", "echo allowed"])).risk == .safe)
+        #expect(policy.assess(CommandRequest(executable: "zsh", arguments: ["-c", "echo allowed"])).risk == .review)
         #expect(policy.assess(CommandRequest(executable: "bash", arguments: ["./Scripts/build-app.sh"])).risk == .review)
         #expect(policy.assess(CommandRequest(executable: "rm", arguments: ["-rf", "."])).risk == .blocked)
         #expect(policy.assess(CommandRequest(executable: "sudo", arguments: ["rm", "-rf", "/"])).risk == .blocked)
@@ -692,7 +788,8 @@ struct ChatGPTBridgeCoreTests {
 
         let shellResult = try await tool.execute(
             workspaceID: opened.workspaceID,
-            request: CommandRequest(executable: "zsh", arguments: ["-c", "echo allowed"])
+            request: CommandRequest(executable: "zsh", arguments: ["-c", "echo allowed"]),
+            approvalGranted: true
         )
         #expect(shellResult.exitCode == 0)
         #expect(shellResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "allowed")
@@ -741,11 +838,12 @@ struct ChatGPTBridgeCoreTests {
         #expect(tools.count == MCPToolCatalogMetadata.toolCount)
         let names = tools.compactMap { $0.objectValue?["name"]?.stringValue }
         #expect(names == [
-            "open_workspace", "read", "search", "list_directory", "workspace_tree",
+            "open_workspace", "read", "tail_file", "search", "list_directory", "workspace_tree",
             "edit", "patch_file", "git_diff", "git_status", "write",
+            "create_directory", "move_path", "trash_path", "restore_path", "list_trash",
             "run_command", "bash", "start_command", "command_status", "command_output",
             "cancel_command", "start_workflow", "workflow_status", "workflow_output",
-            "cancel_workflow", "run_workflow", "coding_task", "repair_project"
+            "cancel_workflow", "run_workflow", "list_tasks", "coding_task", "repair_project"
         ])
         #expect(tools.allSatisfy { $0.objectValue?["outputSchema"] != nil })
         #expect(names.contains("initialize") == false)
@@ -1202,6 +1300,13 @@ struct ChatGPTBridgeCoreTests {
         #expect((probeResponse as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type") == "text/event-stream")
         #expect(String(decoding: probeData, as: UTF8.self).contains("codex-harbor-ready"))
 
+        let headerEndpoint = try #require(URL(string: "http://127.0.0.1:\(port)/mcp"))
+        var bearerProbe = URLRequest(url: headerEndpoint)
+        bearerProbe.httpMethod = "GET"
+        bearerProbe.setValue("Bearer compat-secret", forHTTPHeaderField: "Authorization")
+        let (_, bearerResponse) = try await URLSession.shared.data(for: bearerProbe)
+        #expect((bearerResponse as? HTTPURLResponse)?.statusCode == 200)
+
         let discoverRequest = MCPJSONRPCRequest(id: .number(1), method: "server/discover")
         var discover = URLRequest(url: endpoint)
         discover.httpMethod = "POST"
@@ -1449,6 +1554,72 @@ struct ChatGPTBridgeCoreTests {
 
         #expect(FileManager.default.fileExists(atPath: logURL.path + ".1"))
         #expect(FileManager.default.fileExists(atPath: logURL.path + ".2"))
+    }
+
+    @Test("Recent audit entries read a bounded log tail and keep latest redacted activity")
+    func recentAuditTail() async throws {
+        let fixture = try TestFixture()
+        defer { fixture.cleanup() }
+        let paths = BridgePaths(root: fixture.root.appendingPathComponent("bridge", isDirectory: true))
+        try paths.ensureDirectories()
+        let logURL = paths.logsDirectory.appendingPathComponent("audit.log")
+        var content = Data(repeating: 65, count: 600_000)
+        content.append(0x0A)
+        try content.write(to: logURL)
+        let logger = AuditLogger(paths: paths)
+        for name in ["first", "latest"] {
+            try await logger.record(AuditEntry(
+                tool: name,
+                workspaceID: nil,
+                target: nil,
+                status: .success,
+                durationMilliseconds: 1,
+                summary: "api_key=do-not-disclose"
+            ))
+        }
+        let entries = try await logger.recentEntries(limit: 2)
+        #expect(entries.map(\.tool) == ["first", "latest"])
+        #expect(entries.allSatisfy { !$0.summary.contains("do-not-disclose") })
+        #expect(try await logger.latestEntry()?.tool == "latest")
+        #expect(try await logger.recentEntries(limit: 0).isEmpty)
+    }
+
+    @Test("Audit activity cache detects external appends and log replacements")
+    func auditCacheFollowsExternalWritersAndRotation() async throws {
+        let fixture = try TestFixture()
+        defer { fixture.cleanup() }
+        let paths = BridgePaths(root: fixture.root.appendingPathComponent("bridge", isDirectory: true))
+        let reader = AuditLogger(paths: paths)
+        let writer = AuditLogger(paths: paths)
+        let logURL = paths.logsDirectory.appendingPathComponent("audit.log")
+
+        #expect(try await reader.latestEntry() == nil)
+        try await writer.record(AuditEntry(
+            tool: "first", workspaceID: nil, target: nil,
+            status: .success, durationMilliseconds: 1, summary: "ok"
+        ))
+        #expect(try await reader.latestEntry()?.tool == "first")
+        #expect(try await reader.latestEntry()?.tool == "first")
+
+        // A second AuditLogger instance is not covered by the reader's local
+        // cache invalidation, so the file fingerprint must notice its append.
+        try await writer.record(AuditEntry(
+            tool: "second", workspaceID: nil, target: nil,
+            status: .success, durationMilliseconds: 1, summary: "ok"
+        ))
+        #expect(try await reader.latestEntry()?.tool == "second")
+
+        // Incomplete data during append must not hide the previous valid call.
+        let handle = try FileHandle(forWritingTo: logURL)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"incomplete\":".utf8))
+        try handle.close()
+        #expect(try await reader.latestEntry()?.tool == "second")
+        #expect(try await reader.recentEntries(limit: 2).map(\.tool) == ["first", "second"])
+
+        // Atomic replacement changes the file identity, even if it is empty.
+        try Data().write(to: logURL, options: .atomic)
+        #expect(try await reader.latestEntry() == nil)
     }
 
     @Test("Audit log redacts common secrets")

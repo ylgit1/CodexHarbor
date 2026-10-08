@@ -169,7 +169,12 @@ public final class LocalMCPHTTPServer: @unchecked Sendable {
         }
 
         let publicCompatibilityPath = publicAccessToken.map { "/mcp/\($0)" }
+        // Support header-based public authentication without putting the
+        // credential in a URL. Legacy secret-path clients remain supported.
         let authenticatedByPath = publicCompatibilityPath == request.path
+            || (request.path == "/mcp" && publicAccessToken.map {
+                request.headers["authorization"] == "Bearer \($0)"
+            } == true)
         guard request.path == "/mcp" || authenticatedByPath else {
             return Self.errorResponse(404, "Not found")
         }

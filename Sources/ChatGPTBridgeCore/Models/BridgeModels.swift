@@ -329,6 +329,9 @@ public struct BridgeConfiguration: Codable, Equatable, Sendable {
     public var enabled: Bool
     public var launchAtLogin: Bool
     public var allowedRoots: [String]
+    /// Explicitly trusted roots. A root is effective only while it remains
+    /// in allowedRoots, so removing folder access also revokes auto-approval.
+    public var trustedDevelopmentRoots: [String]
     public var modificationPermission: ModificationPermission
     public var shellPermission: ShellPermission
     public var gitPushPermission: GitPermission
@@ -341,6 +344,7 @@ public struct BridgeConfiguration: Codable, Equatable, Sendable {
         enabled: Bool = false,
         launchAtLogin: Bool = false,
         allowedRoots: [String] = [],
+        trustedDevelopmentRoots: [String] = [],
         modificationPermission: ModificationPermission = .ask,
         shellPermission: ShellPermission = .safeOnly,
         gitPushPermission: GitPermission = .ask,
@@ -352,6 +356,7 @@ public struct BridgeConfiguration: Codable, Equatable, Sendable {
         self.enabled = enabled
         self.launchAtLogin = launchAtLogin
         self.allowedRoots = allowedRoots
+        self.trustedDevelopmentRoots = trustedDevelopmentRoots
         self.modificationPermission = modificationPermission
         self.shellPermission = shellPermission
         self.gitPushPermission = gitPushPermission
@@ -365,6 +370,7 @@ public struct BridgeConfiguration: Codable, Equatable, Sendable {
         case enabled
         case launchAtLogin
         case allowedRoots
+        case trustedDevelopmentRoots
         case modificationPermission
         case shellPermission
         case gitPushPermission
@@ -379,6 +385,7 @@ public struct BridgeConfiguration: Codable, Equatable, Sendable {
         enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
         launchAtLogin = try container.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
         allowedRoots = try container.decodeIfPresent([String].self, forKey: .allowedRoots) ?? []
+        trustedDevelopmentRoots = try container.decodeIfPresent([String].self, forKey: .trustedDevelopmentRoots) ?? []
         modificationPermission = try container.decodeIfPresent(ModificationPermission.self, forKey: .modificationPermission) ?? .ask
         shellPermission = try container.decodeIfPresent(ShellPermission.self, forKey: .shellPermission) ?? .safeOnly
         gitPushPermission = try container.decodeIfPresent(GitPermission.self, forKey: .gitPushPermission) ?? .ask

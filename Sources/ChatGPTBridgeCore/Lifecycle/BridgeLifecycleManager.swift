@@ -48,6 +48,9 @@ public struct BridgeLifecycleSnapshot: Sendable {
 /// transitions so a new operation can never race an unfinished stop/start.
 public actor BridgeLifecycleManager {
     public private(set) var phase: BridgeLifecyclePhase = .idle
+    // Actor isolation alone is insufficient: await permits reentrant starts,
+    // stops, or switches. Reject conflicting transitions until one completes.
+    private var transitionInProgress = false
 
     private let paths: BridgePaths
     private let store: BridgeConfigurationStore
@@ -67,6 +70,18 @@ public actor BridgeLifecycleManager {
     }
 
     public func start(
+        configuration: BridgeConfiguration,
+        agentExecutableURL: URL
+    ) async throws -> BridgeLifecycleSnapshot {
+        guard !transitionInProgress else {
+            throw BridgeError.writeFailed("服务正在执行其他连接操作，请在操作完成后重试")
+        }
+        transitionInProgress = true
+        defer { transitionInProgress = false }
+        return try await startUnlocked(configuration: configuration, agentExecutableURL: agentExecutableURL)
+    }
+
+    private func startUnlocked(
         configuration: BridgeConfiguration,
         agentExecutableURL: URL
     ) async throws -> BridgeLifecycleSnapshot {
@@ -120,6 +135,13 @@ public actor BridgeLifecycleManager {
         configuration: BridgeConfiguration,
         agentExecutableURL: URL?
     ) async -> BridgeLifecycleSnapshot {
+        // Stop must not silently return while a switch is still running:
+        // configuration deletion depends on the helper actually stopping.
+        while transitionInProgress {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        transitionInProgress = true
+        defer { transitionInProgress = false }
         phase = .stopping
         await stopProcesses(configuration: configuration, agentExecutableURL: agentExecutableURL)
         phase = .idle
@@ -130,7 +152,6 @@ public actor BridgeLifecycleManager {
         configuration: BridgeConfiguration,
         agentExecutableURL: URL
     ) async throws -> BridgeLifecycleSnapshot {
-        // start() deliberately performs a complete stop first.
         try await start(configuration: configuration, agentExecutableURL: agentExecutableURL)
     }
 
@@ -139,6 +160,11 @@ public actor BridgeLifecycleManager {
         configuration: BridgeConfiguration,
         agentExecutableURL: URL
     ) async throws -> BridgeLifecycleSnapshot {
+        guard !transitionInProgress else {
+            throw BridgeError.writeFailed("服务正在执行其他连接操作，请在操作完成后重试")
+        }
+        transitionInProgress = true
+        defer { transitionInProgress = false }
         phase = .switching
         try validateConfigured(mode, configuration: configuration)
 
@@ -153,16 +179,24 @@ public actor BridgeLifecycleManager {
         }
 
         do {
-            let snapshot = try await start(configuration: updated, agentExecutableURL: agentExecutableURL)
+            let snapshot = try await startUnlocked(configuration: updated, agentExecutableURL: agentExecutableURL)
             phase = .running
             return snapshot
         } catch {
-            // Configuration and process recovery are one transaction. If the
-            // new helper cannot expose a local MCP endpoint, restore both.
-            try? store.save(previous)
-            _ = try? await start(configuration: previous, agentExecutableURL: agentExecutableURL)
-            phase = .failed
-            throw error
+            // A failed rollback must be reported explicitly; never claim that
+            // the old connection was restored if its helper cannot start.
+            let switchError = error
+            do {
+                try store.save(previous)
+                _ = try await startUnlocked(configuration: previous, agentExecutableURL: agentExecutableURL)
+                phase = .running
+            } catch {
+                phase = .failed
+                throw BridgeError.writeFailed(
+                    "切换失败：\(switchError.localizedDescription)；恢复原连接也失败：\(error.localizedDescription)"
+                )
+            }
+            throw switchError
         }
     }
 
@@ -170,6 +204,11 @@ public actor BridgeLifecycleManager {
         configuration: BridgeConfiguration,
         agentExecutableURL: URL
     ) async throws -> BridgeLifecycleSnapshot {
+        guard !transitionInProgress else {
+            throw BridgeError.writeFailed("服务正在执行其他连接操作，请在操作完成后重试")
+        }
+        transitionInProgress = true
+        defer { transitionInProgress = false }
         phase = .recovering
         guard configuration.enabled else {
             phase = .idle
@@ -183,7 +222,7 @@ public actor BridgeLifecycleManager {
         )
         let launchAgentMissing = configuration.launchAtLogin && !snapshot.launchAgentStatus.loaded
         if binaryChanged || launchAgentMissing || !snapshot.processRunning || !snapshot.mcpHealthy {
-            return try await start(configuration: configuration, agentExecutableURL: agentExecutableURL)
+            return try await startUnlocked(configuration: configuration, agentExecutableURL: agentExecutableURL)
         }
 
         // Transport/network recovery stays inside the running helper so MCP
@@ -200,6 +239,11 @@ public actor BridgeLifecycleManager {
         agentExecutableURL: URL?,
         restartIfActive: Bool = true
     ) async throws -> BridgeLifecycleSnapshot {
+        guard !transitionInProgress else {
+            throw BridgeError.writeFailed("服务正在执行其他连接操作，请在操作完成后重试")
+        }
+        transitionInProgress = true
+        defer { transitionInProgress = false }
         let value = runtimeKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else {
             throw BridgeError.writeFailed("Runtime Key 不能为空")
@@ -213,7 +257,7 @@ public actor BridgeLifecycleManager {
            configuration.enabled,
            configuration.transportMode == .secureTunnel,
            let agentExecutableURL {
-            return try await restart(
+            return try await startUnlocked(
                 configuration: configuration,
                 agentExecutableURL: agentExecutableURL
             )
@@ -346,8 +390,20 @@ public actor BridgeLifecycleManager {
             var request = URLRequest(url: url)
             request.timeoutInterval = 1.5
             do {
-                let (_, response) = try await URLSession.shared.data(for: request)
-                if (response as? HTTPURLResponse)?.statusCode == 200 { return true }
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard (response as? HTTPURLResponse)?.statusCode == 200,
+                      let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    continue
+                }
+                if BridgeHealthPolicy.catalogMatches(
+                    version: payload["toolCatalogVersion"] as? String,
+                    count: payload["toolCount"] as? Int
+                ) {
+                    return true
+                }
+                // A stale Agent may still return 200. Let recovery replace it
+                // instead of advertising an incompatible MCP catalog as healthy.
+                return false
             } catch {
                 if attempt < 2 { try? await Task.sleep(for: .milliseconds(300)) }
             }

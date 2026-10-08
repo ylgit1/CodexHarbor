@@ -10,7 +10,8 @@ struct RepairAgentTests {
         defer { fixture.cleanup() }
         let result = try await fixture.agent.repair(
             workspaceID: fixture.workspaceID,
-            timeoutSeconds: 60
+            timeoutSeconds: 60,
+            approvalGranted: true
         )
         #expect(result.state == .needsPatch)
         #expect(result.test.exitCode != 0)

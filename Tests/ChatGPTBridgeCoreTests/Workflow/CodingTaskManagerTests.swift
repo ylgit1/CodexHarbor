@@ -4,6 +4,43 @@ import Testing
 
 @Suite("Coding Task")
 struct CodingTaskManagerTests {
+    @Test("different workspaces may run Coding Tasks concurrently while same-workspace writes serialize")
+    func multipleWorkspaces() async throws {
+        let fixture = try await CodingTaskFixture()
+        defer { fixture.cleanup() }
+        let plan = ProjectWorkflowPlan(
+            kind: .swiftPackage,
+            commands: [ProjectWorkflowCommand(name: "Long verification", executable: "sleep", arguments: ["1"])],
+            message: "two independent workspaces"
+        )
+        let first = try await fixture.manager.start(
+            workspaceID: fixture.workspaceID, requirement: "workspace one",
+            changes: [], plan: plan, packageCommand: nil,
+            timeoutSeconds: 5, approvalGranted: true
+        )
+        let second = try await fixture.manager.start(
+            workspaceID: fixture.otherWorkspaceID, requirement: "workspace two",
+            changes: [], plan: plan, packageCommand: nil,
+            timeoutSeconds: 5, approvalGranted: true
+        )
+        #expect(first.taskID != second.taskID)
+        #expect(await fixture.manager.list().count >= 2)
+        await #expect(throws: BridgeError.self) {
+            _ = try await fixture.manager.start(
+                workspaceID: fixture.workspaceID, requirement: "conflicting workspace one",
+                changes: [], plan: plan, packageCommand: nil, approvalGranted: true
+            )
+        }
+        let firstFinished = try await waitForState(
+            manager: fixture.manager, taskID: first.taskID, states: [.completed, .failed]
+        )
+        let secondFinished = try await waitForState(
+            manager: fixture.manager, taskID: second.taskID, states: [.completed, .failed]
+        )
+        #expect(firstFinished.state == .completed)
+        #expect(secondFinished.state == .completed)
+    }
+
     @Test("task applies changes then verifies, builds, and packages under one task ID")
     func completesFullLifecycle() async throws {
         let fixture = try await CodingTaskFixture()
@@ -188,6 +225,8 @@ struct CodingTaskManagerTests {
 private struct CodingTaskFixture {
     let root: URL
     let workspaceID: UUID
+    let otherWorkspaceID: UUID
+    let otherRoot: URL
     let manager: CodingTaskManager
 
     init() async throws {
@@ -196,9 +235,15 @@ private struct CodingTaskFixture {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try Data("demo\n".utf8).write(to: root.appendingPathComponent("README.md"))
         try Self.initializeGit(at: root)
+        otherRoot = root.deletingLastPathComponent()
+            .appendingPathComponent("CodexHarborCodingTaskOther-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: otherRoot, withIntermediateDirectories: true)
+        try Data("other\n".utf8).write(to: otherRoot.appendingPathComponent("README.md"))
+        try Self.initializeGit(at: otherRoot)
 
-        let workspaces = WorkspaceManager(allowedRoots: AllowedRootsManager(roots: [root]))
+        let workspaces = WorkspaceManager(allowedRoots: AllowedRootsManager(roots: [root, otherRoot]))
         workspaceID = try await workspaces.open(path: root.path).id
+        otherWorkspaceID = try await workspaces.open(path: otherRoot.path).id
         let audit = AuditLogger(paths: BridgePaths(root: root.appendingPathComponent("Bridge")))
         let permissions = PermissionEngine(
             configuration: BridgeConfiguration(
@@ -228,6 +273,7 @@ private struct CodingTaskFixture {
 
     func cleanup() {
         try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: otherRoot)
     }
 
     private static func initializeGit(at root: URL) throws {

@@ -1033,11 +1033,17 @@ struct HarborLocalAccessView: View {
 
             Spacer()
 
-            Text(bridge.unrestrictedDevelopmentAccessEnabled ? "开发模式" : "安全模式")
+            Text(bridge.unrestrictedDevelopmentAccessEnabled
+                 ? "完全授权"
+                 : (bridge.isTrustedDevelopmentRoot(root) ? "可信开发" : "安全模式"))
                 .font(.system(size: 9.5, weight: .medium))
-                .foregroundStyle(bridge.unrestrictedDevelopmentAccessEnabled
-                    ? HarborColors.orange
-                    : HarborColors.blue)
+                .foregroundStyle(bridge.isTrustedDevelopmentRoot(root)
+                    || bridge.unrestrictedDevelopmentAccessEnabled ? HarborColors.orange : HarborColors.blue)
+
+            Button(bridge.isTrustedDevelopmentRoot(root) ? "取消信任" : "信任") {
+                Task { await bridge.setTrustedDevelopment(!bridge.isTrustedDevelopmentRoot(root), root: root) }
+            }
+            .buttonStyle(HarborActionButtonStyle(tint: .orange, prominence: .secondary))
 
             Button("打开") {
                 NSWorkspace.shared.open(URL(fileURLWithPath: root))

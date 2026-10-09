@@ -103,7 +103,7 @@ MCP Catalog 会根据工具定义自动生成版本号。服务端 `/health` 会
 
 **长命令与日志：**命令最长允许 30 分钟，最多可写入 256 MiB 的 stdout/stderr 日志；大输出按偏移调用 `command_output` 分页读取，单次最多 256 KiB。大型项目日志可用 `tail_file` 查看最后 256 KiB，不需要读取整个日志文件。超过 256 MiB 仍可能终止命令，以避免无限磁盘写入。
 
-**多聊天使用：**`list_tasks` 返回同一 Agent 中最近的命令、工作流和 Coding Task（支持按 Workspace 过滤）。不同 Workspace 可同时执行 Coding Task；同一个 Workspace 仍限制并发修改。任务发现依赖运行中的 Agent，任务内存记录及正在运行的子进程**不能在 Agent 重启后自动恢复**，并发命令仍存在全局上限。
+**多聊天使用：**`list_tasks` 返回同一 Agent 中最近的命令、工作流和 Coding Task（支持按 Workspace 过滤）。不同 Workspace 可同时执行 Coding Task；同一个 Workspace 仍限制并发修改。任务发现依赖运行中的 Agent，正在运行的子进程**不能在 Agent 重启后自动恢复**；Coding Task 已增加轻量状态检查点，可以在 Agent 重启后查看历史任务和中断状态，但不会自动重放文件修改、Git 或 Shell 命令。中断任务需要先检查 Git Diff，再创建新任务继续。并发命令仍存在全局上限。
 
 ### Coding Task
 
@@ -229,6 +229,27 @@ Codex 与 ChatGPT Bridge 的敏感信息保存在 Harbor 自己的本地凭据�
 
 独立 Agent 使用本地凭据文件而不是依赖应用进程的 Keychain 授权，避免 App 重签名或 Agent 独立启动时反复弹出系统授权框。
 
+### 授权记忆与后台确认
+
+- 记忆授权绑定工作区、工具、目标文件和具体操作参数；旧版全项目文件授权不会自动沿用。
+- 记忆授权最多 24 小时；参数内容仅在持久化规则中保存哈希。记忆记录不再在设置页展示，亦不提供“撤销全部授权”入口。
+- 独立的置顶 NSPanel 显示待审批命令，与主窗口是否打开无关，不需要系统通知权限；90 秒后自动失效。
+
+### 真实 macOS 界面读取与操作（按需授权）
+
+Codex Harbor 通过 macOS Accessibility 提供独立的 UI 测试工具，两种 ChatGPT 接入方式共用同一套 Agent 能力：
+
+- `ui_apps` / `ui_open_app`：列出可交互应用名称与 Bundle ID；仅在本机单独授权后才可打开指定应用。
+- `ui_windows` / `ui_inspect`：先指定已授权应用、窗口索引及**准确标题**，再读取控件树、可用性与选中状态。密码输入框及普通可编辑输入框的值不回传。
+- `ui_perform`：对明确控件执行单步点击、写入或滚动，操作前校验 ID 和原标签；敏感操作、授权按钮及系统安全窗口不得自动点击。
+- `ui_wait` / `ui_wait_window`：轮询真实控件或窗口出现，不依赖固定睡眠时间。
+- `ui_test`：最多 8 步的结构化 UI 验收，每步必须设置 `expectContains`（实际界面文字）或 `expectWindowGone`（目标窗口关闭）；未提供可观察的成功条件时，整个测试在操作前拒绝执行。
+- `ui_capture`：**独立授权后**使用 ScreenCaptureKit 获取指定窗口的一张 JPEG 帧，MCP 返回标准 image 内容，默认不截图、不录制也不保存；不提供常驻视频流。
+
+不必提前配置应用列表。首次实际调用指定 App 的界面工具时，Codex Harbor 会弹出置顶本地授权窗口，显示从本机读取的应用名称、Bundle ID、此次申请的读取/操作/截图权限；用户明确允许后自动继续原调用，拒绝或超时则不执行。授权只针对该 App 及所需等级，后续升级权限会再次确认。后台 Agent 仍需在 macOS **系统设置 → 隐私与安全性 → 辅助功能** 获得系统权限；单帧截图由前台 Codex Harbor 主程序通过本机受限 Unix socket 执行，因此需要单独为 **Codex Harbor 主程序**开启**屏幕与系统音频录制**权限，不能由 MCP 代替用户授权。
+
+应用授权与 Workspace Allowed Roots **完全独立**，MCP 只能申请权限，只有 Codex Harbor 本地弹窗中的用户点击才能新增授权；目标窗口变化后必须重新选择，系统授权弹窗不能通过该能力自动批准。关闭主界面时不采集任何画面，截图仅在明确调用 `ui_capture` 时执行。通用快捷键与屏幕坐标拖动暂未开放，避免绕过控件校验造成误操作；持续视频镜像和远程观看端也尚未实现。
+
 ### 日志与诊断
 
 - stdout / stderr 和审计摘要会经过常见 Token / API Key 脱敏
@@ -293,9 +314,23 @@ Transport Installer 当前同时包含 Apple Silicon（arm64）与 Intel（x86_6
 
 从 [Releases](../../releases) 下载最新的 macOS 压缩包，解压后将 `Codex Harbor.app` 放入“应用程序”。
 
-当前项目构建产物使用 **ad-hoc 签名**。如果 macOS 首次打开提示来源未验证，可以在 Finder 中按住 Control 点击应用并选择“打开”。
+构建脚本会优先沿用已安装 Agent 的签名证书，并自动识别有效的 **Apple Development / Developer ID Application** 证书或本机固定名称的自签名证书；`HarborChatGPTAgent` 使用 `com.codexharbor.agent` 代码签名标识。
 
-正式的 Developer ID 签名与公证流程尚未接入仓库中的默认构建脚本。
+**不付费、仅在自己的 Mac 上开发：** 打开「钥匙串访问」→ 菜单「钥匙串访问」→「证书助理」→「创建证书」，将名称设为 `Codex Harbor Local Code Signing`，身份类型选「自签名根证书」，证书类型选「代码签名」。保存到登录钥匙串并保留私钥；若系统不认可该证书的代码签名用途，需要在钥匙串里按需检查信任设置。创建后检查：
+
+```bash
+security find-identity -v -p codesigning
+# 自动选择同名本地证书，也可显式指定：
+CODEX_HARBOR_SIGN_IDENTITY="Codex Harbor Local Code Signing" ./Scripts/build-app.sh fast
+```
+
+另一种免费方法是登录 Xcode 的 Apple Account / Personal Team，创建适用于本机开发的 Apple Development 证书。它不等同于付费的 Developer ID 分发证书，也有个人团队开发限制。
+
+本机没有有效证书时仍会明确警告并退回 **ad-hoc 签名**；这种签名的标识即使固定，也不能保证 macOS 的辅助功能和「屏幕与系统音频录制」授权在重新编译后保留。**真正解决更新后反复失去 TCC 授权，仍需要持续使用相同的有效证书和代码身份**。从旧的 ad-hoc 版本第一次迁移到证书签名版，仍可能需要手动授权一次。不要通过自动更改 TCC 数据库来绕过用户权限。
+
+截图需用户另行在「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」授权 Codex Harbor 主程序；后台 Agent 不直接调用截图框架，主程序只处理按需授权的单窗口截图，不通过 `screencapture` 绕过系统权限。如果 macOS 首次打开应用时提示来源未验证，可以在 Finder 中 Control 点击应用并选择“打开”。
+
+正式 Developer ID 公证及自动更新发布流水线仍需独立配置。
 
 ## 快速开始
 
@@ -360,6 +395,26 @@ swift test
 ```
 
 测试使用临时目录和隔离配置，不应修改真实的 `~/.codex`。
+
+### 持续集成与性能验收
+
+GitHub Actions 的 macOS 工作流会运行测试、Release 打包、签名和 Info.plist 检查；Developer ID 签名与 Apple 公证仍需要另行配置凭据。
+
+分别在前台静止、后台静止、连接切换等场景执行：
+
+```bash
+./Scripts/benchmark-idle.sh 30 2
+```
+
+输出位于 `dist/performance/`，包括 App、Agent、Tunnel CPU 平均值与峰值、RSS 峰值。短时采样不能代替 Instruments 或长期内存检查。
+
+安装新版后，如需从独立终端安全重启 GUI（有等待审批的请求则拒绝重启）：
+
+```bash
+./Scripts/restart-installed-app.sh
+```
+
+安装脚本默认不强制退出正在使用的 App。构建号按 Git 提交数量生成，并在 Info.plist 写入提交哈希；精确打在 `vX.Y.Z` 标签上时才更新公开版本号。
 
 ### 构建 Release App
 

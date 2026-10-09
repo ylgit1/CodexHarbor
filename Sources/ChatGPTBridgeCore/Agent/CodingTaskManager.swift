@@ -162,19 +162,27 @@ public actor CodingTaskManager {
     private let commandSessionManager: CommandSessionManager
     private let auditLogger: AuditLogger
     private var sessions: [UUID: Session] = [:]
+    private let journal: CodingTaskJournal?
+    private let restoredTasks: [UUID: CodingTaskResponse]
 
     public init(
         workspaceManager: WorkspaceManager,
         patchTool: PatchFileTool,
         gitService: GitService,
         commandSessionManager: CommandSessionManager,
-        auditLogger: AuditLogger
+        auditLogger: AuditLogger,
+        journalDirectory: URL? = nil
     ) {
         self.workspaceManager = workspaceManager
         self.patchTool = patchTool
         self.gitService = gitService
         self.commandSessionManager = commandSessionManager
         self.auditLogger = auditLogger
+        let journal = journalDirectory.map { CodingTaskJournal(directory: $0) }
+        self.journal = journal
+        self.restoredTasks = Dictionary(
+            uniqueKeysWithValues: (journal?.restoredResponses() ?? []).map { ($0.taskID, $0) }
+        )
     }
 
     public static func packageCommand(for workspace: BridgeWorkspace) -> ProjectWorkflowCommand? {
@@ -266,6 +274,7 @@ public actor CodingTaskManager {
         }
 
         resetSteps(session)
+        saveCheckpoint(session)
         Task { [weak self] in
             await self?.run(taskID: id)
         }
@@ -324,6 +333,7 @@ public actor CodingTaskManager {
 
         resetSteps(session)
         session.state = .planned
+        saveCheckpoint(session)
         Task { [weak self] in
             await self?.run(taskID: taskID)
         }
@@ -334,14 +344,18 @@ public actor CodingTaskManager {
     /// inspect the latest state without inheriting another session's workspace.
     public func list(workspaceID: UUID? = nil) -> [CodingTaskResponse] {
         pruneExpiredSessions()
-        return sessions.values
+        let live = sessions.values.map { response(for: $0) }
+        let prior = restoredTasks.values.filter { sessions[$0.taskID] == nil }
+        return (live + prior)
             .filter { workspaceID == nil || $0.workspaceID == workspaceID }
             .sorted { $0.startedAt > $1.startedAt }
-            .map { response(for: $0) }
+            .prefix(20)
+            .map { $0 }
     }
 
     public func status(taskID: UUID) async throws -> CodingTaskResponse {
         guard let session = sessions[taskID] else {
+            if let restored = restoredTasks[taskID] { return restored }
             throw BridgeError.codingTaskNotFound(taskID)
         }
         await refreshCurrentCommand(session)
@@ -355,6 +369,7 @@ public actor CodingTaskManager {
         limitBytes: Int = CommandSessionManager.maximumOutputChunkBytes
     ) async throws -> CodingTaskResponse {
         guard let session = sessions[taskID] else {
+            if let restored = restoredTasks[taskID] { return restored }
             throw BridgeError.codingTaskNotFound(taskID)
         }
         await refreshCurrentCommand(session)
@@ -396,6 +411,7 @@ public actor CodingTaskManager {
             session.steps[index].state = .cancelled
         }
         session.finishedAt = Date()
+        saveCheckpoint(session)
         await recordAuditIfNeeded(session)
         return response(for: session)
     }
@@ -472,6 +488,7 @@ public actor CodingTaskManager {
 
         session.state = .running
         session.message = "Coding Task running"
+        saveCheckpoint(session)
 
         for index in session.steps.indices {
             guard session.state == .running else { return }
@@ -480,6 +497,7 @@ public actor CodingTaskManager {
             session.phase = step.phase
             session.message = step.command.name
             step.state = .running
+            saveCheckpoint(session)
 
             do {
                 let started = try await commandSessionManager.start(
@@ -493,6 +511,7 @@ public actor CodingTaskManager {
                 )
                 step.commandID = started.commandID
                 session.currentCommandID = started.commandID
+                saveCheckpoint(session)
 
                 let terminal = try await waitForCommand(
                     commandID: started.commandID,
@@ -501,6 +520,7 @@ public actor CodingTaskManager {
                 step.exitCode = terminal.exitCode
                 step.errors = terminal.errors
                 session.errors = terminal.errors
+                saveCheckpoint(session)
 
                 guard session.state == .running else { return }
 
@@ -531,6 +551,7 @@ public actor CodingTaskManager {
                 if session.repairAttempt < session.maximumRepairAttempts {
                     session.state = .needsRepair
                     session.message = message
+                    saveCheckpoint(session)
                 } else {
                     finish(session, state: .failed, message: message)
                     await recordAuditIfNeeded(session)
@@ -555,6 +576,7 @@ public actor CodingTaskManager {
         if session.repairAttempt < session.maximumRepairAttempts {
             session.state = .needsRepair
             session.message = "\(step.command.name) failed; repair patch required"
+            saveCheckpoint(session)
             return
         }
         finish(
@@ -600,6 +622,11 @@ public actor CodingTaskManager {
         session.phase = .complete
         session.message = message
         session.finishedAt = Date()
+        saveCheckpoint(session)
+    }
+
+    private func saveCheckpoint(_ session: Session) {
+        journal?.save(response(for: session))
     }
 
     private func response(

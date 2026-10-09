@@ -16,6 +16,9 @@ public struct BridgeApprovalRequest: Codable, Equatable, Identifiable, Sendable 
     public var decision: BridgeApprovalDecision
     public let rememberScope: BridgeApprovalScope?
     public let expiresAt: Date?
+    /// Chinese copy derived by the server from structured tool arguments.
+    /// Absent when the exact purpose cannot be established.
+    public let actionDescription: String?
 
     public var deadline: Date { expiresAt ?? createdAt.addingTimeInterval(90) }
 
@@ -31,7 +34,8 @@ public struct BridgeApprovalRequest: Codable, Equatable, Identifiable, Sendable 
         createdAt: Date = Date(),
         decision: BridgeApprovalDecision = .pending,
         rememberScope: BridgeApprovalScope? = nil,
-        expiresAt: Date? = nil
+        expiresAt: Date? = nil,
+        actionDescription: String? = nil
     ) {
         self.id = id
         self.tool = tool
@@ -41,7 +45,16 @@ public struct BridgeApprovalRequest: Codable, Equatable, Identifiable, Sendable 
         self.decision = decision
         self.rememberScope = rememberScope
         self.expiresAt = expiresAt
+        self.actionDescription = actionDescription
     }
+}
+
+/// Expiring, explicitly scoped approval. Legacy indefinite rules are never
+/// accepted after upgrading to this format.
+public struct BridgeRememberedApprovalRule: Codable, Sendable {
+    public let scope: BridgeApprovalScope
+    public let expiresAt: Date
+    public let grantedAt: Date
 }
 
 public final class BridgeApprovalStore: @unchecked Sendable {
@@ -52,6 +65,7 @@ public final class BridgeApprovalStore: @unchecked Sendable {
     // Keep authorization lifetime aligned with ToolRouter's 90-second wait.
     // A late decision must never authorize a subsequent identical command.
     private let approvalTimeout: TimeInterval = 90
+    public static let rememberedApprovalLifetime: TimeInterval = 24 * 60 * 60
 
     public init(paths: BridgePaths, ttl: TimeInterval = 10 * 60) {
         self.directory = paths.root.appendingPathComponent("approvals", isDirectory: true)
@@ -81,7 +95,8 @@ public final class BridgeApprovalStore: @unchecked Sendable {
         tool: String,
         summary: String,
         target: String? = nil,
-        rememberScope: BridgeApprovalScope? = nil
+        rememberScope: BridgeApprovalScope? = nil,
+        actionDescription: String? = nil
     ) {
         withLock {
             pruneExpiredLocked()
@@ -95,7 +110,8 @@ public final class BridgeApprovalStore: @unchecked Sendable {
                 summary: summary,
                 target: target,
                 rememberScope: rememberScope,
-                expiresAt: Date().addingTimeInterval(min(ttl, approvalTimeout))
+                expiresAt: Date().addingTimeInterval(min(ttl, approvalTimeout)),
+                actionDescription: actionDescription
             )
             saveLocked(request, to: url)
         }
@@ -169,7 +185,12 @@ public final class BridgeApprovalStore: @unchecked Sendable {
                     try FileManager.default.createDirectory(at: rulesDirectory, withIntermediateDirectories: true,
                                                            attributes: [.posixPermissions: 0o700])
                     let rule = rulesDirectory.appendingPathComponent(scope.id + ".json")
-                    try JSONEncoder().encode(scope).write(to: rule, options: .atomic)
+                    let saved = BridgeRememberedApprovalRule(
+                        scope: scope,
+                        expiresAt: Date().addingTimeInterval(Self.rememberedApprovalLifetime),
+                        grantedAt: Date()
+                    )
+                    try JSONEncoder().encode(saved).write(to: rule, options: .atomic)
                     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: rule.path)
                 } catch { return false }
             }
@@ -182,8 +203,27 @@ public final class BridgeApprovalStore: @unchecked Sendable {
     public func hasRememberedApproval(_ scope: BridgeApprovalScope) -> Bool {
         let url = rulesDirectory.appendingPathComponent(scope.id + ".json")
         guard let data = try? Data(contentsOf: url),
-              let saved = try? JSONDecoder().decode(BridgeApprovalScope.self, from: data) else { return false }
-        return saved == scope
+              let rule = try? JSONDecoder().decode(BridgeRememberedApprovalRule.self, from: data),
+              rule.expiresAt > Date() else { return false }
+        return rule.scope == scope
+    }
+
+    public func rememberedApprovalRules() -> [BridgeRememberedApprovalRule] {
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: rulesDirectory, includingPropertiesForKeys: nil
+        ) else { return [] }
+        return urls.compactMap { url -> BridgeRememberedApprovalRule? in
+            guard let data = try? Data(contentsOf: url),
+                  let rule = try? JSONDecoder().decode(BridgeRememberedApprovalRule.self, from: data),
+                  rule.expiresAt > Date() else { return nil }
+            return rule
+        }.sorted { $0.grantedAt > $1.grantedAt }
+    }
+
+    public func revokeRememberedApproval(_ scope: BridgeApprovalScope) throws {
+        try FileManager.default.removeItem(
+            at: rulesDirectory.appendingPathComponent(scope.id + ".json")
+        )
     }
 
     public func revokeRememberedApprovals() throws {

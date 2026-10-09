@@ -843,7 +843,9 @@ struct ChatGPTBridgeCoreTests {
             "create_directory", "move_path", "trash_path", "restore_path", "list_trash",
             "run_command", "bash", "start_command", "command_status", "command_output",
             "cancel_command", "start_workflow", "workflow_status", "workflow_output",
-            "cancel_workflow", "run_workflow", "list_tasks", "coding_task", "repair_project"
+            "cancel_workflow", "run_workflow", "list_tasks", "coding_task",
+            "ui_apps", "ui_open_app", "ui_windows", "ui_inspect", "ui_perform",
+            "ui_capture", "ui_test", "ui_wait_window", "ui_wait", "repair_project"
         ])
         #expect(tools.allSatisfy { $0.objectValue?["outputSchema"] != nil })
         #expect(names.contains("initialize") == false)

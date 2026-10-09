@@ -546,6 +546,163 @@ enum MCPToolCatalog {
             annotations: mutatingAnnotations
         ),
         MCPToolDefinition(
+            name: "ui_apps",
+            title: "List macOS UI applications",
+            description: "List running foreground-capable application identities (names and bundle IDs only). When a UI tool first needs access, Harbor prompts the local user for per-app permission.",
+            inputSchema: objectSchema(properties: [:], required: []),
+            outputSchema: arraySchema(items: objectSchema(properties: [
+                "bundleID": stringSchema(description: "macOS bundle ID"),
+                "name": stringSchema(description: "Application name"),
+                "running": booleanSchema(description: "Running state")
+            ], required: ["bundleID", "name", "running"])),
+            annotations: readOnlyAnnotations
+        ),
+        MCPToolDefinition(
+            name: "ui_open_app",
+            title: "Open a locally authorized app",
+            description: "Launch or activate a macOS application by exact bundle ID. Missing app-read permission triggers a local approval dialog showing that app; a denial or timeout stops execution. Rejects protected system apps.",
+            inputSchema: objectSchema(properties: [
+                "bundleID": stringSchema(description: "Target app bundle ID")
+            ], required: ["bundleID"]),
+            outputSchema: objectSchema(properties: [
+                "bundleID": stringSchema(description: "Opened app bundle ID"),
+                "name": stringSchema(description: "Application name"),
+                "running": booleanSchema(description: "Running status")
+            ], required: ["bundleID", "name", "running"]),
+            annotations: mutatingAnnotations
+        ),
+        MCPToolDefinition(
+            name: "ui_windows",
+            title: "List authorized app windows",
+            description: "List window indices and titles of the specified app. If unapproved, ask the local user to grant read permission in a targeted Harbor dialog. No screenshots.",
+            inputSchema: objectSchema(properties: [
+                "bundleID": stringSchema(description: "Exact authorized application bundle ID")
+            ], required: ["bundleID"]),
+            outputSchema: arraySchema(items: objectSchema(properties: [
+                "bundleID": stringSchema(description: "Bundle ID"),
+                "pid": integerSchema(minimum: 1),
+                "windowIndex": integerSchema(minimum: 0),
+                "title": stringSchema(description: "Window title")
+            ], required: ["bundleID", "pid", "windowIndex", "title"])),
+            annotations: readOnlyAnnotations
+        ),
+        MCPToolDefinition(
+            name: "ui_inspect",
+            title: "Read authorized macOS UI",
+            description: "Read a bounded Accessibility element tree of one exact app window: roles, labels, enabled/selected state; hides password and editable field values. Requests per-app read authorization on first use.",
+            inputSchema: objectSchema(properties: [
+                "bundleID": stringSchema(description: "Exact authorized bundle ID"),
+                "windowIndex": integerSchema(minimum: 0),
+                "windowTitle": stringSchema(description: "Exact current window title")
+            ], required: ["bundleID", "windowIndex", "windowTitle"]),
+            outputSchema: uiTreeSchema,
+            annotations: readOnlyAnnotations
+        ),
+        MCPToolDefinition(
+            name: "ui_perform",
+            title: "Operate one authorized UI element",
+            description: "Perform click, type or scroll on one element of an exact app window. Requests per-app control permission on first use; rejects security/authorization buttons and secure text inputs. Returns fresh before and after AX snapshots (not proof of an external side effect).",
+            inputSchema: objectSchema(properties: [
+                "bundleID": stringSchema(description: "Exact authorized bundle ID"),
+                "windowIndex": integerSchema(minimum: 0),
+                "windowTitle": stringSchema(description: "Exact window title"),
+                "elementID": stringSchema(description: "AX element ID from ui_inspect"),
+                "expectedLabel": stringSchema(description: "Exact label to prevent stale clicks"),
+                "operation": stringSchema(description: "click, type, scroll_up or scroll_down"),
+                "text": stringSchema(description: "New input text; never returned in audit logs")
+            ], required: ["bundleID", "windowIndex", "windowTitle",
+                          "elementID", "expectedLabel", "operation"]),
+            outputSchema: objectSchema(properties: [
+                "operation": stringSchema(description: "Applied AX action"),
+                "target": stringSchema(description: "Selected app/window/element"),
+                "succeeded": booleanSchema(description: "AX operation returned success"),
+                "before": uiTreeSchema, "after": uiTreeSchema,
+                "explanation": stringSchema(description: "Outcome qualification")
+            ], required: ["operation", "target", "succeeded", "before", "after", "explanation"]),
+            annotations: mutatingAnnotations
+        ),
+        MCPToolDefinition(
+            name: "ui_capture",
+            title: "Capture one authorized app window",
+            description: "Opt-in single JPEG frame for visual alignment/overlap checks. On first use, requests an independent per-app capture grant in Harbor; also requires macOS Screen Recording permission for HarborChatGPTAgent. No stream, no desktop capture, no disk recording.",
+            inputSchema: objectSchema(properties: [
+                "bundleID": stringSchema(description: "Exact authorized app bundle ID"),
+                "windowIndex": integerSchema(minimum: 0),
+                "windowTitle": stringSchema(description: "Exact selected window title")
+            ], required: ["bundleID", "windowIndex", "windowTitle"]),
+            outputSchema: objectSchema(properties: [
+                "bundleID": stringSchema(description: "Authorized bundle ID"),
+                "windowTitle": stringSchema(description: "Target window"),
+                "width": integerSchema(minimum: 1),
+                "height": integerSchema(minimum: 1),
+                "imageFormat": stringSchema(description: "image/jpeg"),
+                "base64": stringSchema(description: "Only available internally; MCP returns native image blocks")
+            ], required: ["bundleID", "windowTitle", "width", "height", "imageFormat"]),
+            annotations: readOnlyAnnotations
+        ),
+        MCPToolDefinition(
+            name: "ui_test",
+            title: "Run a bounded macOS UI test",
+            description: "Run at most eight explicitly targeted Accessibility actions, each with an optional real UI postcondition. Stop on first error. Returns step-by-step results without logging typed text. Requests app control grant from local user on first use.",
+            inputSchema: objectSchema(properties: [
+                "bundleID": stringSchema(description: "Authorized app bundle ID"),
+                "windowIndex": integerSchema(minimum: 0),
+                "windowTitle": stringSchema(description: "Exact window title"),
+                "steps": arraySchema(items: objectSchema(properties: [
+                    "elementID": stringSchema(description: "Element ID from ui_inspect"),
+                    "expectedLabel": stringSchema(description: "Exact element label"),
+                    "operation": stringSchema(description: "click, type, scroll_up, scroll_down"),
+                    "text": stringSchema(description: "Text to enter, never logged"),
+                    "expectContains": stringSchema(description: "Expected text that must appear after operation"),
+                    "expectWindowGone": booleanSchema(description: "Alternatively assert the target window disappears")
+                ], required: ["elementID", "expectedLabel", "operation"]))
+            ], required: ["bundleID", "windowIndex", "windowTitle", "steps"]),
+            outputSchema: objectSchema(properties: [
+                "bundleID": stringSchema(description: "Authorized bundle ID"),
+                "windowTitle": stringSchema(description: "Selected window"),
+                "passed": booleanSchema(description: "All steps passed"),
+                "steps": arraySchema(items: objectSchema(properties: [
+                    "index": integerSchema(minimum: 0),
+                    "operation": stringSchema(description: "Performed operation"),
+                    "passed": booleanSchema(description: "Step passed"),
+                    "message": stringSchema(description: "Observed result or failure reason")
+                ], required: ["index", "operation", "passed", "message"])),
+                "durationMilliseconds": integerSchema(minimum: 0)
+            ], required: ["bundleID", "windowTitle", "passed", "steps", "durationMilliseconds"]),
+            annotations: mutatingAnnotations
+        ),
+        MCPToolDefinition(
+            name: "ui_wait_window",
+            title: "Wait for a new macOS window",
+            description: "Poll visible windows of a targeted app for a real window title. Requests a local per-app read grant on first use, including read-only inspection of Harbor's own approval panel. Never clicks permission dialogs.",
+            inputSchema: objectSchema(properties: [
+                "bundleID": stringSchema(description: "Authorized app bundle ID"),
+                "titleContains": stringSchema(description: "Window title substring"),
+                "timeoutSeconds": integerSchema(minimum: 1, maximum: 20)
+            ], required: ["bundleID", "titleContains"]),
+            outputSchema: objectSchema(properties: [
+                "bundleID": stringSchema(description: "Bundle ID"),
+                "pid": integerSchema(minimum: 1),
+                "windowIndex": integerSchema(minimum: 0),
+                "title": stringSchema(description: "Detected window title")
+            ], required: ["bundleID", "pid", "windowIndex", "title"]),
+            annotations: readOnlyAnnotations
+        ),
+        MCPToolDefinition(
+            name: "ui_wait",
+            title: "Wait for a real UI state",
+            description: "Poll the authorized Accessibility tree for a specific visible label or non-editable value instead of sleeping a fixed number of seconds. Maximum 20 seconds.",
+            inputSchema: objectSchema(properties: [
+                "bundleID": stringSchema(description: "Exact authorized bundle ID"),
+                "windowIndex": integerSchema(minimum: 0),
+                "windowTitle": stringSchema(description: "Exact window title"),
+                "containsText": stringSchema(description: "Expected label/value substring"),
+                "timeoutSeconds": integerSchema(minimum: 1, maximum: 20)
+            ], required: ["bundleID", "windowIndex", "windowTitle", "containsText"]),
+            outputSchema: uiTreeSchema,
+            annotations: readOnlyAnnotations
+        ),
+        MCPToolDefinition(
             name: "repair_project",
             title: "Repair Swift project",
             description: "Run a permission-aware Swift repair workflow: inspect Git, test, optionally apply a reviewed unified diff, retest, and build.",
@@ -562,6 +719,22 @@ enum MCPToolCatalog {
             annotations: mutatingAnnotations
         )
     ]
+
+    private static let uiTreeSchema = objectSchema(properties: [
+        "bundleID": stringSchema(description: "Authorized app bundle ID"),
+        "windowTitle": stringSchema(description: "Exact selected window title"),
+        "windowIndex": integerSchema(minimum: 0),
+        "elements": arraySchema(items: objectSchema(properties: [
+            "id": stringSchema(description: "Ephemeral element path; re-inspect after UI changes"),
+            "role": stringSchema(description: "AX role"),
+            "label": stringSchema(description: "Text or label, redacted for sensitive input"),
+            "value": stringSchema(description: "Non-editable non-sensitive control value"),
+            "enabled": booleanSchema(description: "Enabled state"),
+            "selected": booleanSchema(description: "Selection state when available"),
+            "actions": stringArraySchema
+        ], required: ["id", "role", "label", "enabled", "actions"])),
+        "truncated": booleanSchema(description: "AX tree bounded at 160 nodes / six levels")
+    ], required: ["bundleID", "windowTitle", "windowIndex", "elements", "truncated"])
 
     private static let workspacePathOperationSchema = objectSchema(
         properties: [

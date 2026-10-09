@@ -51,7 +51,7 @@ struct LiveTransportSwitchTests {
                     let (getStatus, initializeStatus, listStatus, toolCount, calledWorkspace) = try await probeMCP(url: url)
                     print("FIELD: public GET=\(getStatus) initialize=\(initializeStatus) tools/list=\(listStatus) tools=\(toolCount) tools/call=\(calledWorkspace)")
                     if getStatus != 200 || initializeStatus != 200 ||
-                        listStatus != 200 || toolCount != 30 || !calledWorkspace {
+                        listStatus != 200 || toolCount != MCPToolCatalogMetadata.toolCount || !calledWorkspace {
                         findings.append("Public HTTPS MCP protocol or read-only tool-call checks did not all succeed")
                     }
                 } catch {

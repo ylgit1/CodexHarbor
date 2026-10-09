@@ -1,0 +1,31 @@
+name: CodexHarbor CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-validation:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: swift --version
+      - name: Unit and integration tests
+        run: swift test --parallel
+      - name: Release build and package verification
+        env:
+          CODEX_HARBOR_BUILD_JOBS: "4"
+        run: |
+          ./Scripts/build-app.sh fast --no-install
+          codesign --verify --deep --strict "dist/Codex Harbor.app"
+          plutil -lint "dist/Codex Harbor.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "dist/Codex Harbor.app/Contents/Info.plist"
+      - name: Check formatting errors
+        run: git diff --check

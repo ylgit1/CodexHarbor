@@ -761,7 +761,8 @@ struct HarborChatGPTAgentMain {
             configuration: configuration,
             auditLogger: auditLogger,
             approvalStore: approvalStore,
-            workspaceSessionStore: workspaceSessionStore
+            workspaceSessionStore: workspaceSessionStore,
+            codingTaskJournalDirectory: paths.root.appendingPathComponent("coding-task-journal", isDirectory: true)
         )
         let secretStore = BridgeSecretStore()
         let localMCPAccessToken = try secretStore.localMCPAccessToken()

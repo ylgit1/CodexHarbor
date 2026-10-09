@@ -1,9 +1,24 @@
 import CodexHarborCore
+import ChatGPTBridgeCore
+import AppKit
 import Foundation
 import SwiftUI
 
+@MainActor
+final class HarborApplicationDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Authorization is an app-level service, not owned by a window or
+        // SwiftUI view. A closed window must not disable approval prompts.
+        HarborApprovalPanelController.shared.start()
+        // Screenshot requests are executed in this foreground, user-authorized
+        // GUI process. The headless Agent only forwards exact-window requests.
+        HarborUICaptureSocket.Server.shared.start()
+    }
+}
+
 @main
 struct CodexHarborApp: App {
+    @NSApplicationDelegateAdaptor(HarborApplicationDelegate.self) private var appDelegate
     @StateObject private var model: AppModel
 
     init() {

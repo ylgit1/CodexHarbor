@@ -238,6 +238,27 @@ public actor MCPServer {
                     sessionID: context.sessionID
                 )
             )
+            if name == "ui_capture",
+               var metadata = value.objectValue,
+               let imageData = metadata.removeValue(forKey: "base64")?.stringValue {
+                // Return an MCP-native image block: the receiving model can
+                // inspect the frame, not just an opaque base64 text string.
+                // Exclude image bytes from structuredContent and audit output.
+                return MCPJSONRPCResponse(
+                    id: request.id,
+                    result: completeResult([
+                        "content": .array([
+                            .object([
+                                "type": .string("image"),
+                                "mimeType": .string("image/jpeg"),
+                                "data": .string(imageData)
+                            ])
+                        ]),
+                        "structuredContent": .object(metadata),
+                        "isError": .bool(false)
+                    ])
+                )
+            }
             return MCPJSONRPCResponse(
                 id: request.id,
                 result: completeResult([

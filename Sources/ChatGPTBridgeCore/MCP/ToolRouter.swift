@@ -23,6 +23,7 @@ public actor ToolRouter {
     private let auditLogger: AuditLogger
     private let approvalStore: BridgeApprovalStore?
     private let workspaceSessionStore: WorkspaceSessionStore
+    private let uiAutomationPaths: BridgePaths?
 
     public init(
         workspaceManager: WorkspaceManager,
@@ -30,8 +31,11 @@ public actor ToolRouter {
         auditLogger: AuditLogger,
         approvalStore: BridgeApprovalStore? = nil,
         workspaceSessionStore: WorkspaceSessionStore = WorkspaceSessionStore(),
-        trashRoot: URL? = nil
+        trashRoot: URL? = nil,
+        codingTaskJournalDirectory: URL? = nil,
+        uiAutomationPaths: BridgePaths? = nil
     ) {
+        self.uiAutomationPaths = uiAutomationPaths
         self.workspaceManager = workspaceManager
         self.auditLogger = auditLogger
         self.approvalStore = approvalStore
@@ -102,8 +106,53 @@ public actor ToolRouter {
             patchTool: patchTool,
             gitService: gitService,
             commandSessionManager: commandSessionManager,
-            auditLogger: auditLogger
+            auditLogger: auditLogger,
+            journalDirectory: codingTaskJournalDirectory
         )
+    }
+
+    private func uiPaths() throws -> BridgePaths {
+        if let uiAutomationPaths { return uiAutomationPaths }
+        return try BridgePaths.live()
+    }
+
+    /// Ask only when a tool needs a specific app and capability.
+    /// The local Harbor panel persists consent; a remote tool call cannot.
+    private func authorizeUIIfNeeded(
+        bundleID: String, capability: HarborUIConsentStore.Capability
+    ) async throws {
+        guard HarborUIAuthorization.isValidTarget(bundleID) else {
+            throw BridgeError.permissionDenied("目标应用不支持界面自动化授权")
+        }
+        let store = HarborUIConsentStore(paths: try uiPaths())
+        if store.allows(bundleID: bundleID, capability: capability) { return }
+        guard let approvalStore else {
+            throw BridgeError.permissionDenied("本地授权弹窗不可用，已拒绝访问 \(bundleID)")
+        }
+        // Unique per invocation: concurrent requests cannot borrow another
+        // command's decision or accidentally consume its approval.
+        let requestID = BridgeApprovalStore.requestID(
+            tool: HarborUIAuthorization.toolName(for: capability),
+            workspaceID: nil, target: bundleID, details: []
+        ) + "-" + UUID().uuidString
+        approvalStore.request(
+            id: requestID,
+            tool: HarborUIAuthorization.toolName(for: capability),
+            summary: "访问指定应用的界面",
+            target: bundleID
+        )
+        switch await approvalStore.waitForDecision(id: requestID) {
+        case .granted:
+            // Even an approved request is useless without the local GUI having
+            // actually written this exact capability for this exact app.
+            guard store.allows(bundleID: bundleID, capability: capability) else {
+                throw BridgeError.permissionDenied("本地授权未保存，已拒绝访问 \(bundleID)")
+            }
+        case .denied:
+            throw BridgeError.permissionDenied("用户已拒绝对 \(bundleID) 的界面授权")
+        case .pending, .none:
+            throw BridgeError.approvalRequired("等待应用界面授权超时：\(bundleID)")
+        }
     }
 
     public func definitions() -> [MCPToolDefinition] {
@@ -118,6 +167,138 @@ public actor ToolRouter {
         let startedAt = Date()
         do {
             switch name {
+            // UI automation is intentionally independent of workspace roots.
+            // Consent is requested on demand and granted only by a user's
+            // click on Harbor's local approval panel, never by MCP itself.
+            case "ui_apps":
+                let service = await HarborUIAutomationService(paths: try uiPaths())
+                return try JSONValue.encoded(await service.runningApps())
+
+            case "ui_open_app":
+                let service = await HarborUIAutomationService(paths: try uiPaths())
+                let bundleID = try requiredString("bundleID", in: arguments)
+                try await authorizeUIIfNeeded(bundleID: bundleID, capability: .read)
+                let app = try await service.open(bundleID: bundleID)
+                try? await auditLogger.record(AuditEntry(
+                    tool: "ui_open_app", workspaceID: nil, target: bundleID,
+                    status: .success, durationMilliseconds: 0,
+                    summary: "Opened locally authorized application"
+                ))
+                return try JSONValue.encoded(app)
+
+            case "ui_windows":
+                let service = await HarborUIAutomationService(paths: try uiPaths())
+                let bundleID = try requiredString("bundleID", in: arguments)
+                try await authorizeUIIfNeeded(bundleID: bundleID, capability: .read)
+                return try JSONValue.encoded(try await service.windows(bundleID: bundleID))
+
+            case "ui_inspect":
+                let service = await HarborUIAutomationService(paths: try uiPaths())
+                let bundleID = try requiredString("bundleID", in: arguments)
+                try await authorizeUIIfNeeded(bundleID: bundleID, capability: .read)
+                return try JSONValue.encoded(try await service.inspect(
+                    bundleID: bundleID,
+                    windowIndex: try requiredInt("windowIndex", in: arguments),
+                    windowTitle: requiredString("windowTitle", in: arguments)
+                ))
+
+            case "ui_perform":
+                let service = await HarborUIAutomationService(paths: try uiPaths())
+                let bundleID = try requiredString("bundleID", in: arguments)
+                let operation = try requiredString("operation", in: arguments)
+                try await authorizeUIIfNeeded(bundleID: bundleID, capability: .control)
+                let result = try await service.perform(
+                    bundleID: bundleID,
+                    windowIndex: try requiredInt("windowIndex", in: arguments),
+                    windowTitle: requiredString("windowTitle", in: arguments),
+                    elementID: requiredString("elementID", in: arguments),
+                    expectedLabel: requiredString("expectedLabel", in: arguments),
+                    operation: operation,
+                    text: optionalString("text", in: arguments)
+                )
+                try? await auditLogger.record(AuditEntry(
+                    tool: "ui_perform", workspaceID: nil, target: bundleID,
+                    status: .success, durationMilliseconds: 0,
+                    summary: "AX \\(operation) succeeded; no entered text logged"
+                ))
+                return try JSONValue.encoded(result)
+
+            case "ui_capture":
+                let bundleID = try requiredString("bundleID", in: arguments)
+                try await authorizeUIIfNeeded(bundleID: bundleID, capability: .capture)
+                // Run ScreenCaptureKit in the foreground signed app; invoking
+                // it from the headless launchd Agent may crash CGS initialization.
+                let result = try await HarborUICaptureSocket.capture(
+                    paths: try uiPaths(),
+                    bundleID: bundleID,
+                    windowIndex: try requiredInt("windowIndex", in: arguments),
+                    windowTitle: requiredString("windowTitle", in: arguments)
+                )
+                try? await auditLogger.record(AuditEntry(
+                    tool: "ui_capture", workspaceID: nil, target: bundleID,
+                    status: .success, durationMilliseconds: 0,
+                    summary: "One authorized window frame captured; image not stored in audit"
+                ))
+                return try JSONValue.encoded(result)
+
+            case "ui_test":
+                let service = await HarborUIAutomationService(paths: try uiPaths())
+                let bundleID = try requiredString("bundleID", in: arguments)
+                let values = arguments["steps"]?.arrayValue ?? []
+                guard !values.isEmpty, values.count <= 8 else {
+                    throw ToolRouterError.invalidArguments("ui_test 只允许 1–8 个步骤")
+                }
+                let steps = try values.map { value -> HarborUITestStep in
+                    guard let fields = value.objectValue,
+                          let id = fields["elementID"]?.stringValue,
+                          let label = fields["expectedLabel"]?.stringValue,
+                          let action = fields["operation"]?.stringValue else {
+                        throw ToolRouterError.invalidArguments("每步需要 elementID/expectedLabel/operation")
+                    }
+                    return HarborUITestStep(
+                        elementID: id, expectedLabel: label, operation: action,
+                        text: fields["text"]?.stringValue,
+                        expectContains: fields["expectContains"]?.stringValue,
+                        expectWindowGone: fields["expectWindowGone"]?.boolValue ?? false
+                    )
+                }
+                try await authorizeUIIfNeeded(bundleID: bundleID, capability: .control)
+                let report = await service.runTest(
+                    bundleID: bundleID,
+                    windowIndex: try requiredInt("windowIndex", in: arguments),
+                    windowTitle: try requiredString("windowTitle", in: arguments),
+                    steps: steps
+                )
+                try? await auditLogger.record(AuditEntry(
+                    tool: "ui_test", workspaceID: nil, target: bundleID,
+                    status: report.passed ? .success : .failure,
+                    durationMilliseconds: report.durationMilliseconds,
+                    summary: "AX test \(report.steps.count) steps, passed=\(report.passed)"
+                ))
+                return try JSONValue.encoded(report)
+
+            case "ui_wait_window":
+                let service = await HarborUIAutomationService(paths: try uiPaths())
+                let bundleID = try requiredString("bundleID", in: arguments)
+                try await authorizeUIIfNeeded(bundleID: bundleID, capability: .read)
+                return try JSONValue.encoded(try await service.waitForWindow(
+                    bundleID: bundleID,
+                    titleContains: requiredString("titleContains", in: arguments),
+                    timeoutSeconds: try optionalInt("timeoutSeconds", in: arguments) ?? 10
+                ))
+
+            case "ui_wait":
+                let service = await HarborUIAutomationService(paths: try uiPaths())
+                let bundleID = try requiredString("bundleID", in: arguments)
+                try await authorizeUIIfNeeded(bundleID: bundleID, capability: .read)
+                return try JSONValue.encoded(try await service.waitFor(
+                    bundleID: bundleID,
+                    windowIndex: try requiredInt("windowIndex", in: arguments),
+                    windowTitle: requiredString("windowTitle", in: arguments),
+                    containsText: requiredString("containsText", in: arguments),
+                    timeoutSeconds: try optionalInt("timeoutSeconds", in: arguments) ?? 10
+                ))
+
             case "open_workspace":
                 let path = try requiredString("path", in: arguments)
                 let result = try await openWorkspaceTool.execute(path: path)
@@ -713,30 +894,47 @@ public actor ToolRouter {
                 )
                 let target = approvalTarget(name: name, arguments: arguments)
                 let details = approvalDetails(name: name, arguments: arguments)
-                var rememberScope: BridgeApprovalScope?
+                var validatedScope: BridgeApprovalScope?
                 if let workspace, let resolved = try? await workspaceManager.workspace(id: workspace) {
-                    rememberScope = BridgeApprovalScope.make(
+                    validatedScope = BridgeApprovalScope.make(
                         workspacePath: resolved.rootPath, tool: name, target: target, details: details
                     )
                 }
-                // This is reached only for an ask decision. Explicit denials,
-                // blocked commands and path validation still run on execution.
+                // Reject obviously invalid file targets before opening the
+                // approval prompt. The mutation tool still revalidates paths.
+                if ["edit", "write", "patch_file", "create_directory",
+                    "move_path", "trash_path"].contains(name),
+                   validatedScope == nil {
+                    throw BridgeError.invalidPath(target ?? ".")
+                }
+                // Exact, repeatable build/test or process-inspection commands
+                // can be remembered. Arbitrary shell, network, destructive
+                // and Git commands remain strictly one-shot.
+                let rememberScope = BridgeApprovalScope.mayRemember(
+                    tool: name, details: details
+                ) ? validatedScope : nil
+                // This is reached only for an ask decision. Explicit denials
+                // and workspace path validation still run on execution.
                 if let rememberScope, approvalStore.hasRememberedApproval(rememberScope) {
                     return try await execute(name: name, arguments: arguments,
                         context: ToolExecutionContext(approvalGranted: true, sessionID: context.sessionID))
                 }
+                // Every invocation has its own decision. A deterministic
+                // content fingerprint alone lets two identical concurrent
+                // calls accidentally share or consume one approval.
                 let requestID = BridgeApprovalStore.requestID(
                     tool: name,
                     workspaceID: workspace,
                     target: target,
                     details: details
-                )
+                ) + "-" + UUID().uuidString
                 approvalStore.request(
                     id: requestID,
                     tool: name,
-                    summary: operation,
+                    summary: approvalDisplaySummary(name: name, arguments: arguments, fallback: operation),
                     target: target,
-                    rememberScope: rememberScope
+                    rememberScope: rememberScope,
+                    actionDescription: BridgeApprovalPresentation.describe(tool: name, arguments: arguments)
                 )
                 switch await approvalStore.waitForDecision(id: requestID) {
                 case .granted:
@@ -895,6 +1093,13 @@ public actor ToolRouter {
         arguments[key]?.boolValue
     }
 
+    private func requiredInt(_ key: String, in arguments: [String: JSONValue]) throws -> Int {
+        guard let value = try optionalInt(key, in: arguments) else {
+            throw ToolRouterError.invalidArguments("缺少必填整数参数 \(key)")
+        }
+        return value
+    }
+
     private func optionalInt(_ key: String, in arguments: [String: JSONValue]) throws -> Int? {
         guard let value = arguments[key] else { return nil }
         guard let integer = value.intValue else {
@@ -959,23 +1164,10 @@ public actor ToolRouter {
         details: [String],
         fallback: Bool
     ) throws -> Bool {
-        guard let approvalStore else { return fallback }
-        let id = BridgeApprovalStore.requestID(
-            tool: tool,
-            workspaceID: workspaceID,
-            target: target,
-            details: details
-        )
-        switch approvalStore.consumeDecision(id: id) {
-        case .granted:
-            return true
-        case .denied:
-            throw BridgeError.permissionDenied("用户已拒绝 \(tool) 操作")
-        case .pending:
-            return false
-        case .none:
-            return fallback
-        }
+        // A decision belongs only to the suspended invocation in
+        // waitForDecision. Never let a later call silently consume a previous
+        // invocation's saved authorization by matching its command hash.
+        return fallback
     }
 
     private func automaticApproval(
@@ -1005,6 +1197,59 @@ public actor ToolRouter {
             }
         }
         return modifyingFiles || command != nil || workflowCommands != nil
+    }
+
+    /// User-facing approval text is specific to the invocation. Do not show
+    /// generic "execute project operation" labels or persist file contents in
+    /// the approval record. Shell arguments are displayed in full so the
+    /// user can distinguish two otherwise similar commands.
+    private func approvalDisplaySummary(
+        name: String,
+        arguments: [String: JSONValue],
+        fallback: String
+    ) -> String {
+        let path = arguments["path"]?.stringValue ?? "（未指定路径）"
+        switch name {
+        case "edit":
+            let before = arguments["oldText"]?.stringValue?.utf8.count ?? 0
+            let after = arguments["newText"]?.stringValue?.utf8.count ?? 0
+            return "在 \(path) 精确替换 1 处文本（\(before) → \(after) 字节）"
+        case "patch_file":
+            let mode = arguments["mode"]?.stringValue ?? "old_new"
+            if mode == "line_range",
+               let start = arguments["startLine"]?.intValue,
+               let end = arguments["endLine"]?.intValue {
+                return "替换 \(path) 第 \(start)–\(end) 行"
+            }
+            return "对 \(path) 应用 \(mode) 补丁"
+        case "write":
+            let overwrite = arguments["overwrite"]?.boolValue ?? false
+            let count = arguments["content"]?.stringValue?.utf8.count ?? 0
+            return "\(overwrite ? "允许覆盖写入" : "创建文件")：\(path)（\(count) 字节）"
+        case "create_directory":
+            return "创建目录：\(path)"
+        case "move_path":
+            let destination = arguments["destination"]?.stringValue ?? "（未知目标）"
+            return "移动：\(path) → \(destination)"
+        case "trash_path":
+            return "将 \(path) 移入回收站"
+        case "restore_path":
+            return "恢复回收站记录：\(arguments["trashId"]?.stringValue ?? "（未知 ID）")"
+        case "bash", "run_command", "start_command":
+            guard let executable = arguments["executable"]?.stringValue else { return fallback }
+            let argv = (arguments["arguments"]?.arrayValue ?? []).compactMap(\.stringValue)
+            return ([executable] + argv).map { arg in
+                arg.rangeOfCharacter(from: .whitespacesAndNewlines) == nil
+                    ? arg
+                    : String(reflecting: arg)
+            }.joined(separator: " ")
+        case "start_workflow", "run_workflow":
+            let tests = arguments["includeTests"]?.boolValue != false ? "是" : "否"
+            let build = arguments["includeBuild"]?.boolValue != false ? "是" : "否"
+            return "运行项目工作流（测试：\(tests)，构建：\(build)）"
+        default:
+            return fallback
+        }
     }
 
     private func approvalTarget(name: String, arguments: [String: JSONValue]) -> String? {

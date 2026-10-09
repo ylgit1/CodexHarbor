@@ -88,10 +88,73 @@ mkdir -p "$staging_app_path/Contents/MacOS" "$staging_app_path/Contents/Helpers"
 cp "$build_root/release/CodexHarbor" "$staging_app_path/Contents/MacOS/CodexHarbor"
 cp "$build_root/release/HarborChatGPTAgent" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
 cp "$project_root/Resources/Info.plist" "$staging_app_path/Contents/Info.plist"
+# Stamp builds with a monotonic revision and exact Git commit.
+build_number="$(git -C "$project_root" rev-list --count HEAD 2>/dev/null || echo 13)"
+build_commit="$(git -C "$project_root" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+if [[ -n "$(git -C "$project_root" status --porcelain 2>/dev/null)" ]]; then
+  build_commit="${build_commit}-dirty"
+fi
+release_tag="$(git -C "$project_root" describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null || true)"
+if [[ "$build_number" == <-> ]]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build_number" "$staging_app_path/Contents/Info.plist"
+fi
+if [[ "$release_tag" =~ '^v[0-9]+\\.[0-9]+\\.[0-9]+$' ]]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${release_tag#v}" "$staging_app_path/Contents/Info.plist"
+fi
+/usr/libexec/PlistBuddy -c "Add :HarborGitCommit string $build_commit" "$staging_app_path/Contents/Info.plist"
+echo "==> 版本标记：${release_tag:-development} (${build_number}) · $build_commit"
 cp "$project_root/Resources/AppIcon.icns" "$staging_app_path/Contents/Resources/AppIcon.icns"
 chmod 755 "$staging_app_path/Contents/MacOS/CodexHarbor" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
-codesign --force --sign - "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
-codesign --force --deep --sign - "$staging_app_path"
+# Sign with the same certificate on every build so the Agent retains its
+# designated requirement (DR) across binary updates. Stable identifiers alone
+# do NOT make ad-hoc signatures persistent in macOS TCC.
+#
+# Explicit CODEX_HARBOR_SIGN_IDENTITY overrides auto-detection, and "-" forces
+# ad-hoc signing. Prefer Apple Development for local builds, Developer ID for
+# distributed builds with an appropriate notarization workflow.
+sign_identity="${CODEX_HARBOR_SIGN_IDENTITY:-auto}"
+if [[ "$sign_identity" == "auto" ]]; then
+  available_identities="$(/usr/bin/security find-identity -v -p codesigning 2>/dev/null || true)"
+  # If the installed Agent has a certificate, keep using that exact identity;
+  # changing from Apple Development to Developer ID would itself reset TCC.
+  installed_agent="$installed_app_path/Contents/Helpers/HarborChatGPTAgent"
+  if [[ -x "$installed_agent" ]]; then
+    prior_signer="$(/usr/bin/codesign -dv --verbose=4 "$installed_agent" 2>&1 |
+      /usr/bin/awk -F= '/^Authority=(Apple Development: |Developer ID Application: |Codex Harbor Local Code Signing)/ { if (name == "") name = $2 } END { print name }')"
+    if [[ -n "$prior_signer" && "$available_identities" == *"$prior_signer"* ]]; then
+      sign_identity="$prior_signer"
+      echo "==> 沿用已安装 Agent 的签名证书，避免升级时更换身份"
+    fi
+  fi
+  if [[ "$sign_identity" == "auto" ]]; then
+    sign_identity="$(print -r -- "$available_identities" | /usr/bin/awk -F '"' '/"Apple Development: / { if (name == "") name = $2 } END { print name }')"
+  fi
+  if [[ -z "$sign_identity" ]]; then
+    sign_identity="$(print -r -- "$available_identities" | /usr/bin/awk -F '"' '/"Developer ID Application: / { print $2; exit }')"
+  fi
+  # Free local-only alternative: a persistent self-signed Code Signing
+  # identity created once with Keychain Access Certificate Assistant.
+  if [[ -z "$sign_identity" ]]; then
+    sign_identity="$(print -r -- "$available_identities" | /usr/bin/awk -F '"' '/"Codex Harbor Local Code Signing"/ { if (name == "") name = $2 } END { print name }')"
+  fi
+  if [[ -z "$sign_identity" ]]; then sign_identity="-"; fi
+fi
+if [[ "$sign_identity" != "-" ]]; then
+  if [[ "$(/usr/bin/security find-identity -v -p codesigning)" != *"$sign_identity"* ]]; then
+    echo "未找到有效的签名证书：$sign_identity" >&2
+    exit 6
+  fi
+  echo "==> 稳定代码签名身份：$sign_identity"
+else
+  echo "==> 警告：没有有效的持久代码签名身份，当前只能 ad-hoc 签名。" >&2
+  echo "    更新 Agent 后，macOS 可能要求重新开启辅助功能和屏幕录制授权。" >&2
+  echo "    免费方案：用钥匙串访问 → 证书助理创建「Codex Harbor Local Code Signing」自签名代码签名证书。" >&2
+  echo "    或者登录 Xcode 的免费 Apple Account / Personal Team 创建开发证书。" >&2
+fi
+# Sign nested executable first, then the enclosing app. Avoid --deep when
+# signing: it can re-sign nested code with an unexpected identity.
+codesign --force --sign "$sign_identity" --identifier "com.codexharbor.agent" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
+codesign --force --sign "$sign_identity" "$staging_app_path"
 
 codesign --verify --deep --strict "$staging_app_path"
 plutil -lint "$staging_app_path/Contents/Info.plist"

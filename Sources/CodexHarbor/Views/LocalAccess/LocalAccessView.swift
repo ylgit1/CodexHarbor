@@ -104,121 +104,166 @@ struct HarborLocalAccessView: View {
     }
 
     private var headerSection: some View {
-        let serviceRunning = bridge.agentRunning || bridge.runtime.agent == .starting
-        let statusTitle = serviceRunning
-            ? (bridge.overallReady ? "服务运行中" : "服务连接中")
-            : "启动服务"
-        let statusColor = serviceRunning
-            ? (bridge.overallReady ? HarborColors.green : HarborColors.orange)
-            : Color.secondary
-        let selectedIsActive = selectedMode == bridge.configuration.transportMode
-        let selectedIsConfigured = isConfigured(selectedMode)
-        let busy = operation != nil || bridge.isWorking || bridge.isSwitchingTransport || bridge.isDiagnosing
-        let canDetect = selectedIsActive
-            && serviceRunning
-            && !bridge.configuration.allowedRoots.isEmpty
-        let canReconnect = selectedIsActive
-            && selectedIsConfigured
-            && serviceRunning
-            && !bridge.configuration.allowedRoots.isEmpty
-        let canSwitch = serviceRunning
-            && !selectedIsActive
-            && selectedIsConfigured
-            && !bridge.configuration.allowedRoots.isEmpty
-        let canToggleService = serviceRunning
-            || (selectedIsConfigured && !bridge.configuration.allowedRoots.isEmpty)
-
-        return HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("ChatGPT 接入")
-                    .font(.system(size: 22, weight: .bold, design: .rounded))
-                Text("查看真实链路状态，管理授权目录与连接方式。")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
+        // Prefer a single row, but let controls wrap into two compact rows
+        // before the window becomes too narrow to show every action.
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: 12) {
+                headerHeading
+                Spacer(minLength: 8)
+                headerControls
             }
-
-            Spacer(minLength: 14)
-
-            Button {
-                if serviceRunning {
-                    showCloseConfirmation = true
-                } else {
-                    beginStartOperation()
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(statusColor)
-                        .frame(width: 7, height: 7)
-                    Text(statusTitle)
-                        .lineLimit(1)
-                }
-                .frame(width: 92)
+            VStack(alignment: .leading, spacing: 10) {
+                headerHeading
+                headerControls
             }
-            .buttonStyle(HarborActionButtonStyle(
-                tint: serviceRunning ? statusColor : HarborColors.blue,
-                prominence: .secondary
-            ))
-            .disabled(!canToggleService || busy)
-            .help(
-                serviceRunning
-                    ? "关闭服务"
-                    : (selectedIsConfigured ? "启动\(selectedMode.displayName)" : "请先完成连接配置")
-            )
-
-            Button(action: beginConnectionTest) {
-                HStack(spacing: 6) {
-                    if bridge.isDiagnosing {
-                        ProgressView().controlSize(.mini)
-                    } else {
-                        Image(systemName: testFeedback?.state == .success ? "checkmark" : "waveform.path.ecg")
-                    }
-                    Text(bridge.isDiagnosing ? "检测中…" : "检测")
-                        .lineLimit(1)
-                }
-                .frame(width: 66)
-            }
-            .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-            .disabled(!canDetect || busy)
-            .help(canDetect ? "检测当前连接" : "请先选择当前正在使用的连接")
-
-            Button(action: beginReconnectOperation) {
-                Label("重新连接", systemImage: "arrow.clockwise")
-                    .lineLimit(1)
-                    .frame(width: 82)
-            }
-            .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-            .disabled(!canReconnect || busy)
-            .help(canReconnect ? "重新连接当前连接" : "请先选择当前正在使用的连接")
-
-            Button(action: beginSwitchOperation) {
-                Label("切换连接", systemImage: "arrow.left.arrow.right")
-                    .lineLimit(1)
-                    .frame(width: 82)
-            }
-            .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .prominent))
-            .disabled(!canSwitch || busy)
-            .help(
-                canSwitch
-                    ? "切换到\(selectedMode.displayName)"
-                    : (selectedIsActive ? "当前已经使用该连接" : "请先完成\(selectedMode.displayName)配置")
-            )
-
-            Button {
-                openChatGPTConfiguration(copyPublicAddress: true)
-            } label: {
-                Label(
-                    copiedHTTPSAddress ? "已复制并打开" : "去 ChatGPT 配置",
-                    systemImage: copiedHTTPSAddress ? "checkmark" : "arrow.up.right"
-                )
-                .lineLimit(1)
-                .frame(width: 118)
-            }
-            .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-            .disabled(busy)
         }
         .frame(minHeight: 46)
     }
+
+    private var headerHeading: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("ChatGPT 接入")
+                .font(.system(size: 22, weight: .bold, design: .rounded))
+            Text("查看真实链路状态，管理授权目录与连接方式。")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var headerControls: some View {
+        let serviceRunning = bridge.agentRunning || bridge.runtime.agent == .starting
+        let selectedIsActive = selectedMode == bridge.configuration.transportMode
+        let selectedIsConfigured = isConfigured(selectedMode)
+        let busy = operation != nil || bridge.isWorking || bridge.isSwitchingTransport || bridge.isDiagnosing
+        let hasRoots = !bridge.configuration.allowedRoots.isEmpty
+        let canDetect = selectedIsActive && serviceRunning && hasRoots
+        let canReconnect = canDetect && selectedIsConfigured
+        let canSwitch = serviceRunning && !selectedIsActive && selectedIsConfigured && hasRoots
+        let canToggleService = serviceRunning || (selectedIsConfigured && hasRoots)
+        let targetName = selectedMode == .secureTunnel ? "本地管道" : "公网 HTTPS"
+        let statusTitle = serviceRunning
+            ? (bridge.overallReady ? "服务运行中" : "服务连接中")
+            : "服务已关闭"
+        let statusColor = serviceRunning
+            ? (bridge.overallReady ? HarborColors.green : HarborColors.orange)
+            : Color.secondary
+
+        return ViewThatFits(in: .horizontal) {
+            HStack(spacing: 7) {
+                HarborStatusBadge(
+                    title: statusTitle,
+                    color: statusColor,
+                    pulses: serviceRunning && bridge.overallReady
+                )
+                serviceToggleButton(serviceRunning: serviceRunning, enabled: canToggleService && !busy)
+                detectButton(enabled: canDetect && !busy)
+                reconnectButton(enabled: canReconnect && !busy)
+                switchButton(targetName: targetName, enabled: canSwitch && !busy,
+                             isCurrent: selectedIsActive, configured: selectedIsConfigured)
+                chatGPTSettingsButton(enabled: !busy)
+            }
+            VStack(alignment: .trailing, spacing: 7) {
+                HStack(spacing: 7) {
+                    HarborStatusBadge(
+                        title: statusTitle,
+                        color: statusColor,
+                        pulses: serviceRunning && bridge.overallReady
+                    )
+                    serviceToggleButton(serviceRunning: serviceRunning, enabled: canToggleService && !busy)
+                    detectButton(enabled: canDetect && !busy)
+                    reconnectButton(enabled: canReconnect && !busy)
+                }
+                HStack(spacing: 7) {
+                    switchButton(targetName: targetName, enabled: canSwitch && !busy,
+                                 isCurrent: selectedIsActive, configured: selectedIsConfigured)
+                    chatGPTSettingsButton(enabled: !busy)
+                }
+            }
+        }
+    }
+
+    private func serviceToggleButton(serviceRunning: Bool, enabled: Bool) -> some View {
+        Button {
+            if serviceRunning {
+                showCloseConfirmation = true
+            } else {
+                beginStartOperation()
+            }
+        } label: {
+            Label(serviceRunning ? "关闭服务" : "启动服务",
+                  systemImage: serviceRunning ? "power" : "play.fill")
+                .lineLimit(1)
+                .frame(width: 76)
+        }
+        .buttonStyle(HarborActionButtonStyle(
+            tint: serviceRunning ? HarborColors.red : HarborColors.blue,
+            prominence: .secondary
+        ))
+        .disabled(!enabled)
+        .help(serviceRunning ? "关闭 ChatGPT 接入（需确认）" : "启动当前选择的连接方式")
+    }
+
+    private func detectButton(enabled: Bool) -> some View {
+        Button(action: beginConnectionTest) {
+            HStack(spacing: 6) {
+                if bridge.isDiagnosing {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Image(systemName: testFeedback?.state == .success
+                          ? "checkmark" : "waveform.path.ecg")
+                }
+                Text(bridge.isDiagnosing ? "检测中…" : "检测")
+                    .lineLimit(1)
+            }
+            .frame(width: 62)
+        }
+        .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+        .disabled(!enabled)
+        .help(enabled ? "检测当前连接" : "请先选择当前正在使用的连接")
+    }
+
+    private func reconnectButton(enabled: Bool) -> some View {
+        Button(action: beginReconnectOperation) {
+            Label("重新连接", systemImage: "arrow.clockwise")
+                .lineLimit(1)
+                .frame(width: 80)
+        }
+        .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+        .disabled(!enabled)
+        .help(enabled ? "重新连接当前连接" : "请先选择当前正在使用的连接")
+    }
+
+    private func switchButton(
+        targetName: String, enabled: Bool, isCurrent: Bool, configured: Bool
+    ) -> some View {
+        Button(action: beginSwitchOperation) {
+            Label(isCurrent ? "切换连接" : "切换至\(targetName)",
+                  systemImage: "arrow.left.arrow.right")
+                .lineLimit(1)
+                .frame(width: 143)
+        }
+        .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .prominent))
+        .disabled(!enabled)
+        .help(enabled ? "切换到\(targetName)" :
+              (isCurrent ? "当前已经使用该连接" : "请先完成\(targetName)配置"))
+    }
+
+    private func chatGPTSettingsButton(enabled: Bool) -> some View {
+        Button {
+            openChatGPTConfiguration(copyPublicAddress: true)
+        } label: {
+            Label(
+                copiedHTTPSAddress ? "已复制并打开" : "去 ChatGPT 配置",
+                systemImage: copiedHTTPSAddress ? "checkmark" : "arrow.up.right"
+            )
+            .lineLimit(1)
+            .frame(width: 118)
+        }
+        .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+        .disabled(!enabled)
+    }
+
 
     private var allowedRootsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -517,25 +562,9 @@ struct HarborLocalAccessView: View {
                 }
 
                 HStack(spacing: 8) {
-                    if selected && current {
-                        Label("当前连接", systemImage: "checkmark.circle.fill")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .foregroundStyle(HarborColors.green)
-                    } else if current {
-                        Label("当前使用", systemImage: "circle.fill")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .foregroundStyle(HarborColors.green)
-                    } else if selected {
-                        Label("已选择", systemImage: "checkmark.circle.fill")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .foregroundStyle(HarborColors.blue)
-                    } else {
-                        Text("点击卡片选择")
-                            .font(.system(size: 9.5, weight: .medium))
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Spacer()
+                    // The badge conveys runtime state; the outline conveys
+                    // which mode is selected for the header actions.
+                    Spacer(minLength: 0)
 
                     Button {
                         onConfigure(mode)
@@ -573,8 +602,25 @@ struct HarborLocalAccessView: View {
                             .lineLimit(1)
                         Spacer(minLength: 0)
                     }
+                } else if mode == .httpsCompatibility, configured,
+                          let hostname = bridge.configuration.httpsCompatibility?.hostname {
+                    HStack(spacing: 6) {
+                        Image(systemName: "globe")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Text("域名 · \(hostname)")
+                            .font(.system(size: 9.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(hostname)
+                        Spacer(minLength: 0)
+                    }
                 }
             }
+            // Reserve the same vertical space for both transport cards.
+            // The tunnel card can display an extra proxy detail row.
+            .frame(minHeight: 124, alignment: .topLeading)
         }
         .overlay(
             RoundedRectangle(cornerRadius: HarborRadius.card, style: .continuous)
@@ -986,27 +1032,52 @@ struct HarborLocalAccessView: View {
 
             Spacer()
 
+            let trusted = bridge.isTrustedDevelopmentRoot(root)
             Text(bridge.unrestrictedDevelopmentAccessEnabled
-                 ? "完全授权"
-                 : (bridge.isTrustedDevelopmentRoot(root) ? "可信开发" : "安全模式"))
+                 ? "完全授权" : (trusted ? "可信开发" : "安全模式"))
                 .font(.system(size: 9.5, weight: .medium))
-                .foregroundStyle(bridge.isTrustedDevelopmentRoot(root)
-                    || bridge.unrestrictedDevelopmentAccessEnabled ? HarborColors.orange : HarborColors.blue)
+                .foregroundStyle(trusted || bridge.unrestrictedDevelopmentAccessEnabled
+                                 ? HarborColors.orange : HarborColors.blue)
+                .frame(minWidth: 48, alignment: .trailing)
 
-            Button(bridge.isTrustedDevelopmentRoot(root) ? "取消信任" : "信任") {
-                Task { await bridge.setTrustedDevelopment(!bridge.isTrustedDevelopmentRoot(root), root: root) }
-            }
-            .buttonStyle(HarborActionButtonStyle(tint: .orange, prominence: .secondary))
+            // Trust, open, remove: grouped controls with explicit tooltips.
+            // Removal still invokes AppShellView's existing confirmation.
+            HStack(spacing: 5) {
+                Button {
+                    Task { await bridge.setTrustedDevelopment(!trusted, root: root) }
+                } label: {
+                    Image(systemName: trusted ? "checkmark.shield.fill" : "checkmark.shield")
+                        .frame(width: 18, height: 18)
+                }
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.orange, prominence: .secondary))
+                .help(trusted ? "撤销该目录的可信开发授权" : "将该目录设为可信开发")
+                .accessibilityLabel(trusted ? "撤销信任" : "信任目录")
 
-            Button("打开") {
-                NSWorkspace.shared.open(URL(fileURLWithPath: root))
-            }
-            .buttonStyle(HarborActionButtonStyle(tint: .blue, prominence: .secondary))
+                Rectangle()
+                    .fill(Color.primary.opacity(0.10))
+                    .frame(width: 1, height: 18)
+                    .padding(.horizontal, 2)
 
-            Button("删除", role: .destructive) {
-                onRemoveRoot(root)
+                Button {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: root))
+                } label: {
+                    Image(systemName: "folder")
+                        .frame(width: 18, height: 18)
+                }
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+                .help("在 Finder 中打开目录")
+                .accessibilityLabel("打开目录")
+
+                Button(role: .destructive) {
+                    onRemoveRoot(root)
+                } label: {
+                    Image(systemName: "trash")
+                        .frame(width: 18, height: 18)
+                }
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.red, prominence: .secondary))
+                .help("移除目录授权（需确认）")
+                .accessibilityLabel("移除目录")
             }
-            .buttonStyle(HarborActionButtonStyle(tint: HarborColors.red, prominence: .secondary))
         }
         .padding(.horizontal, 15)
         .frame(height: 62)

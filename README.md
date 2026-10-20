@@ -22,11 +22,12 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 
 ## 下载安装
 
-- [下载最新版 Codex Harbor（Apple Silicon / arm64）](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg)
-- [下载 v0.1.4 固定版本](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/v0.1.4/Codex-Harbor-v0.1.4-arm64.dmg)
+- [最新 DMG · GitHub 公共镜像（无需登录）](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.5/Codex-Harbor-v0.1.5-arm64.dmg)
+- [最新 DMG · Gitee 文件（访问大文件可能需要登录）](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg)
+- [Gitee v0.1.5 固定版本](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/v0.1.5/Codex-Harbor-v0.1.5-arm64.dmg)
 
-v0.1.4 DMG SHA-256：`2e0e2fbc8b1edba7794972884e9a0778a15ea71b02f58e738f1f4128fdce7cb2`。
-当前安装包要求 macOS 14 或更新版本及 Apple Silicon；Xray、`geoip.dat`、`geosite.dat`
+Gitee Raw 大文件可能要求用户登录；不能登录时使用 GitHub 下载镜像。
+要求 macOS 14 或更新版本及 Apple Silicon；Xray、`geoip.dat`、`geosite.dat`
 已内置，首次启动不需要下载代理内核。
 
 ## 核心能力

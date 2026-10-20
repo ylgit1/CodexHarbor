@@ -98,7 +98,7 @@ release_tag="$(git -C "$project_root" describe --tags --exact-match --match 'v[0
 if [[ "$build_number" == <-> ]]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build_number" "$staging_app_path/Contents/Info.plist"
 fi
-if [[ "$release_tag" =~ '^v[0-9]+\\.[0-9]+\\.[0-9]+$' ]]; then
+if [[ "$release_tag" =~ '^v[0-9]+\.[0-9]+\.[0-9]+$' ]]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${release_tag#v}" "$staging_app_path/Contents/Info.plist"
 fi
 /usr/libexec/PlistBuddy -c "Add :HarborGitCommit string $build_commit" "$staging_app_path/Contents/Info.plist"

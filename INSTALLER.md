@@ -1,10 +1,17 @@
 # Codex Harbor installers
 
-Current release: `v0.1.4` (Apple Silicon / arm64)
+Current release: `v0.1.5` (Apple Silicon / arm64)
 
-- Versioned installer: `v0.1.4/Codex-Harbor-v0.1.4-arm64.dmg`
+- Versioned installer: `v0.1.5/Codex-Harbor-v0.1.5-arm64.dmg`
 - Latest installer: `latest/Codex-Harbor-arm64.dmg`
-- SHA-256: `2e0e2fbc8b1edba7794972884e9a0778a15ea71b02f58e738f1f4128fdce7cb2`
+- SHA-256: `6e4835c1144e91d801b5ea7c051adf15ebeae203671770083bf22e0e7592747c`
 
-The DMG contains Xray 26.3.27, `geoip.dat`, and `geosite.dat` for offline
-first-run setup. It requires Apple Silicon and macOS 14 or newer.
+Download:
+- Gitee (large raw files require Gitee login):
+  https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg
+- Public no-login mirror:
+  https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.5/Codex-Harbor-v0.1.5-arm64.dmg
+
+The DMG includes a signed Codex Harbor app, an Applications shortcut for
+drag-and-drop installation, and bundled Xray, geoip.dat and geosite.dat.
+Requires Apple Silicon and macOS 14 or newer.

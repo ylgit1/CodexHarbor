@@ -8,6 +8,8 @@ private struct HarborProxyState: Codable {
     var subscriptions: [HarborProxySubscription] = []
     var selectedID: String?
     var routingRules = true
+    // Optional so existing Keychain JSON decodes without losing saved subscriptions.
+    var forcedProxyDomains: [String]?
 }
 @MainActor
 private struct HarborProxyProcessRecord: Codable {
@@ -71,6 +73,7 @@ final class HarborProxyManager: ObservableObject {
     private var latencyCancellationRequested = false
     @Published private(set) var subscriptionUpdatedAt: [String: Date] = [:]
     @Published var routingRules: Bool { didSet { store.routingRules = routingRules; persist() } }
+    @Published private(set) var forcedProxyDomains: [String]
     private var store: HarborProxyState
     private var child: Process?
     private var configPath: URL?
@@ -133,6 +136,9 @@ final class HarborProxyManager: ObservableObject {
         store = state
         nodes = state.nodes; subscriptions = state.subscriptions
         selectedID = state.selectedID; routingRules = state.routingRules
+        forcedProxyDomains = (try? HarborProxyDomainRules.normalized(
+            state.forcedProxyDomains ?? HarborProxyDomainRules.defaults
+        )) ?? HarborProxyDomainRules.defaults
         systemManaged = HarborSystemProxy.isOwned()
     }
 
@@ -169,8 +175,18 @@ final class HarborProxyManager: ObservableObject {
         store.nodes = nodes
         store.subscriptions = subscriptions
         store.selectedID = selectedID
+        store.forcedProxyDomains = forcedProxyDomains
         do { try HarborProxyStore.save(store) }
         catch { detail = error.localizedDescription }
+    }
+
+    func updateForcedProxyDomains(_ domains: [String]) throws {
+        guard !busy, !latencyTesting else {
+            throw HarborProxyError.invalid("代理正在执行其他操作，请稍后修改规则")
+        }
+        forcedProxyDomains = try HarborProxyDomainRules.normalized(domains)
+        persist()
+        detail = running ? "站点规则已保存；重新连接当前节点后生效" : "站点规则已保存，下次连接生效"
     }
 
     /// Read-only import. Copy Xray and geo assets into a Harbor-owned folder so
@@ -378,7 +394,8 @@ final class HarborProxyManager: ObservableObject {
         status = "正在连接"; detail = ""
         do {
             let port = try choosePort()
-            let config = try HarborXrayConfig.make(node: node, httpPort: port, ruleMode: routingRules)
+            let config = try HarborXrayConfig.make(node: node, httpPort: port, ruleMode: routingRules,
+                                                  forcedProxyDomains: forcedProxyDomains)
             let file = root.appendingPathComponent("runtime-\(UUID().uuidString).json")
             try config.write(to: file, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
@@ -473,7 +490,8 @@ final class HarborProxyManager: ObservableObject {
         for node in targets {
             if latencyCancellationRequested || Task.isCancelled { break }
             latencyCurrentID = node.id
-            let result = await HarborNodeLatencyTester.measure(node: node, root: root, ruleMode: routingRules)
+            let result = await HarborNodeLatencyTester.measure(node: node, root: root, ruleMode: routingRules,
+                                                                 forcedProxyDomains: forcedProxyDomains)
             probeResults[node.id] = HarborProxyProbeResult(milliseconds: result)
             latencyCompleted += 1
         }
@@ -487,7 +505,7 @@ final class HarborProxyManager: ObservableObject {
     func enableSystemProxy() {
         guard running, healthy, let localPort else { detail = "请先连接并验证当前节点"; return }
         do {
-            try HarborSystemProxy.enable(port: localPort)
+            try HarborSystemProxy.enable(port: localPort, forcedProxyDomains: forcedProxyDomains)
             systemManaged = true
             detail = "已设置 macOS 系统代理，可随时清除"
         } catch { detail = error.localizedDescription }

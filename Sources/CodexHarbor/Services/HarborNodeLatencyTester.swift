@@ -7,19 +7,23 @@ import Foundation
 /// then always terminates the child and deletes the temporary config.
 /// Does not alter the active node or macOS system proxy.
 enum HarborNodeLatencyTester {
-    static func measure(node: HarborProxyNode, root: URL, ruleMode: Bool) async -> Int? {
+    static func measure(node: HarborProxyNode, root: URL, ruleMode: Bool,
+                        forcedProxyDomains: [String] = HarborProxyDomainRules.defaults) async -> Int? {
         await Task.detached(priority: .userInitiated) {
             guard !Task.isCancelled else { return nil }
-            return perform(node: node, root: root, ruleMode: ruleMode)
+            return perform(node: node, root: root, ruleMode: ruleMode,
+                           forcedProxyDomains: forcedProxyDomains)
         }.value
     }
 
-    private static func perform(node: HarborProxyNode, root: URL, ruleMode: Bool) -> Int? {
+    private static func perform(node: HarborProxyNode, root: URL, ruleMode: Bool,
+                                forcedProxyDomains: [String]) -> Int? {
         let xray = root.appendingPathComponent("xray")
         guard FileManager.default.isExecutableFile(atPath: xray.path),
               let port = freePortPair() else { return nil }
         let configPath = root.appendingPathComponent("probe-\(UUID().uuidString).json")
-        guard let data = try? HarborXrayConfig.make(node: node, httpPort: port, ruleMode: ruleMode),
+        guard let data = try? HarborXrayConfig.make(node: node, httpPort: port, ruleMode: ruleMode,
+                                                  forcedProxyDomains: forcedProxyDomains),
               (try? data.write(to: configPath, options: .atomic)) != nil else { return nil }
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configPath.path)
         defer { try? FileManager.default.removeItem(at: configPath) }

@@ -193,8 +193,39 @@ public enum HarborV2rayNReader {
     }
 }
 
+/// Domains routed through the selected proxy before any GeoIP/GeoSite direct rules.
+/// A domain entry covers the apex hostname and all its subdomains.
+public enum HarborProxyDomainRules {
+    public static let defaults = ["gitee.com", "gitee.io"]
+
+    public static func normalized(_ domains: [String]) throws -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for value in domains {
+            var domain = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if domain.hasPrefix("*.") { domain.removeFirst(2) }
+            guard !domain.isEmpty, domain.utf8.count <= 253 else {
+                throw HarborProxyError.invalid("强制代理域名不能为空，且不得超过 253 字节")
+            }
+            let labels = domain.split(separator: ".", omittingEmptySubsequences: false)
+            guard labels.count >= 2, labels.allSatisfy({ label in
+                !label.isEmpty && label.utf8.count <= 63
+                    && label.first != "-" && label.last != "-"
+                    && label.utf8.allSatisfy { byte in
+                        (97...122).contains(byte) || (48...57).contains(byte) || byte == 45
+                    }
+            }) else {
+                throw HarborProxyError.invalid("无效域名：\(value)。每行填写域名，例如 gitee.com")
+            }
+            if seen.insert(domain).inserted { result.append(domain) }
+        }
+        return result
+    }
+}
+
 public enum HarborXrayConfig {
-    public static func make(node: HarborProxyNode, httpPort: Int, ruleMode: Bool) throws -> Data {
+    public static func make(node: HarborProxyNode, httpPort: Int, ruleMode: Bool,
+                            forcedProxyDomains: [String] = HarborProxyDomainRules.defaults) throws -> Data {
         guard (1024...65534).contains(httpPort), (1...65535).contains(node.port),
               !node.host.isEmpty, !node.credential.isEmpty else {
             throw HarborProxyError.invalid("代理节点无效")
@@ -238,9 +269,15 @@ public enum HarborXrayConfig {
                                                    "password": node.credential, "method": node.encryption]]]
         default: throw HarborProxyError.invalid("不支持 \(node.protocolName) 协议")
         }
-        var rules: [[String: Any]] = [
-            ["type": "field", "ip": ["geoip:private"], "outboundTag": "direct"]
-        ]
+        let forced = try HarborProxyDomainRules.normalized(forcedProxyDomains)
+        var rules: [[String: Any]] = []
+        if !forced.isEmpty {
+            // First-match-wins: Gitee/custom sites must not be swallowed by geosite:cn
+            // or resolve to a Chinese IP and fall through to geoip:cn.
+            rules.append(["type": "field", "domain": forced.map { "domain:\($0)" },
+                          "outboundTag": "proxy"])
+        }
+        rules.append(["type": "field", "ip": ["geoip:private"], "outboundTag": "direct"])
         if ruleMode {
             rules += [
                 ["type": "field", "domain": ["geosite:cn"], "outboundTag": "direct"],

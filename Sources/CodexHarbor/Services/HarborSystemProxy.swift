@@ -1,3 +1,4 @@
+import CodexHarborCore
 import Foundation
 import Security
 import SystemConfiguration
@@ -116,7 +117,7 @@ enum HarborSystemProxy {
         else { throw Failure.changeFailed }
     }
 
-    static func enable(port: Int) throws {
+    static func enable(port: Int, forcedProxyDomains: [String] = HarborProxyDomainRules.defaults) throws {
         guard (1024...65535).contains(port) else { throw Failure.unavailable }
         if hasBackup { throw Failure.notOwned }
         // Fail closed before requesting authorization. This prevents a subtle
@@ -136,6 +137,16 @@ enum HarborSystemProxy {
         updated["SOCKSPort"] = port + 1; updated["ProxyAutoConfigEnable"] = 0
         updated["ProxyAutoDiscoveryEnable"] = 0
         var bypass = (updated["ExceptionsList"] as? [String]) ?? []
+        // Restore these exclusions on disconnect via the existing snapshot.
+        // While Harbor owns the proxy, a macOS bypass for a forced site
+        // would prevent Xray from seeing the request at all.
+        let forced = try HarborProxyDomainRules.normalized(forcedProxyDomains)
+        bypass.removeAll { exception in
+            var host = exception.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if host.hasPrefix("*.") { host.removeFirst(2) }
+            else if host.hasPrefix(".") { host.removeFirst() }
+            return forced.contains { domain in host == domain || host.hasSuffix("." + domain) }
+        }
         for host in ["localhost", "127.0.0.0/8", "::1"] where !bypass.contains(host) { bypass.append(host) }
         updated["ExceptionsList"] = bypass
         let backup = Snapshot(serviceID: id, original: try encoded(previous), managed: try encoded(updated))

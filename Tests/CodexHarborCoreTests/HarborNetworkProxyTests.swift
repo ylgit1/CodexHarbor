@@ -19,11 +19,48 @@ struct HarborNetworkProxyTests {
         #expect(listeners.allSatisfy { ($0["listen"] as? String) == "127.0.0.1" })
         #expect(listeners.compactMap { $0["port"] as? Int } == [18080, 18081])
         let rules = try #require(object["routing"] as? [String: Any])
-        #expect((rules["rules"] as? [[String: Any]])?.count == 3)
+        let entries = try #require(rules["rules"] as? [[String: Any]])
+        #expect(entries.count == 4)
+        #expect(entries[0]["outboundTag"] as? String == "proxy")
+        #expect(entries[0]["domain"] as? [String] == ["domain:gitee.com", "domain:gitee.io"])
+        #expect(entries[1]["ip"] as? [String] == ["geoip:private"])
+        #expect(entries[2]["domain"] as? [String] == ["geosite:cn"])
+        #expect(entries[3]["ip"] as? [String] == ["geoip:cn"])
         let all = try HarborXrayConfig.make(node: node, httpPort: 18080, ruleMode: false)
         let other = try #require(JSONSerialization.jsonObject(with: all) as? [String: Any])
         let allRules = try #require(other["routing"] as? [String: Any])
-        #expect((allRules["rules"] as? [[String: Any]])?.count == 1)
+        #expect((allRules["rules"] as? [[String: Any]])?.count == 2)
+        #expect((allRules["rules"] as? [[String: Any]])?.first?["outboundTag"] as? String == "proxy")
+    }
+
+    @Test("Custom forced domains are validated and precede all direct routes")
+    func forcedDomainConfiguration() throws {
+        let node = HarborProxyNode(name: "fixture", protocolName: "vless",
+            host: "proxy.example.net", port: 443,
+            credential: "00000000-0000-0000-0000-000000000001")
+        let normalized = try HarborProxyDomainRules.normalized(
+            ["GITEE.COM", "*.gitee.com", "git.example.com", "Git.Example.com"]
+        )
+        #expect(normalized == ["gitee.com", "git.example.com"])
+        let config = try HarborXrayConfig.make(node: node, httpPort: 18080, ruleMode: true,
+                                              forcedProxyDomains: normalized)
+        let json = try #require(JSONSerialization.jsonObject(with: config) as? [String: Any])
+        let routing = try #require(json["routing"] as? [String: Any])
+        let rules = try #require(routing["rules"] as? [[String: Any]])
+        #expect(rules.first?["domain"] as? [String] == [
+            "domain:gitee.com", "domain:git.example.com"
+        ])
+        #expect(throws: HarborProxyError.self) {
+            try HarborProxyDomainRules.normalized(["https://gitee.com/owner/repo"])
+        }
+        #expect(throws: HarborProxyError.self) {
+            try HarborProxyDomainRules.normalized(["example.com", "geosite:cn"])
+        }
+        let disabled = try HarborXrayConfig.make(node: node, httpPort: 18080,
+                                                  ruleMode: true, forcedProxyDomains: [])
+        let disabledJSON = try #require(JSONSerialization.jsonObject(with: disabled) as? [String: Any])
+        let disabledRouting = try #require(disabledJSON["routing"] as? [String: Any])
+        #expect((disabledRouting["rules"] as? [[String: Any]])?.count == 3)
     }
 
     @Test("Installed Xray accepts generated rule-mode configuration when available")

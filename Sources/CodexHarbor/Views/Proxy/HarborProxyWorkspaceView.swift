@@ -20,6 +20,8 @@ struct HarborProxyWorkspaceView: View {
     @State private var subscriptionName = ""
     @State private var subscriptionURL = ""
     @State private var nodeLinks = ""
+    @State private var forcedDomainText = ""
+    @State private var forcedDomainError: String?
     @State private var hoveredSubscriptionID: String?
     @State private var hoveredNodeID: String?
     @State private var deletionTargetID: DeletionTarget?
@@ -28,7 +30,7 @@ struct HarborProxyWorkspaceView: View {
     private struct DeletionTarget: Identifiable { let id: String }
 
     private enum Editor: String, Identifiable {
-        case subscription, links, importChoice
+        case subscription, links, importChoice, routing
         var id: String { rawValue }
     }
 
@@ -409,7 +411,18 @@ struct HarborProxyWorkspaceView: View {
                 .pickerStyle(.menu)
                 .frame(width: 83)
                 .disabled(proxy.running)
-                .help("规则：国内域名和 IP 直连，其余默认代理；全局：除局域网和私有 IP 外默认走代理。切换后下次连接生效。")
+                .help("规则：国内域名和 IP 直连，其余默认代理；全局：除局域网和私有 IP 外默认走代理。强制代理站点在两种模式中均优先，切换后下次连接生效。")
+                Button {
+                    forcedDomainText = proxy.forcedProxyDomains.joined(separator: "\n")
+                    forcedDomainError = nil
+                    editor = .routing
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 12))
+                        .frame(width: 27, height: 28)
+                }
+                .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue, cornerRadius: 7))
+                .help("配置强制代理站点（默认 Gitee），可添加不允许直连的域名")
             }
             .padding(.horizontal, 13)
             .padding(.vertical, 10)
@@ -1028,7 +1041,8 @@ struct HarborProxyWorkspaceView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 14) {
                 Text(mode == .importChoice ? "新增代理配置"
-                     : (mode == .subscription ? "添加订阅" : "导入节点链接"))
+                     : (mode == .subscription ? "添加订阅"
+                        : (mode == .routing ? "强制代理站点" : "导入节点链接")))
                     .font(.system(size: 19, weight: .bold, design: .rounded))
                 Spacer(minLength: 0)
                 Button { editor = nil } label: {
@@ -1087,6 +1101,33 @@ struct HarborProxyWorkspaceView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+            } else if mode == .routing {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("始终通过代理访问的域名")
+                        .font(.system(size: 12, weight: .semibold))
+                    TextEditor(text: $forcedDomainText)
+                        .font(.system(size: 12, design: .monospaced))
+                        .frame(height: 148)
+                        .padding(6)
+                        .background(Color(nsColor: .controlBackgroundColor),
+                                    in: RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color.primary.opacity(0.12)))
+                    Text("每行一个域名，如 gitee.com；自动包含所有子域名。优先于国内直连规则，在规则和全局模式下均生效。")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if proxy.running {
+                        Text("保存后将自动重新连接当前节点以应用规则，连接可能短暂中断。")
+                            .font(.system(size: 11))
+                            .foregroundStyle(HarborColors.orange)
+                    }
+                    if let forcedDomainError {
+                        Text(forcedDomainError)
+                            .font(.system(size: 11))
+                            .foregroundStyle(HarborColors.red)
+                    }
+                }
             } else {
                 VStack(alignment: .leading, spacing: 7) {
                     Text("节点分享链接").font(.callout.weight(.semibold))
@@ -1115,7 +1156,30 @@ struct HarborProxyWorkspaceView: View {
                     .keyboardShortcut(.cancelAction)
                     .buttonStyle(HarborActionButtonStyle(
                         tint: .secondary, prominence: .secondary))
-                if mode != .importChoice {
+                if mode == .routing {
+                    Button {
+                        let domains = forcedDomainText
+                            .components(separatedBy: .newlines)
+                            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                            .filter { !$0.isEmpty }
+                        do {
+                            let changed = domains != proxy.forcedProxyDomains
+                            try proxy.updateForcedProxyDomains(domains)
+                            let reconnectID = changed && proxy.running ? proxy.selectedID : nil
+                            editor = nil
+                            if let reconnectID {
+                                Task { await proxy.select(reconnectID) }
+                            }
+                        } catch {
+                            forcedDomainError = error.localizedDescription
+                        }
+                    } label: {
+                        Text("保存规则")
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(HarborActionButtonStyle(tint: .blue, prominence: .prominent))
+                    .disabled(proxy.busy || proxy.latencyTesting)
+                } else if mode != .importChoice {
                     Button {
                         if mode == .subscription {
                             proxy.addSubscription(
@@ -1150,7 +1214,7 @@ struct HarborProxyWorkspaceView: View {
         .padding(.horizontal, 27)
         .padding(.top, 30)
         .padding(.bottom, 26)
-        .frame(width: 500, height: mode == .importChoice ? 356 : (mode == .links ? 375 : 370))
+        .frame(width: 500, height: mode == .importChoice ? 356 : (mode == .routing ? 440 : (mode == .links ? 375 : 370)))
         .onExitCommand { editor = nil }
     }
 

@@ -45,6 +45,7 @@ private enum ProfileRenameTarget: Identifiable {
 struct AppShellView: View {
     @ObservedObject var model: AppModel
     @StateObject private var chatGPTBridge = ChatGPTBridgeViewModel()
+    @ObservedObject private var networkProxy = HarborProxyManager.shared
 
     @State private var mainPage: HarborMainPage = .home
     @State private var catalogFilter: ConnectionCatalogFilter = .all
@@ -229,6 +230,8 @@ struct AppShellView: View {
                         HarborAnalyticsView(model: model)
                     case .localAccess:
                         localAccessPage
+                    case .networkProxy:
+                        HarborProxyWorkspaceView(proxy: networkProxy)
                     case .settings:
                         HarborSettingsView(model: model, bridge: chatGPTBridge)
                     }

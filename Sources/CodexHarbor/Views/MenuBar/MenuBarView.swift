@@ -4,6 +4,7 @@ import SwiftUI
 
 struct MenuBarView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var proxy: HarborProxyManager
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -54,6 +55,19 @@ struct MenuBarView: View {
                 }
             }
 
+            Divider()
+            Section("网络代理") {
+                Label(proxy.status, systemImage: proxy.running ? "network" : "network.slash")
+                if proxy.running {
+                    Button("关闭代理") { _ = proxy.stop() }
+                } else {
+                    Button("开启代理") { Task { await proxy.start() } }
+                        .disabled(proxy.selectedNode == nil || !proxy.coreInstalled)
+                }
+                if proxy.requiresRecovery {
+                    Button("清除系统代理") { proxy.clearSystemProxy() }
+                }
+            }
             Divider()
 
             Button("检查所有连接") {

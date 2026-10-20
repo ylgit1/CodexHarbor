@@ -85,6 +85,29 @@ flowchart LR
     G --> H[Workspace / Git / Command / Coding Task]
 ```
 
+### 网络代理（独立 v2rayN 替代模块）
+
+左侧「网络代理」可手动启动/关闭内置 Xray、选取节点、检测联通性、切换全局/规则代理，
+并在明确确认后**设置或清除当前 macOS 网络的 HTTP/HTTPS/SOCKS 系统代理**。代理只监听
+127.0.0.1 的 HTTP/SOCKS5 端口，不启用 TUN，不直接修改 Codex 连接设置或 ChatGPT
+本地管道/公网 HTTPS 的业务配置。菜单栏提供启动和停止代理的快捷操作。
+
+首次点击「从 v2rayN 迁移」会以 SQLite 只读方式读取
+`~/Library/Application Support/v2rayN/guiConfigs/guiNDB.db` 和
+`guiNConfig.json`：导入受支持的 VLESS 节点、HTTPS 订阅及选中节点，明确统计其他
+不支持的记录。原始配置不会被修改；VLESS、VMess、Trojan、Shadowsocks 分享链接可另行导入。
+迁移时复制 Xray 和 geoip/geosite 资源到 Harbor 专属目录，使其之后不依赖 v2rayN
+客户端运行。Apple Silicon Mac 优先复用已安装的官方 arm64 Xray 缓存，否则复制现有
+v2rayN 内核。敏感节点、订阅信息保存在系统钥匙串，临时运行配置设为 0600 权限。
+
+**切换代理的安全前提**：如果 v2rayN 当前仍控制系统代理（例如 127.0.0.1:10808），
+Harbor 拒绝覆盖；请先在 v2rayN 内清除系统代理，然后在 Harbor 内设置。设置前备份
+原代理参数，清除时按所有权检查恢复，避免覆盖其他程序的网络变更。关闭或退出时先恢复
+macOS 代理再终止本机 Xray；如需系统授权且未恢复，则阻止普通退出并提示手动恢复。
+启动时对异常退出留下的系统代理快照尝试安全恢复，并按完整进程命令验证后清理孤立内核。
+「开机启动 Xray」仅启动内核，**不会自动接管系统代理**。本功能不是所有程序透明代理，
+忽略 macOS 系统代理的客户端仍需要自行配置。
+
 ### 本地 MCP 开发工具
 
 当前版本内置 **30 个 MCP 工具**（实际数量以运行时 `tools/list` 为准），覆盖项目浏览、文件修改、Git、命令、工作流和 Coding Task。

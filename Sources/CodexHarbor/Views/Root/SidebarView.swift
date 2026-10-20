@@ -6,6 +6,7 @@ enum HarborMainPage: String, CaseIterable, Identifiable {
     case connections
     case analytics
     case localAccess
+    case networkProxy
     case settings
 
     var id: String { rawValue }
@@ -16,6 +17,7 @@ enum HarborMainPage: String, CaseIterable, Identifiable {
         case .connections: "Codex 连接"
         case .analytics: "使用统计"
         case .localAccess: "ChatGPT 接入"
+        case .networkProxy: "网络代理"
         case .settings: "设置"
         }
     }
@@ -26,6 +28,7 @@ enum HarborMainPage: String, CaseIterable, Identifiable {
         case .connections: "point.3.connected.trianglepath.dotted"
         case .analytics: "chart.xyaxis.line"
         case .localAccess: "display"
+        case .networkProxy: "network"
         case .settings: "gearshape"
         }
     }
@@ -47,6 +50,7 @@ struct HarborSidebarView: View {
                     row(.connections)
                     row(.analytics)
                     row(.localAccess)
+                    row(.networkProxy)
                 }
                 .padding(.leading, 11)
                 .padding(.trailing, 15)

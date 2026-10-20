@@ -6,7 +6,22 @@ import SwiftUI
 
 @MainActor
 final class HarborApplicationDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard HarborProxyManager.shared.stop(interactive: false) else {
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "系统代理尚未恢复"
+            alert.informativeText = "为避免关闭内核导致 macOS 网络中断，应用将保持运行。请到「网络代理」清除系统代理后再退出。"
+            alert.addButton(withTitle: "返回")
+            _ = alert.runModal()
+            return .terminateCancel
+        }
+        return .terminateNow
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Recovery and optional core autostart cannot depend on a window/menu being opened.
+        Task { await HarborProxyManager.shared.bootstrap() }
         // Authorization is an app-level service, not owned by a window or
         // SwiftUI view. A closed window must not disable approval prompts.
         HarborApprovalPanelController.shared.start()
@@ -20,6 +35,7 @@ final class HarborApplicationDelegate: NSObject, NSApplicationDelegate {
 struct CodexHarborApp: App {
     @NSApplicationDelegateAdaptor(HarborApplicationDelegate.self) private var appDelegate
     @StateObject private var model: AppModel
+    @StateObject private var proxy = HarborProxyManager.shared
 
     init() {
         if CommandLine.arguments.dropFirst().first == "serve-relay" {
@@ -67,7 +83,8 @@ struct CodexHarborApp: App {
         .windowResizability(.contentMinSize)
 
         MenuBarExtra {
-            MenuBarView(model: model)
+            MenuBarView(model: model, proxy: proxy)
+                .task { await proxy.bootstrap() }
         } label: {
             Label(
                 "Codex Harbor",

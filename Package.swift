@@ -29,7 +29,8 @@ let package = Package(
         ),
         .executableTarget(
             name: "CodexHarbor",
-            dependencies: ["CodexHarborCore", "ChatGPTBridgeCore"]
+            dependencies: ["CodexHarborCore", "ChatGPTBridgeCore"],
+            resources: [.process("Resources/ProxyFlags")]
         ),
         .executableTarget(
             name: "HarborChatGPTAgent",

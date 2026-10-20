@@ -1,0 +1,1165 @@
+import SwiftUI
+import CodexHarborCore
+
+/// Compact, high-fidelity macOS proxy workspace.
+/// This view never starts background timers or probes unrelated nodes.
+struct HarborProxyWorkspaceView: View {
+    @ObservedObject var proxy: HarborProxyManager
+    @State private var groupID: String?
+    @State private var favoritesOnly = false
+    @State private var favorites: Set<String> = []
+    @State private var keyword = ""
+    @State private var region = "全部"
+    @State private var protocolFilter = "全部"
+    @State private var latencyFilter = "全部"
+    @State private var latencyAscending: Bool? = nil
+    @State private var page = 1
+    @State private var pageSize = 10
+    @State private var gridMode = false
+    @State private var editor: Editor?
+    @State private var subscriptionName = ""
+    @State private var subscriptionURL = ""
+    @State private var nodeLinks = ""
+    @State private var hoveredSubscriptionID: String?
+    @State private var hoveredNodeID: String?
+    @State private var deletionTargetID: DeletionTarget?
+    @FocusState private var nodeSearchFocused: Bool
+
+    private struct DeletionTarget: Identifiable { let id: String }
+
+    private enum Editor: String, Identifiable {
+        case subscription, links, importChoice
+        var id: String { rawValue }
+    }
+
+    private let favoritesKey = "com.codexharbor.proxy.favoriteNodeIDs"
+    private let subscriptionTints: [Color] = [
+        HarborColors.blue, HarborColors.green, HarborColors.orange, HarborColors.purple
+    ]
+
+    private var groupNodes: [HarborProxyNode] {
+        proxy.nodes.filter { node in
+            if let groupID { return node.subscriptionID == groupID }
+            return favorites.contains(node.id)
+        }
+    }
+
+    private var shownNodes: [HarborProxyNode] {
+        var result = groupNodes.filter { node in
+            if region != "全部" && location(of: node) != region { return false }
+            if protocolFilter != "全部" && node.protocolName.uppercased() != protocolFilter { return false }
+            if latencyFilter != "全部" {
+                guard let delay = proxy.probeResults[node.id]?.milliseconds else { return false }
+                if latencyFilter == "快速" && delay >= 200 { return false }
+                if latencyFilter == "一般" && (delay < 200 || delay >= 500) { return false }
+                if latencyFilter == "较慢" && delay < 500 { return false }
+            }
+            let text = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+            return text.isEmpty || node.name.localizedCaseInsensitiveContains(text)
+                || node.host.localizedCaseInsensitiveContains(text)
+                || node.protocolName.localizedCaseInsensitiveContains(text)
+        }
+        if let ascending = latencyAscending {
+            let position = Dictionary(uniqueKeysWithValues: result.enumerated().map { ($0.element.id, $0.offset) })
+            result.sort { a, b in
+                let x = proxy.probeResults[a.id]?.milliseconds
+                let y = proxy.probeResults[b.id]?.milliseconds
+                switch (x, y) {
+                case let (lhs?, rhs?) where lhs != rhs: return ascending ? lhs < rhs : lhs > rhs
+                case (_?, nil): return true
+                case (nil, _?): return false
+                default: return (position[a.id] ?? 0) < (position[b.id] ?? 0)
+                }
+            }
+        }
+        return result
+    }
+    private var maxPage: Int { max(1, (shownNodes.count + pageSize - 1) / pageSize) }
+    private var currentPage: Int { min(max(1, page), maxPage) }
+    private var visibleNodes: [HarborProxyNode] {
+        Array(shownNodes.dropFirst((currentPage - 1) * pageSize).prefix(pageSize))
+    }
+    private var title: String {
+        if let groupID { return proxy.subscriptions.first(where: { $0.id == groupID })?.name ?? "订阅节点" }
+        return "我的收藏"
+    }
+    private var protocols: [String] {
+        ["全部"] + Array(Set(groupNodes.map { $0.protocolName.uppercased() })).sorted()
+    }
+    private var regions: [String] {
+        let actual = Set(groupNodes.map(location))
+        return ["全部"] + ["香港", "美国", "日本", "新加坡", "台湾", "德国", "韩国", "英国", "其他"]
+            .filter(actual.contains)
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            VStack(alignment: .leading, spacing: 9) {
+                header
+                    .frame(height: 42)
+                currentNode
+                    .frame(height: 68)
+                HStack(alignment: .top, spacing: 11) {
+                    subscriptionSidebar
+                        .frame(width: geometry.size.width > 1000 ? 250 : 215)
+                    nodeTable
+                        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+                }
+                .frame(minHeight: 0, maxHeight: .infinity)
+                .layoutPriority(1)
+            }
+            .padding(.horizontal, geometry.size.width < 850 ? 16 : 22)
+            .padding(.top, 3)
+            .padding(.bottom, 10)
+            .frame(maxWidth: 1360, maxHeight: .infinity, alignment: .top)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
+        .task { await proxy.bootstrap() }
+        .onAppear {
+            favorites = Set(UserDefaults.standard.stringArray(forKey: favoritesKey) ?? [])
+            if groupID == nil && !favoritesOnly {
+                groupID = proxy.subscriptions.first?.id
+                favoritesOnly = groupID == nil
+            }
+        }
+        .onChange(of: proxy.subscriptions.map(\.id)) { _, ids in
+            if let groupID, !ids.contains(groupID) {
+                self.groupID = ids.first
+                favoritesOnly = ids.isEmpty
+                resetFilters()
+            } else if self.groupID == nil && !favoritesOnly {
+                self.groupID = ids.first
+                favoritesOnly = ids.isEmpty
+            }
+        }
+        .onChange(of: keyword) { _, _ in page = 1 }
+        .onChange(of: region) { _, _ in page = 1 }
+        .onChange(of: protocolFilter) { _, _ in page = 1 }
+        .onChange(of: latencyFilter) { _, _ in page = 1 }
+        .onChange(of: latencyAscending) { _, _ in page = 1 }
+        .onChange(of: pageSize) { _, _ in page = 1 }
+        .sheet(item: $editor) { mode in editorSheet(mode) }
+        .sheet(item: $deletionTargetID) { target in
+            let id = target.id
+            if let subscription = proxy.subscriptions.first(where: { $0.id == id }) {
+                let count = proxy.nodes.filter { $0.subscriptionID == id }.count
+                let inUse = proxy.running && proxy.selectedNode?.subscriptionID == id
+                HarborDestructiveConfirmDialog(
+                    title: "删除订阅「\(subscription.name)」？",
+                    message: inUse
+                        ? "该订阅正在提供当前代理连接，请先清理代理，再删除订阅。"
+                        : "这将从 CodexHarbor 中移除该订阅及其 \(count) 个节点，不会删除 v2rayN 中的原始配置。",
+                    confirmTitle: inUse ? "返回" : "删除订阅",
+                    onCancel: { deletionTargetID = nil },
+                    onConfirm: {
+                        if !inUse { _ = proxy.removeSubscription(id) }
+                        deletionTargetID = nil
+                    }
+                )
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("网络代理")
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                    .tracking(-0.5)
+                Text("管理订阅与节点，一键切换，轻松上网")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            HStack(spacing: 9) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("搜索节点名称、地区或备注", text: $keyword)
+                    .focused($nodeSearchFocused)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11.5))
+                    .accessibilityLabel("搜索节点")
+                if !keyword.isEmpty {
+                    Button {
+                        keyword = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .font(.system(size: 12))
+            .padding(.horizontal, 12)
+            .frame(width: 220, height: 32)
+            .background(Color.primary.opacity(0.025),
+                        in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(HarborColors.cardBorder))
+        }
+    }
+
+    /// The header represents what is *actually* active, not a saved selection.
+    /// A configured-but-idle node must never be labeled as an active proxy.
+    private var proxyStateColor: Color {
+        if proxy.requiresRecovery { return HarborColors.red }
+        if proxy.busy { return HarborColors.orange }
+        if proxy.running && !proxy.healthy { return HarborColors.orange }
+        if proxy.running && proxy.systemManaged { return HarborColors.green }
+        if proxy.running { return HarborColors.blue }
+        return .secondary
+    }
+
+    private var proxyStateTitle: String {
+        if proxy.requiresRecovery { return "系统代理等待恢复" }
+        if proxy.busy { return "正在连接代理…" }
+        if proxy.running && !proxy.healthy { return "代理连接异常" }
+        if proxy.running && proxy.systemManaged { return "正在使用代理" }
+        if proxy.running { return "本地代理已连接" }
+        return "未使用 Harbor 代理"
+    }
+
+    private var proxyStateSubtitle: String {
+        if proxy.requiresRecovery { return "请先恢复系统代理设置，避免网络异常" }
+        if proxy.busy { return "正在建立独立连接，请稍候" }
+        if proxy.running && !proxy.healthy { return "内核已启动，但连通性检查未通过" }
+        if proxy.running && proxy.systemManaged {
+            return proxy.selectedNode.map { "系统代理已接管 · \($0.name)" } ?? "系统代理已接管"
+        }
+        if proxy.running {
+            return proxy.selectedNode.map { "节点 \($0.name) 已连接 · 未接管 macOS 系统代理" }
+                ?? "内核已连接 · 未接管系统代理"
+        }
+        if let node = proxy.selectedNode { return "上次选择：\(node.name) · 点击下方节点重新连接" }
+        return "点击下方的订阅节点选择并连接"
+    }
+
+    private var currentNode: some View {
+        HStack(spacing: 14) {
+            Image(systemName: proxy.running ? "network" : "network.slash")
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(proxyStateColor)
+                .frame(width: 37, height: 37)
+                .background(proxyStateColor.opacity(0.09),
+                            in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(proxyStateColor)
+                        .frame(width: 7, height: 7)
+                    Text(proxyStateTitle)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    if proxy.running, let node = proxy.selectedNode,
+                       let latency = proxy.probeResults[node.id]?.milliseconds {
+                        Text("\(latency) ms")
+                            .font(.system(size: 10, weight: .medium))
+                            .monospacedDigit()
+                            .foregroundStyle(latencyColor(latency))
+                            .padding(.horizontal, 8)
+                            .frame(height: 21)
+                            .background(latencyColor(latency).opacity(0.09), in: Capsule())
+                    }
+                }
+                Text(proxyStateSubtitle)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 12)
+            if proxy.running || proxy.requiresRecovery {
+                Button {
+                    proxy.clearProxy()
+                } label: {
+                    Label("清理代理", systemImage: "trash")
+                }
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.red, prominence: .secondary))
+                .disabled(proxy.busy)
+                .help("恢复 Harbor 接管前的系统代理设置，并停止 Harbor 的 Xray")
+            } else {
+                Button {
+                    if proxy.subscriptions.isEmpty && proxy.nodes.isEmpty {
+                        editor = .subscription
+                    } else {
+                        if groupID == nil && favorites.isEmpty {
+                            groupID = proxy.subscriptions.first?.id
+                            favoritesOnly = groupID == nil
+                        }
+                        resetFilters()
+                        nodeSearchFocused = true
+                    }
+                } label: {
+                    Label("配置代理", systemImage: "arrow.right.circle")
+                }
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+                .help("前往下方节点列表，点击节点行建立连接")
+            }
+        }
+        .padding(.horizontal, 18)
+        .frame(height: 66)
+        .background(HarborColors.cardBackground,
+                    in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(HarborColors.cardBorder))
+    }
+
+    private var subscriptionSidebar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("订阅")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("\(proxy.subscriptions.count)")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                Button {
+                    editor = .importChoice
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 30, height: 30)
+                }
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+                .help("新增订阅或节点")
+                Button {
+                    if let groupID {
+                        Task { await proxy.refreshSubscription(groupID) }
+                    }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 20, height: 30)
+                }
+                .disabled(groupID == nil || proxy.busy || proxy.latencyTesting)
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+                .help("更新选中订阅")
+                Button {
+                    if let groupID { deletionTargetID = DeletionTarget(id: groupID) }
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .frame(width: 20, height: 30)
+                }
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.red, prominence: .secondary))
+                .disabled(groupID == nil || proxy.busy || proxy.latencyTesting)
+                .help(groupID == nil ? "先选择需要删除的订阅" : "删除当前选中的订阅")
+            }
+            .padding(.horizontal, 15)
+            .padding(.top, 13)
+            .padding(.bottom, 3)
+
+            // The navigation intentionally contains no “全部节点” category.
+            groupButton("我的收藏", icon: "star", count: proxy.nodes.filter { favorites.contains($0.id) }.count,
+                        selected: groupID == nil) {
+                groupID = nil
+                favoritesOnly = true
+                resetFilters()
+            }
+            Rectangle()
+                .fill(HarborColors.cardBorder)
+                .frame(height: 1)
+                .padding(.horizontal, 15)
+                .padding(.vertical, 3)
+
+            ScrollView(.vertical) {
+                LazyVStack(spacing: 5) {
+                    ForEach(Array(proxy.subscriptions.enumerated()), id: \.element.id) { index, item in
+                        subscriptionRow(item, index: index)
+                    }
+                }
+                .padding(.horizontal, 9)
+            }
+            .scrollIndicators(.hidden)
+            .frame(minHeight: 0, maxHeight: .infinity)
+
+            HStack(spacing: 4) {
+                Text("代理路由")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                Picker("代理路由", selection: $proxy.routingRules) {
+                    Text("规则").tag(true)
+                    Text("全局").tag(false)
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 83)
+                .disabled(proxy.running)
+                .help("规则：国内域名和 IP 直连，其余默认代理；全局：除局域网和私有 IP 外默认走代理。切换后下次连接生效。")
+            }
+            .padding(.horizontal, 13)
+            .padding(.vertical, 10)
+            .overlay(alignment: .top) {
+                Rectangle().fill(HarborColors.cardBorder).frame(height: 1)
+            }
+        }
+        .frame(minHeight: 0, maxHeight: .infinity, alignment: .top)
+        .background(HarborColors.cardBackground,
+                    in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(HarborColors.cardBorder))
+    }
+
+    private func groupButton(_ name: String, icon: String, count: Int,
+                             selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 11) {
+                Image(systemName: icon)
+                    .font(.system(size: 12))
+                    .frame(width: 22)
+                Text(name)
+                    .font(.system(size: 11.5, weight: selected ? .semibold : .medium))
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                Text("\(count)")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(selected ? HarborColors.blue : Color.secondary)
+                    .padding(.horizontal, 6)
+                    .frame(minHeight: 19)
+                    .background(selected ? HarborColors.blue.opacity(0.09) : Color.primary.opacity(0.035),
+                                in: Capsule())
+            }
+            .foregroundStyle(selected ? HarborColors.blue : Color.primary.opacity(0.83))
+            .padding(.horizontal, 11)
+            .frame(height: 44)
+            .contentShape(RoundedRectangle(cornerRadius: 9))
+            .background(selected ? HarborColors.blue.opacity(0.095) : .clear,
+                        in: RoundedRectangle(cornerRadius: 9))
+            .overlay(alignment: .leading) {
+                if selected {
+                    Capsule()
+                        .fill(HarborColors.blue)
+                        .frame(width: 2, height: 27)
+                }
+            }
+        }
+        .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue, cornerRadius: 9))
+        .padding(.horizontal, 9)
+    }
+
+    private func subscriptionRow(_ item: HarborProxySubscription, index: Int) -> some View {
+        let selected = groupID == item.id
+        let hovered = hoveredSubscriptionID == item.id
+        let tint = subscriptionTints[index % subscriptionTints.count]
+        let count = proxy.nodes.filter { $0.subscriptionID == item.id }.count
+
+        // One full-width clickable surface. The count belongs inside the
+        // Button's hit area, so hover, selection and press never stop halfway.
+        return Button {
+            groupID = item.id
+            favoritesOnly = false
+            resetFilters()
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: ["doc.text", "airplane", "shippingbox", "square.stack.3d.up"][index % 4])
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(selected ? .white : tint)
+                    .frame(width: 34, height: 34)
+                    .background(selected ? tint : tint.opacity(0.10),
+                                in: RoundedRectangle(cornerRadius: 9))
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.name)
+                        .font(.system(size: 11.5, weight: selected ? .semibold : .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    if let updated = proxy.subscriptionUpdatedAt[item.id] {
+                        Text(updated.formatted(date: .omitted, time: .shortened) + " 更新")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    } else {
+                        Text("\(count) 个节点")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Text("\(count)")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundStyle(selected ? HarborColors.blue : Color.secondary)
+                    .monospacedDigit()
+                    .frame(minWidth: 22, alignment: .trailing)
+            }
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, minHeight: 61)
+            .contentShape(RoundedRectangle(cornerRadius: 9))
+            .background(selected ? HarborColors.blue.opacity(0.085)
+                : (hovered ? HarborColors.blue.opacity(0.055) : .clear),
+                in: RoundedRectangle(cornerRadius: 9))
+            .overlay(alignment: .leading) {
+                if selected {
+                    Capsule().fill(HarborColors.blue)
+                        .frame(width: 2, height: 41)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            if hovering { hoveredSubscriptionID = item.id }
+            else if hoveredSubscriptionID == item.id { hoveredSubscriptionID = nil }
+        }
+        .contextMenu {
+            Button("更新订阅") { Task { await proxy.refreshSubscription(item.id) } }
+            Button("删除订阅", role: .destructive) {
+                deletionTargetID = DeletionTarget(id: item.id)
+            }
+        }
+    }
+
+    // One compact row replaces the previous dedicated filter panel.
+    private var regionBar: some View {
+        HStack(spacing: 7) {
+            ScrollView(.horizontal) {
+                HStack(spacing: 2) {
+                    ForEach(regions, id: \.self) { name in
+                        let selected = region == name
+                        let count = name == "全部"
+                            ? groupNodes.count
+                            : groupNodes.filter { location(of: $0) == name }.count
+                        Button { region = name } label: {
+                            HStack(spacing: 5) {
+                                if name != "全部" {
+                                    Text(regionEmoji(name)).font(.system(size: 12))
+                                }
+                                Text(name)
+                                Text("\(count)")
+                                    .font(.system(size: 9, weight: .medium, design: .rounded))
+                                    .padding(.horizontal, 5)
+                                    .frame(height: 17)
+                                    .background(selected ? HarborColors.blue.opacity(0.10)
+                                                       : Color.primary.opacity(0.035), in: Capsule())
+                            }
+                            .font(.system(size: 10.5, weight: selected ? .semibold : .medium))
+                            .foregroundStyle(selected ? HarborColors.blue : Color.secondary)
+                            .padding(.horizontal, 7)
+                            .frame(height: 38)
+                            .overlay(alignment: .bottom) {
+                                if selected {
+                                    Capsule().fill(HarborColors.blue).frame(height: 2)
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(HarborInteractivePlainButtonStyle(
+                            tint: HarborColors.blue, cornerRadius: 6))
+                    }
+                }
+                .padding(.leading, 10)
+            }
+            .scrollIndicators(.hidden)
+            .frame(minWidth: 0, maxWidth: .infinity)
+
+            if proxy.latencyTesting {
+                Button { proxy.cancelLatencyTests() } label: {
+                    Label("停止 \(proxy.latencyCompleted)/\(proxy.latencyTotal)",
+                          systemImage: "stop.circle")
+                        .font(.system(size: 10.5, weight: .medium))
+                }
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.orange, prominence: .secondary))
+            } else {
+                Button {
+                    Task { await proxy.testLatency(visibleNodes.map(\.id)) }
+                } label: {
+                    Label("测速", systemImage: "speedometer")
+                        .font(.system(size: 10.5, weight: .medium))
+                }
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+                .disabled(visibleNodes.isEmpty || !proxy.coreInstalled || proxy.busy)
+                .help("手动测速当前页节点，不更改当前系统代理")
+            }
+
+            if gridMode {
+                latencySortButton
+                    .frame(width: 80)
+            }
+
+            HStack(spacing: 2) {
+                modeButton("list.bullet", selected: !gridMode) { gridMode = false }
+                modeButton("square.grid.2x2", selected: gridMode) { gridMode = true }
+            }
+            .padding(2)
+            .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 8))
+            .padding(.trailing, 10)
+        }
+        .frame(height: 40)
+    }
+
+    private var latencySortButton: some View {
+        Button {
+            latencyAscending = !(latencyAscending ?? false)
+            page = 1
+        } label: {
+            HStack(spacing: 3) {
+                Text("延迟")
+                Image(systemName: latencyAscending == nil ? "arrow.up.arrow.down"
+                      : (latencyAscending == true ? "arrow.up" : "arrow.down"))
+                    .font(.system(size: 9, weight: .semibold))
+            }
+            .font(.system(size: 10.5, weight: latencyAscending == nil ? .medium : .semibold))
+            .frame(height: 32, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+        .help("按已测速延迟排序，点击切换升序或降序；未测速的节点排在后面")
+    }
+
+    private func modeButton(_ symbol: String, selected: Bool,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(selected ? Color.white : Color.secondary)
+                .frame(width: 27, height: 27)
+                .background(selected ? HarborColors.blue : .clear,
+                            in: RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue, cornerRadius: 6))
+    }
+
+    /// Only node content scrolls. Controls and pagination stay in view at any
+    /// supported window height; there is no outer page scrolling.
+    private var nodeTable: some View {
+        VStack(spacing: 0) {
+            regionBar
+            Rectangle().fill(HarborColors.cardBorder).frame(height: 1)
+
+            if !gridMode {
+                HStack(spacing: 10) {
+                    Image(systemName: "circle").frame(width: 18).opacity(0)
+                    Text("节点名称").frame(maxWidth: .infinity, alignment: .leading)
+                    Text("地址").frame(width: 141, alignment: .leading)
+                    Text("类型").frame(width: 62, alignment: .leading)
+                    Text("地区").frame(width: 76, alignment: .leading)
+                    latencySortButton.frame(width: 68, alignment: .leading)
+                    Image(systemName: "speedometer").frame(width: 28)
+                    Image(systemName: "star").frame(width: 29)
+                }
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 17)
+                .frame(height: 36)
+                .background(Color.primary.opacity(0.016))
+            }
+
+            GeometryReader { available in
+                ScrollView(.vertical) {
+                if visibleNodes.isEmpty {
+                    VStack(spacing: 9) {
+                        Image(systemName: "line.3.horizontal.decrease.circle")
+                            .font(.system(size: 24, weight: .ultraLight))
+                        Text(proxy.nodes.isEmpty ? "暂无节点，请先导入订阅"
+                             : (groupID == nil && favorites.isEmpty ? "还没有收藏的节点"
+                             : "没有符合条件的节点"))
+                            .font(.system(size: 11))
+                    }
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 70)
+                } else if gridMode {
+                    let columnCount = 2
+                    // Use the configured page capacity, not the filtered result count.
+                    // Region changes must not stretch one or two remaining cards.
+                    let rowCount = max(1, (pageSize + columnCount - 1) / columnCount)
+                    let cellHeight = max(88, min(128,
+                        (available.size.height - 18 - CGFloat(max(0, rowCount - 1)) * 8) / CGFloat(rowCount)))
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 9), count: columnCount), spacing: 8) {
+                        ForEach(visibleNodes) { node in gridCard(node).frame(height: cellHeight) }
+                    }
+                    .padding(9)
+                    .frame(maxWidth: .infinity, minHeight: available.size.height, alignment: .top)
+                } else {
+                    LazyVStack(spacing: 2) {
+                        ForEach(visibleNodes) { node in row(node) }
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                }
+                }
+                .scrollIndicators(.automatic)
+            }
+            .frame(minHeight: 0, maxHeight: .infinity)
+
+            if !proxy.detail.isEmpty && !proxy.detail.contains("HTTP 127.0.0.1:") {
+                Text(proxy.detail)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(proxy.detail)
+                    .padding(.horizontal, 14)
+                    .frame(height: 20, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            pagination
+                .fixedSize(horizontal: false, vertical: true)
+                .layoutPriority(2)
+        }
+        .frame(minHeight: 0, maxHeight: .infinity)
+        .background(HarborColors.cardBackground, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(HarborColors.cardBorder))
+    }
+
+    private func row(_ node: HarborProxyNode) -> some View {
+        let selected = proxy.selectedID == node.id && proxy.running
+        let probe = proxy.probeResults[node.id]
+        let delay = probe?.milliseconds
+        let connecting = selected && proxy.busy
+        return HStack(spacing: 10) {
+            Button {
+                Task { await proxy.activate(node.id) }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                        .font(.system(size: 13.5))
+                        .foregroundStyle(selected ? HarborColors.blue : Color.primary.opacity(0.24))
+                        .frame(width: 18)
+                    Text(node.name)
+                        .font(.system(size: 11, weight: selected ? .semibold : .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(node.host)
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(width: 141, alignment: .leading)
+                    Text(node.protocolName.uppercased())
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(protocolColor(node.protocolName))
+                        .frame(width: 62, height: 24)
+                        .background(protocolColor(node.protocolName).opacity(0.085),
+                                    in: RoundedRectangle(cornerRadius: 6))
+                    HStack(spacing: 5) {
+                        Text(regionFlag(node)).font(.system(size: 13))
+                        Text(location(of: node)).lineLimit(1)
+                    }
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 76, alignment: .leading)
+                    Text(connecting ? "连接中" : (proxy.latencyCurrentID == node.id ? "测速中"
+                         : delay.map { "\($0) ms" } ?? (probe == nil ? "未测" : "超时")))
+                        .font(.system(size: 10.3, weight: delay == nil ? .regular : .medium))
+                        .monospacedDigit()
+                        .foregroundStyle(delay.map(latencyColor) ?? Color.secondary)
+                        .frame(width: 68, alignment: .leading)
+                }
+                .frame(height: 46)
+                .contentShape(Rectangle())
+            }
+            .disabled(proxy.busy)
+            .buttonStyle(.plain)
+            .help("选择并连接：\(node.name)")
+
+            Button {
+                Task { await proxy.testLatency([node.id]) }
+            } label: {
+                Image(systemName: proxy.latencyCurrentID == node.id
+                      ? "hourglass" : "speedometer")
+                    .font(.system(size: 12))
+                    .foregroundStyle(proxy.latencyCurrentID == node.id
+                                     ? HarborColors.orange : HarborColors.blue)
+                    .frame(width: 28, height: 30)
+            }
+            .disabled(proxy.latencyTesting || !proxy.coreInstalled || proxy.busy)
+            .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue, cornerRadius: 7))
+            .help("仅测试此节点的代理 HTTPS 延迟，不切换当前代理")
+            Button {
+                toggleFavorite(node.id)
+            } label: {
+                Image(systemName: favorites.contains(node.id) ? "star.fill" : "star")
+                    .font(.system(size: 12))
+                    .foregroundStyle(favorites.contains(node.id) ? HarborColors.orange : Color.secondary)
+                    .frame(width: 29, height: 30)
+            }
+            .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.orange, cornerRadius: 7))
+            .help(favorites.contains(node.id) ? "取消收藏" : "收藏节点")
+        }
+        .padding(.horizontal, 8)
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .background(
+            selected ? HarborColors.blue.opacity(0.085)
+                : (hoveredNodeID == node.id ? HarborColors.blue.opacity(0.055) : .clear),
+            in: RoundedRectangle(cornerRadius: 8))
+        .onHover { hovering in
+            if hovering { hoveredNodeID = node.id }
+            else if hoveredNodeID == node.id { hoveredNodeID = nil }
+        }
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(HarborColors.cardBorder.opacity(0.6))
+                .frame(height: 0.5)
+                .padding(.horizontal, 13)
+        }
+    }
+
+    private func gridCard(_ node: HarborProxyNode) -> some View {
+        let selected = proxy.selectedID == node.id && proxy.running
+        let delay = proxy.probeResults[node.id]?.milliseconds
+        return HStack(alignment: .center, spacing: 6) {
+            Button {
+                Task { await proxy.activate(node.id) }
+            } label: {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(selected ? HarborColors.blue : Color.secondary.opacity(0.35))
+                            .frame(width: 7, height: 7)
+                        Text(node.name)
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                    }
+                    Text(node.host)
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    HStack(spacing: 8) {
+                        Text(node.protocolName.uppercased())
+                            .foregroundStyle(protocolColor(node.protocolName))
+                        Text("\(regionFlag(node)) \(location(of: node))")
+                        Spacer(minLength: 2)
+                        Text(delay.map { "\($0) ms" } ?? (proxy.probeResults[node.id] == nil ? "未测" : "超时"))
+                            .font(.system(size: 11, weight: delay == nil ? .regular : .semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(delay.map(latencyColor) ?? Color.secondary)
+                            .padding(.horizontal, 5)
+                            .frame(height: 22)
+                            .background(delay.map { latencyColor($0).opacity(0.09) } ?? Color.clear,
+                                        in: RoundedRectangle(cornerRadius: 6))
+                    }
+                    .font(.system(size: 9.5))
+                }
+                .padding(.leading, 11)
+                .padding(.vertical, 9)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .disabled(proxy.busy)
+            .buttonStyle(.plain)
+            VStack(spacing: 4) {
+                Button {
+                    toggleFavorite(node.id)
+                } label: {
+                    Image(systemName: favorites.contains(node.id) ? "star.fill" : "star")
+                        .foregroundStyle(favorites.contains(node.id) ? HarborColors.orange : Color.secondary)
+                        .frame(width: 30, height: 30)
+                }
+                .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.orange))
+                Button {
+                    Task { await proxy.testLatency([node.id]) }
+                } label: {
+                    Image(systemName: proxy.latencyCurrentID == node.id ? "hourglass" : "speedometer")
+                        .foregroundStyle(HarborColors.blue)
+                        .frame(width: 30, height: 30)
+                }
+                .disabled(proxy.latencyTesting || !proxy.coreInstalled)
+                .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue, cornerRadius: 7))
+                .help("测速，不切换节点")
+            }
+        }
+        .padding(.trailing, 8)
+        .contentShape(RoundedRectangle(cornerRadius: 10))
+        .background(
+            selected ? HarborColors.blue.opacity(0.085)
+                : (hoveredNodeID == node.id
+                    ? HarborColors.blue.opacity(0.055) : Color.primary.opacity(0.018)),
+            in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10)
+            .stroke(selected ? HarborColors.blue.opacity(0.22) : HarborColors.cardBorder))
+        .onHover { hovering in
+            if hovering { hoveredNodeID = node.id }
+            else if hoveredNodeID == node.id { hoveredNodeID = nil }
+        }
+    }
+
+    private var pagination: some View {
+        HStack(spacing: 4) {
+            Text("共 \(shownNodes.count) 条")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+            pageButton("chevron.left", to: currentPage - 1).disabled(currentPage == 1)
+            ForEach(HarborProxyCatalog.pageChoices(current: currentPage, total: maxPage), id: \.self) { value in
+                if value == 0 {
+                    Text("…").font(.system(size: 10)).frame(width: 18)
+                } else {
+                    Button {
+                        page = value
+                    } label: {
+                        Text("\(value)")
+                            .font(.system(size: 10, weight: value == currentPage ? .semibold : .medium))
+                            .foregroundStyle(value == currentPage ? Color.white : Color.primary)
+                            .frame(width: 27, height: 27)
+                            .background(value == currentPage ? HarborColors.blue : .clear,
+                                        in: RoundedRectangle(cornerRadius: 7))
+                    }
+                    .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue))
+                }
+            }
+            pageButton("chevron.right", to: currentPage + 1).disabled(currentPage == maxPage)
+            Spacer(minLength: 0)
+            Menu {
+                ForEach([10, 20, 30], id: \.self) { size in
+                    Button("每页 \(size) 条") { pageSize = size }
+                }
+            } label: {
+                Text("每页 \(pageSize) 条")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            .menuStyle(.borderlessButton)
+            .frame(width: 86)
+        }
+        .frame(height: 52)
+        .padding(.horizontal, 15)
+        .overlay(alignment: .top) {
+            Rectangle().fill(HarborColors.cardBorder).frame(height: 1)
+        }
+    }
+
+    private var pageChoices: [Int] {
+        if maxPage <= 5 { return Array(1...maxPage) }
+        let middle = min(max(2, currentPage), maxPage - 1)
+        var values = [1]
+        if middle > 2 { values.append(0) }
+        if middle != 1 && middle != maxPage { values.append(middle) }
+        if middle < maxPage - 1 { values.append(0) }
+        values.append(maxPage)
+        return values
+    }
+
+    private func pageButton(_ icon: String, to index: Int) -> some View {
+        Button { page = index } label: {
+            Image(systemName: icon)
+                .font(.system(size: 10))
+                .frame(width: 24, height: 27)
+        }
+        .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue))
+    }
+
+    private func toggleFavorite(_ id: String) {
+        if !favorites.insert(id).inserted { favorites.remove(id) }
+        UserDefaults.standard.set(Array(favorites), forKey: favoritesKey)
+    }
+
+    private func protocolColor(_ name: String) -> Color {
+        switch name.lowercased() {
+        case "trojan": HarborColors.green
+        case "shadowsocks": HarborColors.red
+        default: HarborColors.blue
+        }
+    }
+
+    private func latencyColor(_ milliseconds: Int) -> Color {
+        if milliseconds < 200 { return HarborColors.green }
+        if milliseconds < 500 { return HarborColors.orange }
+        return HarborColors.red
+    }
+
+    private func regionEmoji(_ name: String) -> String {
+        switch name {
+        case "香港": "🇭🇰"
+        case "美国": "🇺🇸"
+        case "日本": "🇯🇵"
+        case "新加坡": "🇸🇬"
+        case "台湾": "🇹🇼"
+        case "德国": "🇩🇪"
+        case "韩国": "🇰🇷"
+        case "英国": "🇬🇧"
+        default: "🌐"
+        }
+    }
+
+    private func regionFlag(_ node: HarborProxyNode) -> String {
+        switch HarborProxyRegion.infer(from: node.name) {
+        case .hongKong: "🇭🇰"
+        case .unitedStates: "🇺🇸"
+        case .japan: "🇯🇵"
+        case .singapore: "🇸🇬"
+        case .taiwan: "🇹🇼"
+        case .germany: "🇩🇪"
+        case .unitedKingdom: "🇬🇧"
+        case .korea: "🇰🇷"
+        case .other: "🌐"
+        }
+    }
+
+    private func resetFilters() {
+        page = 1
+        region = "全部"
+        protocolFilter = "全部"
+        latencyFilter = "全部"
+    }
+
+    private func location(of node: HarborProxyNode) -> String {
+        HarborProxyRegion.infer(from: node.name).rawValue
+    }
+
+    // A centered, padded form with the same visual language as hosted-key setup.
+    private func editorSheet(_ mode: Editor) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 14) {
+                Text(mode == .importChoice ? "新增代理配置"
+                     : (mode == .subscription ? "添加订阅" : "导入节点链接"))
+                    .font(.system(size: 19, weight: .bold, design: .rounded))
+                Spacer(minLength: 0)
+                Button { editor = nil } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 28)
+                        .background(Color.primary.opacity(0.045), in: Circle())
+                }
+                .buttonStyle(HarborInteractivePlainButtonStyle(
+                    tint: Color.primary, cornerRadius: 9))
+                .help("关闭")
+            }
+            .frame(height: 34)
+            .padding(.bottom, 22)
+
+            if mode == .importChoice {
+                Text("选择添加方式")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.bottom, 13)
+                VStack(spacing: 12) {
+                    importOption("订阅地址", subtitle: "通过 HTTPS 订阅获取并更新节点",
+                                 symbol: "link", tint: HarborColors.blue) {
+                        editor = .subscription
+                    }
+                    importOption("节点分享链接", subtitle: "粘贴 VLESS、VMess、Trojan 或 SS 链接",
+                                 symbol: "square.and.arrow.down", tint: HarborColors.purple) {
+                        editor = .links
+                    }
+                }
+            } else if mode == .subscription {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("订阅名称").font(.callout.weight(.semibold))
+                    TextField("例如：我的订阅", text: $subscriptionName)
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 12)
+                        .frame(height: 44)
+                        .background(Color(nsColor: .controlBackgroundColor),
+                                    in: RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color.primary.opacity(0.12)))
+                }
+                .padding(.bottom, 17)
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("HTTPS 订阅地址").font(.callout.weight(.semibold))
+                    SecureField("粘贴 https:// 开头的订阅链接", text: $subscriptionURL)
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 12)
+                        .frame(height: 44)
+                        .background(Color(nsColor: .controlBackgroundColor),
+                                    in: RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color.primary.opacity(0.12)))
+                    Text("订阅地址保存在系统钥匙串，添加后可手动更新")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("节点分享链接").font(.callout.weight(.semibold))
+                    TextEditor(text: $nodeLinks)
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .frame(height: 140)
+                        .padding(5)
+                        .background(Color(nsColor: .controlBackgroundColor),
+                                    in: RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color.primary.opacity(0.12)))
+                    Text("每行一条链接，不影响已连接的代理")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer(minLength: 18)
+            Rectangle()
+                .fill(HarborColors.cardBorder)
+                .frame(height: 1)
+                .padding(.bottom, 15)
+            HStack(spacing: 10) {
+                Spacer()
+                Button("取消") { editor = nil }
+                    .keyboardShortcut(.cancelAction)
+                    .buttonStyle(HarborActionButtonStyle(
+                        tint: .secondary, prominence: .secondary))
+                if mode != .importChoice {
+                    Button {
+                        if mode == .subscription {
+                            proxy.addSubscription(
+                                name: subscriptionName.trimmingCharacters(in: .whitespacesAndNewlines),
+                                url: subscriptionURL.trimmingCharacters(in: .whitespacesAndNewlines))
+                            subscriptionName = ""
+                            subscriptionURL = ""
+                            if let newID = proxy.subscriptions.last?.id {
+                                groupID = newID
+                                favoritesOnly = false
+                                resetFilters()
+                                Task { await proxy.refreshSubscription(newID) }
+                            }
+                        } else {
+                            proxy.addLinks(nodeLinks)
+                            nodeLinks = ""
+                        }
+                        editor = nil
+                    } label: {
+                        Text(mode == .subscription ? "添加订阅" : "导入节点")
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(HarborActionButtonStyle(
+                        tint: .blue, prominence: .prominent))
+                    .disabled(mode == .subscription
+                              ? subscriptionURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              : nodeLinks.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .frame(height: 35)
+        }
+        .padding(.horizontal, 27)
+        .padding(.top, 30)
+        .padding(.bottom, 26)
+        .frame(width: 500, height: mode == .importChoice ? 356 : (mode == .links ? 375 : 370))
+        .onExitCommand { editor = nil }
+    }
+
+    private func importOption(_ title: String, subtitle: String, symbol: String,
+                              tint: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 13) {
+                Image(systemName: symbol)
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(tint)
+                    .frame(width: 38, height: 38)
+                    .background(tint.opacity(0.085), in: RoundedRectangle(cornerRadius: 10))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    Text(subtitle)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 64)
+            .background(Color(nsColor: .controlBackgroundColor),
+                        in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.10)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(HarborInteractivePlainButtonStyle(tint: tint, cornerRadius: 10))
+    }
+
+}

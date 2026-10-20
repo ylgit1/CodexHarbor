@@ -21,7 +21,10 @@ final class HarborApplicationDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Recovery and optional core autostart cannot depend on a window/menu being opened.
-        Task { await HarborProxyManager.shared.bootstrap() }
+        Task {
+            await HarborProxyManager.shared.bootstrap()
+            HarborRuntimeEnvironment.shared.refresh()
+        }
         // Authorization is an app-level service, not owned by a window or
         // SwiftUI view. A closed window must not disable approval prompts.
         HarborApprovalPanelController.shared.start()

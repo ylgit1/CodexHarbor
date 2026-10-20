@@ -5,11 +5,73 @@ import ChatGPTBridgeCore
 struct HarborSettingsView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var bridge: ChatGPTBridgeViewModel
+    @ObservedObject private var environment = HarborRuntimeEnvironment.shared
+    @ObservedObject private var proxy = HarborProxyManager.shared
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Text("设置")
                     .font(.system(size: 22, weight: .bold, design: .rounded))
+
+                HarborCard(padding: 0) {
+                    VStack(spacing: 0) {
+                        sectionHeader("运行环境")
+                        environmentRow("macOS 14 或更新", available:
+                            ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 14,
+                            detail: "系统要求")
+                        Divider().opacity(0.4).padding(.horizontal, 16)
+                        environmentRow("ChatGPT 桌面版", available: environment.chatGPTDesktop,
+                                       detail: "ChatGPT 接入")
+                        if !environment.chatGPTDesktop {
+                            HStack {
+                                Text("尚未安装 ChatGPT macOS 桌面版")
+                                    .font(.system(size: 10.5))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Button("获取官方安装包") {
+                                    NSWorkspace.shared.open(URL(string: "https://chatgpt.com/download/")!)
+                                }
+                                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+                                Button("重新检测") { environment.refresh() }
+                                    .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+                            }
+                            .padding(.horizontal, 16)
+                            .frame(height: 41)
+                        }
+                        Divider().opacity(0.4).padding(.horizontal, 16)
+                        environmentRow("OpenAI 本地管道", available: environment.tunnelClient,
+                                       detail: "本地管道启用时下载")
+                        Divider().opacity(0.4).padding(.horizontal, 16)
+                        environmentRow("Cloudflared", available: environment.cloudflared,
+                                       detail: "公网 HTTPS 启用时下载")
+                        Divider().opacity(0.4).padding(.horizontal, 16)
+                        environmentRow("Xray 与路由数据", available: proxy.coreInstalled,
+                                       detail: "网络代理使用")
+                        Divider().opacity(0.4).padding(.horizontal, 16)
+                        environmentRow("Git", available: environment.git,
+                                       detail: "本地项目 Git 工具")
+                        if !proxy.coreInstalled {
+                            Divider().opacity(0.4).padding(.horizontal, 16)
+                            HStack {
+                                Text(proxy.installingCore ? "正在从应用安装包恢复 Xray" : "Xray 内置资源未就绪，可离线恢复")
+                                    .font(.system(size: 10.5))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Button(proxy.installingCore ? "恢复中…" : "恢复内置 Xray") {
+                                    Task {
+                                        await proxy.installBundledXray()
+                                        environment.refresh()
+                                    }
+                                }
+                                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+                                .disabled(proxy.busy || proxy.installingCore || proxy.running || proxy.requiresRecovery)
+                            }
+                            .padding(.horizontal, 16)
+                            .frame(minHeight: 48)
+                        }
+                    }
+                }
+                .frame(maxWidth: 760)
 
                 HarborCard(padding: 0) {
                     VStack(spacing: 0) {
@@ -70,6 +132,28 @@ struct HarborSettingsView: View {
             .padding(.top, 24)
             .padding(.bottom, 24)
         }
+        .onAppear { environment.refresh() }
+    }
+
+    private func environmentRow(_ title: String, available: Bool, detail: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: available ? "checkmark.circle.fill" : "circle.dotted")
+                .foregroundStyle(available ? HarborColors.green : Color.secondary)
+                .font(.system(size: 12))
+                .frame(width: 18)
+            Text(title)
+                .font(.system(size: 11.5, weight: .medium))
+            Spacer()
+            Text(available ? "已就绪" : "按需配置")
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(available ? HarborColors.green : Color.secondary)
+            Text(detail)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .frame(width: 125, alignment: .trailing)
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 43)
     }
 
     private func sectionHeader(_ title: String) -> some View {

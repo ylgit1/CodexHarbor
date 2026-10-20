@@ -372,6 +372,30 @@ struct HarborProxyWorkspaceView: View {
             .scrollIndicators(.hidden)
             .frame(minHeight: 0, maxHeight: .infinity)
 
+            if !proxy.coreInstalled {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(proxy.installingCore ? "正在恢复 Xray…" : "内置 Xray 尚未就绪")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Button {
+                        Task { await proxy.installBundledXray() }
+                    } label: {
+                        Label(proxy.installingCore ? "恢复中…" : "从安装包恢复 Xray",
+                              systemImage: "shippingbox")
+                    }
+                    .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+                    .disabled(proxy.busy || proxy.installingCore || proxy.requiresRecovery)
+                    Text(proxy.detail.isEmpty ? "无需网络，也不需要预先安装 v2rayN" : proxy.detail)
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 13)
+                .padding(.vertical, 9)
+                .overlay(alignment: .top) {
+                    Rectangle().fill(HarborColors.cardBorder).frame(height: 1)
+                }
+            }
             HStack(spacing: 4) {
                 Text("代理路由")
                     .font(.system(size: 10.5))

@@ -104,6 +104,36 @@ fi
 /usr/libexec/PlistBuddy -c "Add :HarborGitCommit string $build_commit" "$staging_app_path/Contents/Info.plist"
 echo "==> 版本标记：${release_tag:-development} (${build_number}) · $build_commit"
 cp "$project_root/Resources/AppIcon.icns" "$staging_app_path/Contents/Resources/AppIcon.icns"
+host_arch="$(uname -m)"
+xray_source="$project_root/Resources/Xray/$host_arch"
+xray_destination="$staging_app_path/Contents/Resources/Xray/$host_arch"
+checksum_manifest="$xray_source/SHA256SUMS"
+if [[ ! -f "$checksum_manifest" ]]; then
+  echo "缺少内置 Xray 校验清单：$checksum_manifest" >&2
+  exit 7
+fi
+for required in xray geoip.dat geosite.dat; do
+  if [[ ! -f "$xray_source/$required" ]]; then
+    echo "缺少内置 Xray 资源：$xray_source/$required" >&2
+    exit 7
+  fi
+  expected_checksum="$(/usr/bin/awk -v name="$required" '$2 == name { print $1 }' "$checksum_manifest")"
+  actual_checksum="$(/usr/bin/openssl dgst -sha256 -r "$xray_source/$required" | /usr/bin/awk '{ print $1 }')"
+  if [[ -z "$expected_checksum" || "$actual_checksum" != "$expected_checksum" ]]; then
+    echo "内置 Xray 资源校验失败：$required" >&2
+    exit 7
+  fi
+done
+mkdir -p "$xray_destination"
+cp "$xray_source/xray" "$xray_source/geoip.dat" "$xray_source/geosite.dat" "$xray_destination/"
+chmod 755 "$xray_destination/xray"
+chmod 644 "$xray_destination/geoip.dat" "$xray_destination/geosite.dat"
+if [[ "$(/usr/bin/lipo -archs "$xray_destination/xray")" != *"$host_arch"* ]]; then
+  echo "内置 Xray 与当前构建架构不匹配：$host_arch" >&2
+  exit 7
+fi
+"$xray_destination/xray" version >/dev/null
+echo "==> 已内置 Xray、GeoIP、GeoSite（$host_arch），安装后无需下载"
 chmod 755 "$staging_app_path/Contents/MacOS/CodexHarbor" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
 # Sign with the same certificate on every build so the Agent retains its
 # designated requirement (DR) across binary updates. Stable identifiers alone

@@ -64,6 +64,7 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var localPort: Int?
     @Published private(set) var probeResults: [String: HarborProxyProbeResult] = [:]
     @Published private(set) var latencyTesting = false
+    @Published private(set) var installingCore = false
     @Published private(set) var latencyCurrentID: String?
     @Published private(set) var latencyCompleted = 0
     @Published private(set) var latencyTotal = 0
@@ -79,10 +80,53 @@ final class HarborProxyManager: ObservableObject {
         .appendingPathComponent("Library/Application Support/CodexHarbor/NetworkProxy", isDirectory: true)
     var selectedNode: HarborProxyNode? { nodes.first { $0.id == selectedID } }
     var coreInstalled: Bool {
-        FileManager.default.isExecutableFile(atPath: root.appendingPathComponent("xray").path)
+        let files = ["xray", "geoip.dat", "geosite.dat"]
+        return files.allSatisfy {
+            let path = root.appendingPathComponent($0).path
+            return $0 == "xray"
+                ? FileManager.default.isExecutableFile(atPath: path)
+                : FileManager.default.fileExists(atPath: path)
+        }
+    }
+
+    /// Restores the packaged runtime without downloading or changing system proxy.
+    func installBundledXray() async {
+        guard !busy, !latencyTesting, !installingCore, !running, child == nil,
+              !HarborSystemProxy.hasBackup,
+              !FileManager.default.fileExists(atPath: runtimeRecordURL.path) else {
+            detail = "当前代理运行中或存在待恢复配置，请先安全清理代理后再安装 Xray"
+            return
+        }
+        busy = true
+        installingCore = true
+        status = "准备内置内核"
+        detail = "正在从 Codex Harbor 安装包恢复 Xray、GeoIP、GeoSite"
+        defer {
+            busy = false
+            installingCore = false
+        }
+        do {
+            let result = try HarborXrayInstaller.installBundled(into: root)
+            guard coreInstalled else { throw HarborProxyError.invalid("Xray 安装后文件不完整") }
+            detail = "内置 \(result.version) 已就绪，全程无需联网下载"
+            status = "内核已就绪"
+        } catch {
+            detail = "Xray 安装失败：" + error.localizedDescription
+            status = "内核待安装"
+        }
     }
     var systemProxyDescription: String { HarborSystemProxy.activeProxyDescription() }
-    var requiresRecovery: Bool { HarborSystemProxy.hasBackup }
+    /// A saved recovery snapshot is normal while Harbor owns the live proxy.
+    /// Only warn when a snapshot exists without an active, owned connection.
+    var requiresRecovery: Bool {
+        guard HarborSystemProxy.hasBackup else { return false }
+        return HarborProxyRecoveryPolicy.requiresRecovery(
+            hasBackup: true,
+            isRunning: running,
+            isSystemManaged: systemManaged,
+            ownsSystemProxy: HarborSystemProxy.isOwned()
+        )
+    }
 
     private init() {
         let state = HarborProxyStore.load()
@@ -95,8 +139,16 @@ final class HarborProxyManager: ObservableObject {
     func bootstrap() async {
         guard !bootstrapped else { return }
         bootstrapped = true
+        if !coreInstalled {
+            do {
+                let result = try HarborXrayInstaller.installBundled(into: root)
+                detail = "已从安装包准备 \(result.version)"
+            } catch {
+                detail = "内置 Xray 准备失败：" + error.localizedDescription
+            }
+        }
         // Never autostart into a stale system proxy pointing at a dead port.
-        if requiresRecovery {
+        if HarborSystemProxy.hasBackup {
             do {
                 try HarborSystemProxy.restore(interactive: false)
                 systemManaged = false
@@ -293,7 +345,7 @@ final class HarborProxyManager: ObservableObject {
     /// The visible 'clear proxy' action never silently deletes another
     /// application's system settings or node/subscription configurations.
     func clearProxy() {
-        if running || requiresRecovery {
+        if running || HarborSystemProxy.hasBackup {
             _ = stop()
         } else {
             detail = "Harbor 当前没有启用代理；其他程序的系统代理设置未修改"
@@ -319,9 +371,9 @@ final class HarborProxyManager: ObservableObject {
                 return
             }
         }
-        guard !requiresRecovery else { detail = "请先恢复残留的系统代理设置"; return }
+        guard !HarborSystemProxy.hasBackup else { detail = "请先恢复残留的系统代理设置"; return }
         guard let node = selectedNode else { detail = "先导入并选择节点"; return }
-        guard coreInstalled else { detail = "请先从 v2rayN 迁移 Xray 内核"; return }
+        guard coreInstalled else { detail = "请从安装包恢复内置 Xray 内核"; return }
         busy = true; defer { busy = false }
         status = "正在连接"; detail = ""
         do {
@@ -402,7 +454,7 @@ final class HarborProxyManager: ObservableObject {
     /// Xray process and HTTPS request; never switch the active system proxy.
     func testLatency(_ ids: [String]) async {
         guard !latencyTesting, !busy, coreInstalled else {
-            if !coreInstalled { detail = "请先导入 Xray 内核，才能测试节点延迟" }
+            if !coreInstalled { detail = "请先恢复内置 Xray，才能测试节点延迟" }
             return
         }
         let uniqueIDs = Array(NSOrderedSet(array: ids)) as? [String] ?? ids
@@ -451,7 +503,7 @@ final class HarborProxyManager: ObservableObject {
 
     @discardableResult
     func stop(interactive: Bool = true) -> Bool {
-        if requiresRecovery {
+        if HarborProxyRecoveryPolicy.mustRestoreBeforeStop(hasBackup: HarborSystemProxy.hasBackup) {
             do { try HarborSystemProxy.restore(interactive: interactive) }
             catch { detail = "系统代理未恢复，请先清除再关闭：" + error.localizedDescription; return false }
         }

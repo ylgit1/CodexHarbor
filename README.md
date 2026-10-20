@@ -92,13 +92,14 @@ flowchart LR
 127.0.0.1 的 HTTP/SOCKS5 端口，不启用 TUN，不直接修改 Codex 连接设置或 ChatGPT
 本地管道/公网 HTTPS 的业务配置。菜单栏提供启动和停止代理的快捷操作。
 
-首次点击「从 v2rayN 迁移」会以 SQLite 只读方式读取
-`~/Library/Application Support/v2rayN/guiConfigs/guiNDB.db` 和
-`guiNConfig.json`：导入受支持的 VLESS 节点、HTTPS 订阅及选中节点，明确统计其他
-不支持的记录。原始配置不会被修改；VLESS、VMess、Trojan、Shadowsocks 分享链接可另行导入。
-迁移时复制 Xray 和 geoip/geosite 资源到 Harbor 专属目录，使其之后不依赖 v2rayN
-客户端运行。Apple Silicon Mac 优先复用已安装的官方 arm64 Xray 缓存，否则复制现有
-v2rayN 内核。敏感节点、订阅信息保存在系统钥匙串，临时运行配置设为 0600 权限。
+**不需要预先安装 v2rayN，也不需要首次启动下载内核**：发行包已内置当前 Mac 架构的
+XTLS Xray-core、`geoip.dat` 和 `geosite.dat`。首次启动会把它们复制到 Harbor 独立目录，
+整个过程不访问 GitHub；资源丢失时也可在「网络代理」或「设置」中从应用安装包离线恢复。
+已有正在运行的代理或等待恢复的系统代理时，禁止替换内核，以免中断联网。
+
+从已有 v2rayN 迁移的底层兼容代码仍然保留，但不再是新设备安装的前置条件。
+可通过「新增」导入 HTTPS 订阅或 VLESS、VMess、Trojan、Shadowsocks 分享链接。
+敏感节点、订阅信息保存在系统钥匙串，临时运行配置设为 0600 权限。
 
 **切换代理的安全前提**：如果 v2rayN 当前仍控制系统代理（例如 127.0.0.1:10808），
 Harbor 拒绝覆盖；请先在 v2rayN 内清除系统代理，然后在 Harbor 内设置。设置前备份
@@ -319,9 +320,8 @@ flowchart TB
 ### 运行
 
 - macOS 14 或更高
-- Codex CLI（使用 Codex 连接功能时）
-- ChatGPT 侧具备可配置 MCP Server 的环境（使用 ChatGPT 接入时）
-- 网络连接（首次下载 tunnel-client / cloudflared 或使用公网接入时）
+- ChatGPT macOS 桌面版（使用 ChatGPT 接入时；不要求 Codex CLI）
+- 网络连接（首次下载 tunnel-client / cloudflared 或使用公网接入时；Xray 无需下载）
 
 Transport Installer 当前同时包含 Apple Silicon（arm64）与 Intel（x86_64）资源选择逻辑。
 

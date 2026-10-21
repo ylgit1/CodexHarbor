@@ -28,9 +28,20 @@ struct HarborTechDashboardContent: View {
     @State private var dashboardFeedbackIsError = false
     @State private var dashboardFeedbackID = UUID()
 
+    private static let networkBackdrop: NSImage? = {
+        guard let url = Bundle.main.url(
+            forResource: "workbench-network-backdrop",
+            withExtension: "png",
+            subdirectory: "Dashboard"
+        ) else { return nil }
+        return NSImage(contentsOf: url)
+    }()
+
     private let teal = Color(red: 0.03, green: 0.72, blue: 0.57)
     private let electric = Color(red: 0.16, green: 0.51, blue: 0.98)
     private let violet = Color(red: 0.58, green: 0.34, blue: 0.96)
+    private let techInk = Color(red: 0.08, green: 0.19, blue: 0.36)
+    private let techMutedInk = Color(red: 0.23, green: 0.34, blue: 0.49)
 
     private var systemProxyAvailable: Bool { proxy.running && proxy.healthy && proxy.systemManaged }
     private var codexModel: String {
@@ -234,30 +245,40 @@ struct HarborTechDashboardContent: View {
             let scale = min(1.42, max(0.88, w / 1000))
             ZStack {
                 RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.035, green: 0.085, blue: 0.18),
-                                Color(red: 0.045, green: 0.09, blue: 0.21),
-                                Color(red: 0.095, green: 0.07, blue: 0.23)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
+                    .fill(Color(red: 0.90, green: 0.95, blue: 1.0))
+                if let backdrop = Self.networkBackdrop {
+                    Image(nsImage: backdrop)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: w, height: h)
+                        .clipped()
+                        .saturation(0.92)
+                        .brightness(0.035)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                } else {
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.87, green: 0.93, blue: 1.0),
+                            Color(red: 0.78, green: 0.88, blue: 1.0),
+                            Color(red: 0.93, green: 0.96, blue: 1.0)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
                     )
-                // Decorative optics remain independent of view state.
-                RadialGradient(
-                    colors: [electric.opacity(0.23), electric.opacity(0.04), .clear],
-                    center: .center, startRadius: 0, endRadius: w * 0.32
+                }
+                // Keep the original luminous circles and moving route points
+                // readable while retaining the much lighter background art.
+                LinearGradient(
+                    colors: [
+                        Color(red: 0.02, green: 0.10, blue: 0.24).opacity(0.08),
+                        Color(red: 0.02, green: 0.12, blue: 0.30).opacity(0.17),
+                        Color.white.opacity(0.05)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
                 )
-                .frame(width: w * 0.65, height: h)
-                .position(x: w * 0.10, y: h * 0.34)
-                RadialGradient(
-                    colors: [violet.opacity(0.18), violet.opacity(0.02), .clear],
-                    center: .center, startRadius: 0, endRadius: w * 0.34
-                )
-                .frame(width: w * 0.70, height: h)
-                .position(x: w * 0.93, y: h * 0.68)
+                .allowsHitTesting(false)
 
                 HarborTechFlowLines(proxyActive: systemProxyAvailable)
                     .allowsHitTesting(false)
@@ -267,14 +288,14 @@ struct HarborTechDashboardContent: View {
                         .foregroundStyle(electric)
                     Text("NETWORK FABRIC")
                         .tracking(2)
-                        .foregroundStyle(Color.white.opacity(0.84))
+                        .foregroundStyle(techInk.opacity(0.88))
                     Text("/ 可选网络层")
-                        .foregroundStyle(Color.white.opacity(0.54))
+                        .foregroundStyle(techMutedInk.opacity(0.75))
                     Spacer()
                     Circle().fill(systemProxyAvailable ? teal : Color.white.opacity(0.38))
                         .frame(width: 6, height: 6)
                     Text(systemProxyAvailable ? "代理已接管" : "系统网络")
-                        .foregroundStyle(Color.white.opacity(0.80))
+                        .foregroundStyle(techInk.opacity(0.82))
                 }
                 .font(.system(size: 10 * scale, weight: .semibold, design: .monospaced))
                 .padding(.horizontal, max(22, w * 0.032))
@@ -305,29 +326,36 @@ struct HarborTechDashboardContent: View {
                 VStack(spacing: max(4, h * 0.015)) {
                         ZStack {
                             Circle()
-                                .stroke(violet.opacity(0.13), lineWidth: 12)
+                                .fill(Color.white.opacity(0.76))
+                                .frame(width: 128 * scale, height: 128 * scale)
+                                .shadow(color: techInk.opacity(0.12), radius: 18, y: 8)
+                            Circle()
+                                .stroke(violet.opacity(0.24), lineWidth: 12)
                                 .frame(width: 120 * scale, height: 120 * scale)
                             Circle()
                                 .stroke(
                                     AngularGradient(
-                                        colors: [violet.opacity(0.2), electric, teal, violet],
+                                        colors: [violet.opacity(0.55), electric, teal, violet],
                                         center: .center
-                                    ), lineWidth: 2.3
+                                    ), lineWidth: 3
                                 )
                                 .frame(width: 105 * scale, height: 105 * scale)
                             Circle()
-                                .stroke(violet.opacity(0.45),
+                                .fill(violet.opacity(0.10))
+                                .frame(width: 84 * scale, height: 84 * scale)
+                            Circle()
+                                .stroke(violet.opacity(0.62),
                                         style: StrokeStyle(lineWidth: 1, dash: [3, 5]))
                                 .frame(width: 84 * scale, height: 84 * scale)
                             Image(systemName: systemProxyAvailable ? "network" : "globe")
                                 .font(.system(size: 34 * scale, weight: .light))
-                                .foregroundStyle(Color.white)
-                                .shadow(color: violet, radius: 14)
+                                .foregroundStyle(violet)
+                                .shadow(color: violet.opacity(0.25), radius: 8, y: 3)
                         }
                         Text("NETWORK CORE")
                             .font(.system(size: 11 * scale, weight: .bold, design: .monospaced))
                             .tracking(1.4)
-                            .foregroundStyle(.white)
+                            .foregroundStyle(techInk)
                         Text(proxyState)
                             .font(.system(size: 10 * scale, weight: .semibold))
                             .foregroundStyle(systemProxyAvailable ? teal : Color.white.opacity(0.7))
@@ -336,7 +364,7 @@ struct HarborTechDashboardContent: View {
                              ? (proxy.selectedNode?.displayName ?? "本地代理")
                              : "直连可用 · 代理非必需")
                             .font(.system(size: 9 * scale))
-                            .foregroundStyle(Color.white.opacity(0.65))
+                            .foregroundStyle(techMutedInk.opacity(0.82))
                             .lineLimit(1)
                     }
                     .frame(width: max(160, w * 0.22))
@@ -344,26 +372,19 @@ struct HarborTechDashboardContent: View {
                 .position(x: w * 0.50, y: h * 0.66)
                 .help("网络路径示意，代理管理请使用下方功能卡片")
 
-                // Compact, non-interactive circuit labels add visual depth
-                // without extra polling, network probes or SwiftUI timers.
-                topologySignal("CODEX CLI", tint: teal, scale: scale)
-                    .position(x: w * 0.35, y: h * 0.55)
-                topologySignal("MCP BRIDGE", tint: electric, scale: scale)
-                    .position(x: w * 0.65, y: h * 0.55)
-
                 HStack(spacing: 10) {
                     Image(systemName: "arrow.triangle.branch")
                         .foregroundStyle(teal)
                     Text("实线 · 可选代理")
-                    Rectangle().fill(Color.white.opacity(0.20)).frame(width: 1, height: 12)
+                    Rectangle().fill(techInk.opacity(0.18)).frame(width: 1, height: 12)
                     Image(systemName: "arrow.up.right").foregroundStyle(electric)
                     Text("虚线 · 直连通道")
                     Spacer()
                     Text("网络路径示意 ≠ 实际流量归属")
-                        .foregroundStyle(Color.white.opacity(0.52))
+                        .foregroundStyle(techMutedInk.opacity(0.72))
                 }
                 .font(.system(size: 9 * scale, weight: .medium))
-                .foregroundStyle(Color.white.opacity(0.78))
+                .foregroundStyle(techInk.opacity(0.78))
                 .padding(.horizontal, max(22, w * 0.032))
                 .position(x: w / 2, y: h * 0.925)
             }
@@ -379,23 +400,27 @@ struct HarborTechDashboardContent: View {
         VStack(spacing: 6 * scale) {
                 ZStack {
                     Circle()
-                        .stroke(tint.opacity(0.17), lineWidth: 12 * scale)
+                        .fill(Color.white.opacity(0.78))
+                        .frame(width: 108 * scale, height: 108 * scale)
+                        .shadow(color: techInk.opacity(0.10), radius: 17 * scale, y: 7 * scale)
+                    Circle()
+                        .stroke(tint.opacity(0.25), lineWidth: 12 * scale)
                         .frame(width: 98 * scale, height: 98 * scale)
                     Circle()
-                        .stroke(tint.opacity(0.60), lineWidth: 1.3)
+                        .stroke(tint.opacity(0.82), lineWidth: 2)
                         .frame(width: 88 * scale, height: 88 * scale)
                     Circle()
-                        .fill(tint.opacity(0.13))
+                        .fill(tint.opacity(0.18))
                         .frame(width: 66 * scale, height: 66 * scale)
                     Image(systemName: icon)
                         .font(.system(size: 27 * scale, weight: .medium))
-                        .foregroundStyle(.white)
-                        .shadow(color: tint, radius: 8)
+                        .foregroundStyle(tint)
+                        .shadow(color: tint.opacity(0.22), radius: 7, y: 2)
                 }
                 Text(title)
                     .font(.system(size: 11 * scale, weight: .bold, design: .monospaced))
                     .tracking(1)
-                    .foregroundStyle(.white)
+                    .foregroundStyle(techInk)
                 HStack(spacing: 5) {
                     Circle().fill(tint).frame(width: 5 * scale, height: 5 * scale)
                     Text(status)
@@ -404,35 +429,18 @@ struct HarborTechDashboardContent: View {
                 .foregroundStyle(tint)
                 Text(detail)
                     .font(.system(size: 11 * scale, weight: .semibold))
-                    .foregroundStyle(Color.white.opacity(0.86))
+                    .foregroundStyle(techInk.opacity(0.88))
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Text(subtitle)
                     .font(.system(size: 9 * scale))
-                    .foregroundStyle(Color.white.opacity(0.57))
+                    .foregroundStyle(techMutedInk.opacity(0.76))
                     .lineLimit(1)
             }
             .frame(maxWidth: .infinity)
             .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .help(title + " 的当前状态；管理操作请使用下方卡片")
-    }
-
-    private func topologySignal(_ name: String, tint: Color, scale: CGFloat) -> some View {
-        HStack(spacing: 5) {
-            Circle().fill(tint).frame(width: 4, height: 4)
-            Text(name)
-                .tracking(0.9)
-        }
-        .font(.system(size: 8 * scale, weight: .semibold, design: .monospaced))
-        .foregroundStyle(tint.opacity(0.78))
-        .padding(.horizontal, 9)
-        .frame(height: 19 * scale)
-        .background(Color(red: 0.05, green: 0.095, blue: 0.18).opacity(0.90),
-                    in: Capsule())
-        .overlay(Capsule().stroke(tint.opacity(0.20)))
-        .fixedSize()
-        .accessibilityHidden(true)
     }
 
     private func glassCard<Content: View>(

@@ -161,7 +161,10 @@ public enum HarborUICaptureSocket {
         guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else {
             return false
         }
-        let path = String(cString: buffer)
+        let path = String(
+            decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) },
+            as: UTF8.self
+        )
         // Only the installed, signed Helper inside the running app bundle.
         guard let applicationURL = Bundle.main.bundleURL as URL? else { return false }
         let expected = applicationURL.appendingPathComponent(

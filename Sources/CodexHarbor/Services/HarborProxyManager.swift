@@ -1,9 +1,12 @@
+import AppKit
 import CodexHarborCore
+import CryptoKit
 import Foundation
 import Darwin
 import Security
+import SystemConfiguration
 
-private struct HarborProxyState: Codable {
+private struct HarborProxyState: Codable, Equatable, Sendable {
     var nodes: [HarborProxyNode] = []
     var subscriptions: [HarborProxySubscription] = []
     var selectedID: String?
@@ -21,44 +24,167 @@ private struct HarborProxyProcessRecord: Codable {
     var executablePath: String
 }
 
-@MainActor
-private enum HarborProxyStore {
-    static let query: [String: Any] = [
+private actor HarborProxyPersistence {
+    private static let legacyQuery: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: "com.codexharbor.v2rayn-replacement",
         kSecAttrAccount as String: "settings"
     ]
-    static func load() -> HarborProxyState {
-        var q = query
+    private static let keyQuery: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "com.codexharbor.proxy-state-key",
+        kSecAttrAccount as String: "v2"
+    ]
+
+    private let stateURL: URL
+    private var newestGeneration = 0
+
+    init(root: URL) {
+        stateURL = root.appendingPathComponent("proxy-settings-v2.enc")
+    }
+
+    /// Load away from the main actor. Existing users migrate once from the
+    /// legacy large Keychain item to an encrypted file protected by a small
+    /// Keychain-held AES key.
+    func load() throws -> HarborProxyState {
+        if FileManager.default.fileExists(atPath: stateURL.path) {
+            return try decrypt(Data(contentsOf: stateURL))
+        }
+        guard let legacy = loadLegacy() else { return HarborProxyState() }
+        try write(legacy)
+        // Delete only after the encrypted replacement was written and decoded.
+        _ = SecItemDelete(Self.legacyQuery as CFDictionary)
+        return legacy
+    }
+
+    func save(_ value: HarborProxyState, generation: Int) throws {
+        guard generation >= newestGeneration else { return }
+        newestGeneration = generation
+        try write(value)
+    }
+
+    private func loadLegacy() -> HarborProxyState? {
+        var q = Self.legacyQuery
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
         guard SecItemCopyMatching(q as CFDictionary, &result) == errSecSuccess,
               let data = result as? Data,
               let state = try? JSONDecoder().decode(HarborProxyState.self, from: data) else {
-            return HarborProxyState()
+            return nil
         }
         return state
     }
-    static func save(_ value: HarborProxyState) throws {
-        let data = try JSONEncoder().encode(value)
-        let result = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        if result == errSecItemNotFound {
-            var q = query
-            q[kSecValueData as String] = data
-            q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            guard SecItemAdd(q as CFDictionary, nil) == errSecSuccess else {
-                throw HarborProxyError.invalid("无法将配置保存到系统钥匙串")
-            }
-        } else if result != errSecSuccess { throw HarborProxyError.invalid("钥匙串保存失败") }
+
+    private func encryptionKey(create: Bool) throws -> SymmetricKey {
+        var q = Self.keyQuery
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(q as CFDictionary, &result)
+        if status == errSecSuccess, let data = result as? Data, data.count == 32 {
+            return SymmetricKey(data: data)
+        }
+        guard create, status == errSecItemNotFound else {
+            throw HarborProxyError.invalid("无法读取代理配置加密密钥")
+        }
+
+        var bytes = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+            throw HarborProxyError.invalid("无法生成代理配置加密密钥")
+        }
+        let data = Data(bytes)
+        var insert = Self.keyQuery
+        insert[kSecValueData as String] = data
+        insert[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let addStatus = SecItemAdd(insert as CFDictionary, nil)
+        guard addStatus == errSecSuccess else {
+            throw HarborProxyError.invalid("无法保存代理配置加密密钥")
+        }
+        return SymmetricKey(data: data)
+    }
+
+    private func decrypt(_ encrypted: Data) throws -> HarborProxyState {
+        let key = try encryptionKey(create: false)
+        let box = try AES.GCM.SealedBox(combined: encrypted)
+        let data = try AES.GCM.open(box, using: key)
+        return try JSONDecoder().decode(HarborProxyState.self, from: data)
+    }
+
+    private func write(_ value: HarborProxyState) throws {
+        let key = try encryptionKey(create: true)
+        let encoded = try JSONEncoder().encode(value)
+        guard let encrypted = try AES.GCM.seal(encoded, using: key).combined else {
+            throw HarborProxyError.invalid("无法加密代理配置")
+        }
+        let parent = stateURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try encrypted.write(to: stateURL, options: [.atomic, .completeFileProtection])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: stateURL.path
+        )
+        // Verify the committed ciphertext before allowing legacy removal.
+        _ = try decrypt(Data(contentsOf: stateURL))
+    }
+}
+
+/// Event-driven SystemConfiguration observer. It keeps the cached ownership
+/// snapshot current even when another proxy app changes macOS settings while
+/// Codex Harbor remains frontmost.
+private final class HarborSystemProxyChangeMonitor: @unchecked Sendable {
+    private var store: SCDynamicStore?
+    private var source: CFRunLoopSource?
+    private let onChange: @Sendable () -> Void
+
+    init(onChange: @escaping @Sendable () -> Void) {
+        self.onChange = onChange
+    }
+
+    func start() {
+        guard store == nil else { return }
+        var context = SCDynamicStoreContext(
+            version: 0,
+            info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: nil,
+            release: nil,
+            copyDescription: nil
+        )
+        let callback: SCDynamicStoreCallBack = { _, _, info in
+            guard let info else { return }
+            let monitor = Unmanaged<HarborSystemProxyChangeMonitor>
+                .fromOpaque(info).takeUnretainedValue()
+            monitor.onChange()
+        }
+        guard let store = SCDynamicStoreCreate(
+            nil,
+            "com.codexharbor.proxy-state-monitor" as CFString,
+            callback,
+            &context
+        ) else { return }
+        let patterns = [
+            "Setup:/Network/Service/.*/Proxies",
+            "State:/Network/Global/Proxies",
+            "State:/Network/Global/IPv4"
+        ] as CFArray
+        guard SCDynamicStoreSetNotificationKeys(store, nil, patterns),
+              let source = SCDynamicStoreCreateRunLoopSource(nil, store, 0) else { return }
+        self.store = store
+        self.source = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+    }
+
+    deinit {
+        if let source {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        }
     }
 }
 
 @MainActor
 final class HarborProxyManager: ObservableObject {
     static let shared = HarborProxyManager()
-    @Published private(set) var nodes: [HarborProxyNode]
-    @Published private(set) var subscriptions: [HarborProxySubscription]
+    @Published private(set) var nodes: [HarborProxyNode] = []
+    @Published private(set) var subscriptions: [HarborProxySubscription] = []
     @Published private(set) var selectedID: String?
     @Published private(set) var running = false
     @Published private(set) var healthy = false
@@ -68,7 +194,7 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var status = "已关闭"
     @Published private(set) var detail = ""
     @Published private(set) var localPort: Int?
-    @Published private(set) var configuredHTTPPort: Int
+    @Published private(set) var configuredHTTPPort = HarborProxyPortPolicy.defaultHTTPPort
     @Published private(set) var switchingNodeID: String?
     private var pendingActivation = HarborProxyActivationQueue()
     private var activationInProgress = false
@@ -81,9 +207,21 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var latencyTotal = 0
     private var latencyCancellationRequested = false
     @Published private(set) var subscriptionUpdatedAt: [String: Date] = [:]
-    @Published var routingRules: Bool { didSet { store.routingRules = routingRules; persist() } }
-    @Published private(set) var forcedProxyDomains: [String]
-    private var store: HarborProxyState
+    @Published var routingRules = true {
+        didSet {
+            guard configurationLoaded else { return }
+            store.routingRules = routingRules
+            persist()
+        }
+    }
+    @Published private(set) var forcedProxyDomains = HarborProxyDomainRules.defaults
+    @Published private(set) var requiresRecovery = false
+    @Published private(set) var systemProxyDescription = "未启用"
+    private var store = HarborProxyState()
+    private let persistence: HarborProxyPersistence
+    private var persistenceGeneration = 0
+    private var persistenceTask: Task<Void, Never>?
+    private var configurationLoaded = false
     private var child: Process?
     private var adoptedPID: Int32?
     private var configPath: URL?
@@ -111,8 +249,10 @@ final class HarborProxyManager: ObservableObject {
     private var connectionGeneration: UInt64 = 0
     private var healthTask: Task<Void, Never>?
     private var runtimeRecordURL: URL { root.appendingPathComponent("active-process.json") }
-    private let root = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/CodexHarbor/NetworkProxy", isDirectory: true)
+    private let root: URL
+    private var appActivationObserver: NSObjectProtocol?
+    private var wakeObserver: NSObjectProtocol?
+    private var systemProxyMonitor: HarborSystemProxyChangeMonitor?
     var selectedNode: HarborProxyNode? { nodes.first { $0.id == selectedID } }
     var coreInstalled: Bool {
         let files = ["xray", "geoip.dat", "geosite.dat"]
@@ -150,20 +290,6 @@ final class HarborProxyManager: ObservableObject {
             status = "内核待安装"
         }
     }
-    var systemProxyDescription: String { HarborSystemProxy.activeProxyDescription() }
-    /// A saved recovery snapshot is normal while Harbor owns the live proxy.
-    /// Only warn when a snapshot exists without an active, owned connection.
-    var requiresRecovery: Bool {
-        guard HarborSystemProxy.hasBackup else { return false }
-        return HarborProxyRecoveryPolicy.requiresRecovery(
-            hasBackup: true,
-            isRunning: running,
-            isSystemManaged: systemManaged,
-            ownsSystemProxy: HarborSystemProxy.isOwned(),
-            currentUsesManagedListener: HarborSystemProxy.currentUsesManagedListener
-        )
-    }
-
     /// Reconcile the persisted ownership snapshot immediately before a node
     /// operation. If another client (for example v2rayN) has replaced every
     /// Harbor listener, discard only Harbor's marker and leave that proxy
@@ -172,14 +298,17 @@ final class HarborProxyManager: ObservableObject {
     private func prepareSystemProxyForActivation() -> Bool? {
         guard HarborSystemProxy.hasBackup else {
             systemManaged = false
+            refreshSystemProxyState()
             return false
         }
         if HarborSystemProxy.isOwned() {
             systemManaged = true
+            refreshSystemProxyState()
             return true
         }
         guard !HarborSystemProxy.currentUsesManagedListener else {
             systemManaged = false
+            refreshSystemProxyState()
             detail = "系统代理仍有项目指向 Harbor，请先清理代理后再切换节点"
             return nil
         }
@@ -188,36 +317,96 @@ final class HarborProxyManager: ObservableObject {
             // does not overwrite the other client's active proxy settings.
             try HarborSystemProxy.restore(interactive: false)
             systemManaged = false
+            refreshSystemProxyState()
             return false
         } catch {
             systemManaged = false
+            refreshSystemProxyState()
             detail = "无法核对系统代理状态：" + error.localizedDescription
             return nil
         }
     }
 
+    private func startSystemProxyMonitoring() {
+        guard appActivationObserver == nil, wakeObserver == nil, systemProxyMonitor == nil else { return }
+        let monitor = HarborSystemProxyChangeMonitor { [weak self] in
+            Task { @MainActor [weak self] in self?.refreshSystemProxyState(synchronizeOwnership: true) }
+        }
+        monitor.start()
+        systemProxyMonitor = monitor
+        appActivationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshSystemProxyState(synchronizeOwnership: true) }
+        }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshSystemProxyState(synchronizeOwnership: true) }
+        }
+    }
+
+    /// SystemConfiguration reads are intentionally centralized here instead
+    /// of being repeated from SwiftUI computed properties during every render.
+    private func refreshSystemProxyState(synchronizeOwnership: Bool = false) {
+        let hasBackup = HarborSystemProxy.hasBackup
+        let owned = hasBackup && HarborSystemProxy.isOwned()
+        let usesManagedListener = hasBackup && HarborSystemProxy.currentUsesManagedListener
+        if synchronizeOwnership {
+            systemManaged = owned
+        }
+        requiresRecovery = HarborProxyRecoveryPolicy.requiresRecovery(
+            hasBackup: hasBackup,
+            isRunning: running,
+            isSystemManaged: systemManaged,
+            ownsSystemProxy: owned,
+            currentUsesManagedListener: usesManagedListener
+        )
+        systemProxyDescription = HarborSystemProxy.activeProxyDescription()
+    }
+
     private init() {
         NSLog("HarborProxy lifecycle: manager init")
-        let state = HarborProxyStore.load()
-        store = state
-        nodes = state.nodes; subscriptions = state.subscriptions
-        selectedID = state.selectedID; routingRules = state.routingRules
-        autoManageSystemProxy = state.autoManageSystemProxy ?? true
-        configuredHTTPPort = (try? HarborProxyPortPolicy.validate(
-            httpPort: state.httpListenPort ?? HarborProxyPortPolicy.defaultHTTPPort
-        )) ?? HarborProxyPortPolicy.defaultHTTPPort
-        forcedProxyDomains = (try? HarborProxyDomainRules.normalized(
-            state.forcedProxyDomains ?? HarborProxyDomainRules.defaults
-        )) ?? HarborProxyDomainRules.defaults
-        systemManaged = HarborSystemProxy.isOwned()
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/CodexHarbor/NetworkProxy", isDirectory: true)
+        self.root = root
+        persistence = HarborProxyPersistence(root: root)
     }
 
     func bootstrap() async {
         guard !bootstrapped, !bootstrapping else { return }
-        startupTrace("bootstrap-entered")
         NSLog("HarborProxy lifecycle: bootstrap entered")
         bootstrapping = true
         defer { bootstrapping = false }
+        if !configurationLoaded {
+            do {
+                let state = try await persistence.load()
+                store = state
+                nodes = state.nodes
+                subscriptions = state.subscriptions
+                selectedID = state.selectedID
+                routingRules = state.routingRules
+                autoManageSystemProxy = state.autoManageSystemProxy ?? true
+                configuredHTTPPort = (try? HarborProxyPortPolicy.validate(
+                    httpPort: state.httpListenPort ?? HarborProxyPortPolicy.defaultHTTPPort
+                )) ?? HarborProxyPortPolicy.defaultHTTPPort
+                forcedProxyDomains = (try? HarborProxyDomainRules.normalized(
+                    state.forcedProxyDomains ?? HarborProxyDomainRules.defaults
+                )) ?? HarborProxyDomainRules.defaults
+                configurationLoaded = true
+            } catch {
+                detail = "代理配置载入失败：" + error.localizedDescription
+                configurationLoaded = true
+                return
+            }
+        }
+        startSystemProxyMonitoring()
+        refreshSystemProxyState(synchronizeOwnership: true)
+        startupTrace("bootstrap-entered")
         if !coreInstalled {
             do {
                 let result = try HarborXrayInstaller.installBundled(into: root)
@@ -251,8 +440,10 @@ final class HarborProxyManager: ObservableObject {
                 do {
                     try HarborSystemProxy.restore(interactive: false)
                     systemManaged = false
+                    refreshSystemProxyState()
                     detail = "上次退出的系统代理已恢复"
                 } catch {
+                    refreshSystemProxyState()
                     detail = "系统代理无法自动恢复（不会弹出授权）：" + error.localizedDescription
                     startupTrace("postponed-proxy-recovery")
                     NSLog("HarborProxy bootstrap postponed: system proxy restore unavailable")
@@ -263,6 +454,7 @@ final class HarborProxyManager: ObservableObject {
         startupTrace("trying-adoption")
         NSLog("HarborProxy lifecycle: checking existing Xray")
         if adoptExistingXray() {
+            refreshSystemProxyState()
             startupTrace("adopted-existing-xray")
             bootstrapped = true
             return
@@ -287,14 +479,25 @@ final class HarborProxyManager: ObservableObject {
     }
 
     private func persist() {
+        guard configurationLoaded else { return }
         store.nodes = nodes
         store.subscriptions = subscriptions
         store.selectedID = selectedID
+        store.routingRules = routingRules
         store.forcedProxyDomains = forcedProxyDomains
         store.httpListenPort = configuredHTTPPort
         store.autoManageSystemProxy = autoManageSystemProxy
-        do { try HarborProxyStore.save(store) }
-        catch { detail = error.localizedDescription }
+        persistenceGeneration += 1
+        let generation = persistenceGeneration
+        let snapshot = store
+        persistenceTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await persistence.save(snapshot, generation: generation)
+            } catch {
+                detail = error.localizedDescription
+            }
+        }
     }
 
     /// Explicit listener-port change. Never switch to a free fallback port.
@@ -644,6 +847,7 @@ final class HarborProxyManager: ObservableObject {
             } else {
                 detail = "已切换节点 · 系统代理端口保持不变"
             }
+            refreshSystemProxyState()
         }
         // For a previously unmanaged connection the asynchronous health check
         // will take over the system proxy only after a verified outbound success.
@@ -904,6 +1108,7 @@ final class HarborProxyManager: ObservableObject {
             systemManaged = false
             detail = "本地节点已连接，但系统代理未接管：" + error.localizedDescription
         }
+        refreshSystemProxyState()
     }
 
     func clearSystemProxy() {
@@ -914,16 +1119,23 @@ final class HarborProxyManager: ObservableObject {
             persist()
             detail = "原系统代理设置已恢复"
         } catch { detail = error.localizedDescription }
+        refreshSystemProxyState()
     }
 
     @discardableResult
     func stop(interactive: Bool = false) async -> Bool {
         if HarborProxyRecoveryPolicy.mustRestoreBeforeStop(hasBackup: HarborSystemProxy.hasBackup) {
             do { try HarborSystemProxy.restore(interactive: interactive) }
-            catch { detail = "系统代理未恢复，已保留代理内核运行：" + error.localizedDescription; return false }
+            catch {
+                detail = "系统代理未恢复，已保留代理内核运行：" + error.localizedDescription
+                refreshSystemProxyState()
+                return false
+            }
         }
         systemManaged = false
-        return await stopCore()
+        let stopped = await stopCore()
+        refreshSystemProxyState()
+        return stopped
     }
 
     /// Stop only our Xray child. Node switching keeps the fixed macOS proxy
@@ -974,6 +1186,7 @@ final class HarborProxyManager: ObservableObject {
         try? FileManager.default.removeItem(at: runtimeRecordURL)
         configPath = nil; localPort = nil
         running = false; healthy = false; checkingConnectivity = false; status = "已关闭"
+        refreshSystemProxyState()
         return true
     }
 

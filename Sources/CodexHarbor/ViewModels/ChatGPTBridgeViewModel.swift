@@ -45,6 +45,7 @@ final class ChatGPTBridgeViewModel: ObservableObject {
     private let networkMonitor = NWPathMonitor()
     private let networkMonitorQueue = DispatchQueue(label: "com.codexharbor.bridge.network-recovery")
     private var lastNetworkStatus: NWPath.Status?
+    private var lastEnvironmentRefreshAt: Date?
 
     init() {
         var resolvedPaths: BridgePaths?
@@ -83,6 +84,7 @@ final class ChatGPTBridgeViewModel: ObservableObject {
         refreshCloudflareAuthorization()
         refreshCloudflareHostnameSuffixes()
         refreshChatGPTIntegration()
+        lastEnvironmentRefreshAt = Date()
         startNetworkRecoveryMonitoring()
     }
 
@@ -232,11 +234,19 @@ final class ChatGPTBridgeViewModel: ObservableObject {
         // 最终诊断完成后再由 applyManualDiagnostics 一次性提交节点状态。
         let preservedPipeline = isDiagnosing ? runtime.pipelineDiagnostics : nil
 
-        refreshTunnelAvailability()
-        refreshCloudflaredAvailability()
-        refreshSecretAvailability()
-        refreshCloudflareAuthorization()
-        refreshCloudflareHostnameSuffixes()
+        // Binary discovery, Keychain lookups and Cloudflare directory scans
+        // describe configuration rather than live health. Keep them out of the
+        // ten-second recovery loop; explicit configuration actions refresh them
+        // immediately, with this five-minute fallback for external changes.
+        let now = Date()
+        if lastEnvironmentRefreshAt.map({ now.timeIntervalSince($0) >= 300 }) ?? true {
+            refreshTunnelAvailability()
+            refreshCloudflaredAvailability()
+            refreshSecretAvailability()
+            refreshCloudflareAuthorization()
+            refreshCloudflareHostnameSuffixes()
+            lastEnvironmentRefreshAt = now
+        }
         refreshChatGPTIntegration()
         if let transportController {
             apply(
@@ -257,7 +267,10 @@ final class ChatGPTBridgeViewModel: ObservableObject {
             statusMessage = "\(configuration.transportMode.displayName)已连接 · 本地 MCP 127.0.0.1:\(configuration.localMCPPort)"
         }
         if let entries = try? await AuditLogger(paths: paths).recentEntries(limit: 12) {
-            recentAuditEntries = entries.reversed()
+            let latestEntries = Array(entries.reversed())
+            if recentAuditEntries != latestEntries {
+                recentAuditEntries = latestEntries
+            }
         }
     }
 
@@ -1148,18 +1161,29 @@ final class ChatGPTBridgeViewModel: ObservableObject {
         _ snapshot: BridgeLifecycleSnapshot,
         preservingPipelineDiagnostics preservedPipeline: BridgePipelineDiagnostics? = nil
     ) {
-        configuration = snapshot.configuration
+        if configuration != snapshot.configuration {
+            configuration = snapshot.configuration
+        }
         var updatedRuntime = repairRuntimeState(snapshot.runtime)
         if let preservedPipeline {
             updatedRuntime.pipelineDiagnostics = preservedPipeline
         }
-        runtime = updatedRuntime
-        launchAgentStatus = snapshot.launchAgentStatus
-        mcpHealthy = snapshot.mcpHealthy
+        if runtime != updatedRuntime {
+            runtime = updatedRuntime
+        }
+        if launchAgentStatus != snapshot.launchAgentStatus {
+            launchAgentStatus = snapshot.launchAgentStatus
+        }
+        if mcpHealthy != snapshot.mcpHealthy {
+            mcpHealthy = snapshot.mcpHealthy
+        }
     }
 
     private func refreshLaunchAgentStatus() {
-        launchAgentStatus = launchAgentManager.status()
+        let latestStatus = launchAgentManager.status()
+        if launchAgentStatus != latestStatus {
+            launchAgentStatus = latestStatus
+        }
     }
 
     @discardableResult

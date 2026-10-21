@@ -104,6 +104,10 @@ fi
 /usr/libexec/PlistBuddy -c "Add :HarborGitCommit string $build_commit" "$staging_app_path/Contents/Info.plist"
 echo "==> 版本标记：${release_tag:-development} (${build_number}) · $build_commit"
 cp "$project_root/Resources/AppIcon.icns" "$staging_app_path/Contents/Resources/AppIcon.icns"
+if [[ -d "$project_root/Resources/Dashboard" ]]; then
+  mkdir -p "$staging_app_path/Contents/Resources/Dashboard"
+  cp "$project_root/Resources/Dashboard/"* "$staging_app_path/Contents/Resources/Dashboard/"
+fi
 host_arch="$(uname -m)"
 xray_source="$project_root/Resources/Xray/$host_arch"
 xray_destination="$staging_app_path/Contents/Resources/Xray/$host_arch"

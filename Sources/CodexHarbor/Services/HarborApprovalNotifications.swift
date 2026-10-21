@@ -16,7 +16,8 @@ final class HarborApprovalPanelController {
     private var panel: NSPanel?
     private var showingRequestID: String?
     private var expirationTask: Task<Void, Never>?
-    private var fallbackTask: Task<Void, Never>?
+    private var appActivationObserver: NSObjectProtocol?
+    private var wakeObserver: NSObjectProtocol?
 
     private init() {}
 
@@ -32,17 +33,22 @@ final class HarborApprovalPanelController {
             }
         }
         refresh()
-        // A rare missed filesystem event must not keep a 90-second approval
-        // invisible. Only one low-frequency task runs for the app lifetime.
-        // This also rechecks pending requests after display sleep/wake.
-        if fallbackTask == nil {
-            fallbackTask = Task { [weak self] in
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(2))
-                    guard !Task.isCancelled, let self else { break }
-                    self.refresh()
-                }
-            }
+        // The filesystem monitor handles new requests immediately. Lifecycle
+        // callbacks cover events coalesced while the display or app was asleep,
+        // avoiding a permanent two-second polling wakeup.
+        appActivationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refresh() }
+        }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refresh() }
         }
     }
 

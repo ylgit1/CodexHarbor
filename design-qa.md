@@ -1,31 +1,49 @@
-# Codex Harbor high-fidelity design QA
+# Design QA — Light technology network backdrop
 
-## Reference and viewport
+- Source visual truth: `/var/folders/fs/t96_fl155zddkwkd9wb44l980000gn/T/codex-clipboard-b1013dce-8cf2-45d5-b2a4-06253751c5a8.png`
+- Implementation evidence: `cua://native-app/Codex Harbor/main-AppWindow-1@2026-10-21T16:10:00+08:00`
+- Viewport/state: maximized macOS app window, light appearance, 工作台, Codex configured, system proxy managed, ChatGPT MCP connected
+- Source pixels: 2159 × 728
+- Implementation capture pixels: 2702 × 1578; native SwiftUI viewport approximately 1351 × 789 points at 2× density
+- Density normalization: the source is a panoramic background asset rather than a full-screen mock. Comparison used the visible top technology panel at its aspect-fill crop; no browser/device frame was involved.
 
-- 唯一视觉基准：用户确认的 1536 × 1024 目标稿。
-- 实际验证：已构建并安装 `/Applications/Codex Harbor.app`，在约 1360 × 840 pt 的原生窗口中检查；该尺寸比目标稿更紧，主要信息仍完整保留在首屏。
-- 验证模式：账户、托管密钥、自定义 API。
-- 验证范围：今日、7 日、当月共用同一状态；Token、请求、耗时使用不同图表实现。
+## Full-view comparison evidence
 
-## 对照结果
+- The new background retains the source's pale ice-blue globe, cyan/green/violet light ribbons, central illuminated platform, and dotted world map.
+- The workbench remains visually lighter than the prior navy panel and now blends with the white app shell and blue sidebar.
+- Existing Codex, Network Core, and ChatGPT circular connection treatments remain in their original positions and proportions.
+- Existing route curves and compositor-driven moving particles were not modified.
+- The three functional status cards below remain visible and unchanged.
 
-1. **页面骨架通过。** 左侧连接栏约 304 pt；右侧严格保持 Object Header → 五项 KPI → Trend 72% / Health 28% 的三级结构，三种模式切换不改变几何骨架。
-2. **Object Header 通过。** 高度固定 120 pt。名称、Badge、副标题、状态、Metadata 分层；账户、托管、API 的操作区宽度固定，托管查询结果出现后不会推动按钮或改变高度。
-3. **KPI Overview 通过。** 五个卡片固定顺序和高度，均包含 Icon、Label、主数值、真实环比或辅助信息、Mini Sparkline。没有上一周期真实数据时不显示伪造百分比。
-4. **Trend 通过。** Token 为渐变 Area、请求为 Bar、耗时为 Line；指标和日期选择器均为完整点击区域。摘要、坐标轴、网格、Hover Crosshair、Tooltip、峰值与底部总计/均值/最高/最低已实现。
-5. **零值时间桶通过。** 今日使用从本地零点到当前小时；7 日含今天及前 6 日；当月从 1 日到今天。托管/API 只有一个非零日时会画出真实的 `0 → 峰值 → 0`，不再退化为孤立点。
-6. **API 多 Provider 通过。** 所有自定义连接共用同一 X 轴，按档案显示独立颜色与线型，并在底部显示图例；不在终点堆叠冗余名称标签。
-7. **Health 通过。** 只显示真实状态行，不再出现黄色大警告卡或虚假健康分；连续相同事件聚合为 `×N`，最多显示 4 组。
-8. **首屏密度通过。** 在更紧的实测窗口中，Header、KPI、Trend、Health 与 Footer Stats 均无需纵向滚动即可完整展示。
+## Focused-region comparison evidence
 
-## 数据真实性
+The top technology panel was inspected at full window scale because this change is limited to that region. The generated background is sharp at the installed window size, the globe/platform crop remains centered behind Network Core, and labels remain readable over the brighter image.
 
-- KPI、Sparkline、主图、Tooltip 与 Footer 使用同一批 Codex 活动与 Token 记录。
-- 月范围按本月 1 日开始，不再错误取“最近 30/31 天”。
-- 今日曲线只绘制到当前时间；24:00 仅作为时间轴终点，不制造未来数据。
-- 环比采用昨日同期、上一个 7 日、上月同期；上一周期为零或缺失时不显示百分比。
-- 缺少余额、到期、延迟或订阅数据时直接隐藏对应字段，不在生产界面 Mock。
+## Findings
 
-## 最终结论
+No actionable P0, P1, or P2 findings remain.
 
-通过。当前实现与目标稿使用同一页面比例、组件层级和交互结构；未发现 P0、P1 或 P2 级布局、溢出、对齐、重复状态或数据伪造问题。
+- Typography: the first pass retained white labels from the former dark panel, producing weak contrast. Fixed by using deep blue-gray label tokens while preserving icon/circle colors and geometry.
+- Spacing/layout: circular endpoints, center core, labels, and legend remain within the rounded panel with no clipping or overlap.
+- Colors/tokens: the panel now uses the requested pale blue/cyan/violet palette; green and blue semantic connection states remain distinct.
+- Image quality: the exact user-provided 2159 × 728 source is packaged as a native PNG and rendered with aspect-fill; no SVG or code-drawn substitute is used for the backdrop.
+- Copy/content: all visible labels describe live Codex, proxy, and MCP state; no placeholder status was introduced.
+- Interaction/accessibility: native controls and accessibility labels remain intact; motion still follows Reduce Motion through the existing particle implementation.
+
+## Comparison history
+
+1. Pass 1 — P2: white endpoint and legend copy lost contrast on the new light background.
+   - Fix: introduced dark navy primary and blue-gray secondary copy colors only inside the technology panel.
+   - Post-fix evidence: final CUA capture at 16:10 shows readable CODEX, CHATGPT / MCP, NETWORK CORE, header, and legend text while all circular visuals and moving route points remain unchanged.
+2. Pass 2 — no actionable P0/P1/P2 differences.
+
+## Implementation checklist
+
+- [x] Use the supplied background image in the top technology panel.
+- [x] Keep all three circular connection visuals unchanged.
+- [x] Keep route curves and moving points unchanged.
+- [x] Package the PNG inside the installed `.app`.
+- [x] Verify light-background text contrast.
+- [x] Build, sign, install, launch, and run the full automated test suite.
+
+final result: passed

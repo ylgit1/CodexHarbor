@@ -1370,15 +1370,14 @@ final class AppModel: ObservableObject {
             codexTokenUsageRecords = update.tokenUsageRecords
         }
 
-        var changed = false
+        var updatedActivityEvents = activityEvents
         for event in update.activityEvents {
-            if let updated = try? activityStore.append(event, to: activityEvents) {
-                activityEvents = updated
-                changed = true
+            if let updated = try? activityStore.append(event, to: updatedActivityEvents) {
+                updatedActivityEvents = updated
             }
         }
-        if changed {
-            objectWillChange.send()
+        if updatedActivityEvents != activityEvents {
+            activityEvents = updatedActivityEvents
         }
     }
 

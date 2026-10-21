@@ -1337,7 +1337,10 @@ final class AppModel: ObservableObject {
                     // slower fallback in case vnode delivery is unavailable.
                     interval = 60
                 case .account, .harborKey:
-                    interval = 10
+                    // Telemetry is a background fallback, not an interactive
+                    // render loop. Thirty seconds avoids frequent directory /
+                    // SQLite walks while keeping the dashboard reasonably fresh.
+                    interval = 30
                 case nil:
                     interval = 30
                 }

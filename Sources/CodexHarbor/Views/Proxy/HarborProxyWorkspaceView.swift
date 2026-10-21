@@ -112,7 +112,7 @@ struct HarborProxyWorkspaceView: View {
                     .frame(height: 68)
                 HStack(alignment: .top, spacing: 11) {
                     subscriptionSidebar
-                        .frame(width: geometry.size.width > 1000 ? 250 : 215)
+                        .frame(width: min(390, max(215, geometry.size.width * 0.22)))
                     nodeTable
                         .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
                 }
@@ -122,7 +122,6 @@ struct HarborProxyWorkspaceView: View {
             .padding(.horizontal, geometry.size.width < 850 ? 16 : 22)
             .padding(.top, 3)
             .padding(.bottom, 10)
-            .frame(maxWidth: 1360, maxHeight: .infinity, alignment: .top)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .task { await proxy.bootstrap() }
@@ -792,7 +791,7 @@ struct HarborProxyWorkspaceView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.top, 70)
                 } else if gridMode {
-                    let columnCount = 2
+                    let columnCount = max(2, min(6, Int((available.size.width + 9) / 270)))
                     // Use the configured page capacity, not the filtered result count.
                     // Region changes must not stretch one or two remaining cards.
                     let rowCount = max(1, (pageSize + columnCount - 1) / columnCount)

@@ -171,8 +171,10 @@ struct HarborAnimatedFlowConnector: View {
 
     var body: some View {
         Group {
-            if active && !failed && !reduceMotion && scenePhase == .active {
-                TimelineView(.animation(minimumInterval: 1.0 / 24.0)) { timeline in
+            // Ready links use a static composited path. Only a connecting
+            // transition runs a low-rate animation; no 24Hz idle repaint.
+            if active && !ready && !failed && !reduceMotion && scenePhase == .active {
+                TimelineView(.animation(minimumInterval: 1.0 / 8.0)) { timeline in
                     connector(at: timeline.date)
                 }
             } else {

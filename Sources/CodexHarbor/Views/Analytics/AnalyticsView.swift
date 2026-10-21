@@ -24,20 +24,21 @@ struct HarborAnalyticsView: View {
     @State private var metric: HarborAnalyticsMetric = .requests
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 15) {
-                header
-                summaryCards
-                trendCard
-                performanceCard
+        GeometryReader { available in
+            ScrollView {
+                    VStack(alignment: .leading, spacing: 15) {
+                    header
+                    summaryCards
+                    trendCard(height: max(290, 290 + (available.size.height - 760) * 0.68))
+                    performanceCard
             }
-            .frame(maxWidth: 1220)
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 26)
             .padding(.top, 24)
-            .padding(.bottom, 24)
+                .padding(.bottom, 24)
+            }
+            .scrollIndicators(.automatic)
         }
-        .scrollIndicators(.automatic)
     }
 
     private var header: some View {
@@ -91,13 +92,13 @@ struct HarborAnalyticsView: View {
         .frame(height: 104)
     }
 
-    private var trendCard: some View {
+    private func trendCard(height: CGFloat) -> some View {
         HarborCard(padding: 16) {
             HarborInteractiveTrendChart(
                 title: "使用趋势 · \(metric.rawValue)",
                 labels: trendLabels,
                 series: trendSeries,
-                height: 290,
+                height: height,
                 compact: false
             )
         }

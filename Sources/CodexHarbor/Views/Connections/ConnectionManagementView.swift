@@ -51,7 +51,6 @@ struct HarborConnectionManagementView: View {
 
                 catalog
             }
-            .frame(maxWidth: 1220, alignment: .topLeading)
             .frame(maxWidth: .infinity, alignment: .top)
             .padding(.horizontal, 26)
             .padding(.top, 24)

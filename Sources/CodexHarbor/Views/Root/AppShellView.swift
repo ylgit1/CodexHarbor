@@ -199,45 +199,51 @@ struct AppShellView: View {
     }
 
     private var content: some View {
-        HStack(alignment: .top, spacing: 0) {
-            HarborSidebarView(
-                selection: mainPage,
-                onSelect: selectMainPage
-            )
-            .frame(minWidth: 228, idealWidth: 244, maxWidth: 252)
-
-            Divider()
-                .opacity(0.45)
-
-            ZStack {
-                LinearGradient(
-                    colors: [
-                        Color(nsColor: .textBackgroundColor),
-                        Color.blue.opacity(0.018)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottomTrailing
+        GeometryReader { viewport in
+                HStack(alignment: .top, spacing: 0) {
+                HarborSidebarView(
+                    selection: mainPage,
+                    onSelect: selectMainPage
                 )
-                .ignoresSafeArea()
+                .frame(width: min(420, max(228, viewport.size.width * 0.19)))
 
-                Group {
-                    switch mainPage {
-                    case .home:
-                        homeDashboard
-                    case .connections:
-                        connectionManagementPage
-                    case .analytics:
-                        HarborAnalyticsView(model: model)
-                    case .localAccess:
-                        localAccessPage
-                    case .networkProxy:
-                        HarborProxyWorkspaceView(proxy: networkProxy)
-                    case .settings:
-                        HarborSettingsView(model: model, bridge: chatGPTBridge)
+                Divider()
+                    .opacity(0.45)
+
+                ZStack {
+                    LinearGradient(
+                        // One background language across all six pages:
+                        // same palette, lower intensity away from the dashboard.
+                        colors: [
+                            Color(nsColor: .textBackgroundColor),
+                            HarborColors.blue.opacity(mainPage == .home ? 0.045 : 0.028),
+                            HarborColors.purple.opacity(mainPage == .home ? 0.028 : 0.018)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottomTrailing
+                    )
+                    .ignoresSafeArea()
+
+                    Group {
+                        switch mainPage {
+                        case .home:
+                            homeDashboard
+                        case .connections:
+                            connectionManagementPage
+                        case .analytics:
+                            HarborAnalyticsView(model: model)
+                        case .localAccess:
+                            localAccessPage
+                        case .networkProxy:
+                            HarborProxyWorkspaceView(proxy: networkProxy)
+                        case .settings:
+                            HarborSettingsView(model: model, bridge: chatGPTBridge)
+                        }
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            }
+        }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .frame(minWidth: 1024, minHeight: 640, alignment: .top)
     }
@@ -262,6 +268,12 @@ struct AppShellView: View {
             },
             onOpenLocalAccess: {
                 mainPage = .localAccess
+            },
+            onOpenNetworkProxy: {
+                mainPage = .networkProxy
+            },
+            onOpenSettings: {
+                mainPage = .settings
             }
         )
     }
@@ -271,7 +283,6 @@ struct AppShellView: View {
         if showingConnectionDetail {
             ScrollView {
                 connectionDetailPage
-                    .frame(maxWidth: 1220, alignment: .topLeading)
                     .frame(maxWidth: .infinity, alignment: .top)
                     .padding(.horizontal, 26)
                     .padding(.top, 24)

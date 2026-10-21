@@ -26,8 +26,7 @@ struct HarborLocalAccessView: View {
                     allowedRootsSection
                     transportSection
                 }
-                .frame(maxWidth: 1220)
-                .frame(maxWidth: .infinity)
+                    .frame(maxWidth: .infinity)
                 .padding(.horizontal, 26)
                 .padding(.top, 24)
                 .padding(.bottom, 24)

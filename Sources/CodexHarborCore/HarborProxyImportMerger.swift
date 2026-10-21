@@ -33,9 +33,12 @@ public enum HarborProxyImportMerger {
         selectedID: String?,
         imported: HarborV2rayNImport
     ) -> (nodes: [HarborProxyNode], subscriptions: [HarborProxySubscription], selectedID: String?) {
-        let incomingIDs = Set(imported.nodes.map(\.id))
+        let importedNodes = HarborProxyNodeNaming.preservingCustomNames(
+            from: currentNodes, in: imported.nodes
+        )
+        let incomingIDs = Set(importedNodes.map(\.id))
         let incomingSubscriptions = Set(imported.subscriptions.map(\.id))
-        let incomingEndpoints = Set(imported.nodes.map(Endpoint.init))
+        let incomingEndpoints = Set(importedNodes.map(Endpoint.init))
 
         // Preserve manually added nodes, while replacing old nodes from every
         // imported subscription even if its provider regenerated profile IDs.
@@ -47,7 +50,7 @@ public enum HarborProxyImportMerger {
             return true
         }
         var seen = Set<String>()
-        let nodes = (retained + imported.nodes).filter { seen.insert($0.id).inserted }
+        let nodes = (retained + importedNodes).filter { seen.insert($0.id).inserted }
         let subscriptions = currentSubscriptions.filter {
             !incomingSubscriptions.contains($0.id)
         } + imported.subscriptions

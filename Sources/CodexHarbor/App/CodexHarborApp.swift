@@ -6,17 +6,26 @@ import SwiftUI
 
 @MainActor
 final class HarborApplicationDelegate: NSObject, NSApplicationDelegate {
+    private var terminationInProgress = false
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard HarborProxyManager.shared.stop(interactive: false) else {
-            let alert = NSAlert()
-            alert.alertStyle = .critical
-            alert.messageText = "系统代理尚未恢复"
-            alert.informativeText = "为避免关闭内核导致 macOS 网络中断，应用将保持运行。请到「网络代理」清除系统代理后再退出。"
-            alert.addButton(withTitle: "返回")
-            _ = alert.runModal()
-            return .terminateCancel
+        if terminationInProgress { return .terminateNow }
+        terminationInProgress = true
+        // Never present an authorization dialog or modal when quitting.
+        // If macOS refuses a noninteractive proxy restore, stop() preserves
+        // Xray so the system does not point to an unavailable proxy endpoint.
+        Task { @MainActor in
+            if !(await HarborProxyManager.shared.stop(interactive: false)) {
+                NSLog("CodexHarbor: system proxy could not be restored without interaction; leaving Xray alive for network safety")
+            }
+            sender.reply(toApplicationShouldTerminate: true)
         }
-        return .terminateNow
+        return .terminateLater
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        // Another idempotent trigger when the app has no initial window.
+        Task { await HarborProxyManager.shared.bootstrap() }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -71,6 +80,9 @@ struct CodexHarborApp: App {
             }
         }
         _model = StateObject(wrappedValue: AppModel())
+        // App-scoped startup survives closed/reopened SwiftUI windows and
+        // does not depend solely on NSApplicationDelegate callbacks.
+        Task { @MainActor in await HarborProxyManager.shared.bootstrap() }
     }
 
     var body: some Scene {

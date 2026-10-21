@@ -8,9 +8,15 @@ public enum HarborProxyRecoveryPolicy {
         hasBackup: Bool,
         isRunning: Bool,
         isSystemManaged: Bool,
-        ownsSystemProxy: Bool
+        ownsSystemProxy: Bool,
+        currentUsesManagedListener: Bool = true
     ) -> Bool {
-        hasBackup && !(isRunning && isSystemManaged && ownsSystemProxy)
+        guard hasBackup else { return false }
+        if isRunning && isSystemManaged && ownsSystemProxy { return false }
+        // A different client has replaced every Harbor listener. The stale
+        // snapshot can be discarded without changing that client's settings.
+        if !ownsSystemProxy && !currentUsesManagedListener { return false }
+        return true
     }
 
     /// Always restore a saved system-proxy snapshot *before* stopping Xray,

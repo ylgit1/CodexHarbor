@@ -59,9 +59,12 @@ struct MenuBarView: View {
             Section("网络代理") {
                 Label(proxy.status, systemImage: proxy.running ? "network" : "network.slash")
                 if proxy.running {
-                    Button("关闭代理") { _ = proxy.stop() }
+                    Button("关闭代理") { Task { _ = await proxy.stop() } }
                 } else {
-                    Button("开启代理") { Task { await proxy.start() } }
+                    Button("开启代理") {
+                        guard let node = proxy.selectedNode else { return }
+                        Task { await proxy.activate(node.id) }
+                    }
                         .disabled(proxy.selectedNode == nil || !proxy.coreInstalled)
                 }
                 if proxy.requiresRecovery {

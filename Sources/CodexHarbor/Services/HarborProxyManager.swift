@@ -10,6 +10,9 @@ private struct HarborProxyState: Codable {
     var routingRules = true
     // Optional so existing Keychain JSON decodes without losing saved subscriptions.
     var forcedProxyDomains: [String]?
+    // Optional to preserve existing Keychain configurations on upgrade.
+    var httpListenPort: Int?
+    var autoManageSystemProxy: Bool?
 }
 @MainActor
 private struct HarborProxyProcessRecord: Codable {
@@ -59,11 +62,17 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var selectedID: String?
     @Published private(set) var running = false
     @Published private(set) var healthy = false
+    @Published private(set) var checkingConnectivity = false
     @Published private(set) var busy = false
     @Published private(set) var systemManaged = false
     @Published private(set) var status = "已关闭"
     @Published private(set) var detail = ""
     @Published private(set) var localPort: Int?
+    @Published private(set) var configuredHTTPPort: Int
+    @Published private(set) var switchingNodeID: String?
+    private var pendingActivation = HarborProxyActivationQueue()
+    private var activationInProgress = false
+    private var autoManageSystemProxy = true
     @Published private(set) var probeResults: [String: HarborProxyProbeResult] = [:]
     @Published private(set) var latencyTesting = false
     @Published private(set) var installingCore = false
@@ -76,8 +85,31 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var forcedProxyDomains: [String]
     private var store: HarborProxyState
     private var child: Process?
+    private var adoptedPID: Int32?
     private var configPath: URL?
     private var bootstrapped = false
+    private var bootstrapping = false
+    /// Bounded, non-sensitive startup tracing for diagnosing fixed-port recovery.
+    private func startupTrace(_ stage: String) {
+        let note = [
+            "stage": stage,
+            "time": ISO8601DateFormatter().string(from: .now),
+            "selectedNodeAvailable": selectedNode != nil ? "yes" : "no",
+            "nodeCount": String(nodes.count),
+            "hasRecoveryRecord": HarborSystemProxy.hasBackup ? "yes" : "no",
+            "ownsSystemProxy": HarborSystemProxy.isOwned() ? "yes" : "no",
+            "hasProcessRecord": FileManager.default.fileExists(atPath: runtimeRecordURL.path) ? "yes" : "no",
+            "configuredPort": String(configuredHTTPPort)
+        ]
+        let value = note.sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }.joined(separator: " ")
+        try? Data((value + "\n").utf8).write(
+            to: root.appendingPathComponent("startup-diagnostics.txt"), options: .atomic
+        )
+    }
+    /// Used to prevent a delayed health probe from updating a newer node.
+    private var connectionGeneration: UInt64 = 0
+    private var healthTask: Task<Void, Never>?
     private var runtimeRecordURL: URL { root.appendingPathComponent("active-process.json") }
     private let root = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/CodexHarbor/NetworkProxy", isDirectory: true)
@@ -127,15 +159,53 @@ final class HarborProxyManager: ObservableObject {
             hasBackup: true,
             isRunning: running,
             isSystemManaged: systemManaged,
-            ownsSystemProxy: HarborSystemProxy.isOwned()
+            ownsSystemProxy: HarborSystemProxy.isOwned(),
+            currentUsesManagedListener: HarborSystemProxy.currentUsesManagedListener
         )
     }
 
+    /// Reconcile the persisted ownership snapshot immediately before a node
+    /// operation. If another client (for example v2rayN) has replaced every
+    /// Harbor listener, discard only Harbor's marker and leave that proxy
+    /// untouched. If macOS still points to Harbor, preserve the listener while
+    /// the core reloads so network access is never cut mid-switch.
+    private func prepareSystemProxyForActivation() -> Bool? {
+        guard HarborSystemProxy.hasBackup else {
+            systemManaged = false
+            return false
+        }
+        if HarborSystemProxy.isOwned() {
+            systemManaged = true
+            return true
+        }
+        guard !HarborSystemProxy.currentUsesManagedListener else {
+            systemManaged = false
+            detail = "系统代理仍有项目指向 Harbor，请先清理代理后再切换节点"
+            return nil
+        }
+        do {
+            // restore() only removes Harbor's stale marker in this branch; it
+            // does not overwrite the other client's active proxy settings.
+            try HarborSystemProxy.restore(interactive: false)
+            systemManaged = false
+            return false
+        } catch {
+            systemManaged = false
+            detail = "无法核对系统代理状态：" + error.localizedDescription
+            return nil
+        }
+    }
+
     private init() {
+        NSLog("HarborProxy lifecycle: manager init")
         let state = HarborProxyStore.load()
         store = state
         nodes = state.nodes; subscriptions = state.subscriptions
         selectedID = state.selectedID; routingRules = state.routingRules
+        autoManageSystemProxy = state.autoManageSystemProxy ?? true
+        configuredHTTPPort = (try? HarborProxyPortPolicy.validate(
+            httpPort: state.httpListenPort ?? HarborProxyPortPolicy.defaultHTTPPort
+        )) ?? HarborProxyPortPolicy.defaultHTTPPort
         forcedProxyDomains = (try? HarborProxyDomainRules.normalized(
             state.forcedProxyDomains ?? HarborProxyDomainRules.defaults
         )) ?? HarborProxyDomainRules.defaults
@@ -143,8 +213,11 @@ final class HarborProxyManager: ObservableObject {
     }
 
     func bootstrap() async {
-        guard !bootstrapped else { return }
-        bootstrapped = true
+        guard !bootstrapped, !bootstrapping else { return }
+        startupTrace("bootstrap-entered")
+        NSLog("HarborProxy lifecycle: bootstrap entered")
+        bootstrapping = true
+        defer { bootstrapping = false }
         if !coreInstalled {
             do {
                 let result = try HarborXrayInstaller.installBundled(into: root)
@@ -153,22 +226,64 @@ final class HarborProxyManager: ObservableObject {
                 detail = "内置 Xray 准备失败：" + error.localizedDescription
             }
         }
-        // Never autostart into a stale system proxy pointing at a dead port.
+        // Prefer adopting an unchanged Harbor-owned proxy from the previous
+        // session. Recovery does not need macOS authorization and leaves the
+        // fixed listener ports intact while Xray is safely re-started.
         if HarborSystemProxy.hasBackup {
-            do {
-                try HarborSystemProxy.restore(interactive: false)
-                systemManaged = false
-                detail = "上次退出的系统代理已恢复"
-            } catch {
-                detail = "系统代理等待恢复：" + error.localizedDescription
-                return
+            NSLog("HarborProxy lifecycle: backup exists, checking macOS ownership")
+            // Network service selection may lag the app launch. Recheck before
+            // deciding that the original proxy snapshot is no longer owned.
+            var ownedPort = HarborSystemProxy.ownedHTTPPort
+            if ownedPort == nil {
+                for _ in 0..<3 where ownedPort == nil {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    ownedPort = HarborSystemProxy.ownedHTTPPort
+                }
+            }
+            if let ownedPort,
+               (try? HarborProxyPortPolicy.validate(httpPort: ownedPort)) != nil {
+                configuredHTTPPort = ownedPort
+                systemManaged = true
+                autoManageSystemProxy = true
+                persist()
+                detail = "正在恢复上次使用的代理节点和系统代理"
+            } else {
+                do {
+                    try HarborSystemProxy.restore(interactive: false)
+                    systemManaged = false
+                    detail = "上次退出的系统代理已恢复"
+                } catch {
+                    detail = "系统代理无法自动恢复（不会弹出授权）：" + error.localizedDescription
+                    startupTrace("postponed-proxy-recovery")
+                    NSLog("HarborProxy bootstrap postponed: system proxy restore unavailable")
+                    return
+                }
             }
         }
-        cleanupOrphan()
-        // Restore the last selected node on every launch when Xray is installed.
-        // This only starts Harbor's own listener; it must never silently replace
-        // another app's macOS system proxy (for example v2rayN on port 10808).
-        if selectedNode != nil && coreInstalled { await start() }
+        startupTrace("trying-adoption")
+        NSLog("HarborProxy lifecycle: checking existing Xray")
+        if adoptExistingXray() {
+            startupTrace("adopted-existing-xray")
+            bootstrapped = true
+            return
+        }
+        await cleanupOrphan()
+        startupTrace("after-orphan-cleanup")
+        guard !FileManager.default.fileExists(atPath: runtimeRecordURL.path) else {
+            detail = "旧 Xray 未清理，稍后可重试恢复代理"
+            startupTrace("postponed-xray-cleanup")
+            NSLog("HarborProxy bootstrap postponed: previous Xray still recorded")
+            return
+        }
+        bootstrapped = true
+        startupTrace("starting-selected-node")
+        NSLog("HarborProxy lifecycle: cleanup complete, resuming selected node")
+        // Restore the user's last active node *and* prior system-proxy intent.
+        // Automatic system changes are always noninteractive and never take
+        // over a proxy managed by another app.
+        if let lastID = selectedNode?.id, coreInstalled {
+            await queueActivation(lastID, restart: false, userInitiated: false)
+        }
     }
 
     private func persist() {
@@ -176,8 +291,61 @@ final class HarborProxyManager: ObservableObject {
         store.subscriptions = subscriptions
         store.selectedID = selectedID
         store.forcedProxyDomains = forcedProxyDomains
+        store.httpListenPort = configuredHTTPPort
+        store.autoManageSystemProxy = autoManageSystemProxy
         do { try HarborProxyStore.save(store) }
         catch { detail = error.localizedDescription }
+    }
+
+    /// Explicit listener-port change. Never switch to a free fallback port.
+    /// When macOS proxy was managed, restore it before stopping the old Xray,
+    /// then enable it only after the new listener passes the proxy health probe.
+    func updateHTTPPort(_ requestedPort: Int) async throws {
+        let port = try HarborProxyPortPolicy.validate(httpPort: requestedPort)
+        guard !busy, !latencyTesting, !installingCore, !requiresRecovery else {
+            throw HarborProxyError.invalid("当前有其他代理操作或系统代理待恢复，请完成后再更改端口")
+        }
+        guard port != configuredHTTPPort else { return }
+        guard !portListening(port), !portListening(port + 1) else {
+            throw HarborProxyError.invalid("端口 \(port) 或 \(port + 1) 已被占用，请选择其他端口；原有连接不会中断")
+        }
+
+        let previous = configuredHTTPPort
+        let wasRunning = running
+        let wasManaged = systemManaged
+        if wasRunning {
+            guard await stop() else {
+                throw HarborProxyError.invalid("原系统代理恢复失败，已取消端口修改：" + detail)
+            }
+        }
+        configuredHTTPPort = port
+        persist()
+        guard wasRunning else {
+            detail = "监听端口已设为 HTTP \(port) / SOCKS5 \(port + 1)，下次连接生效"
+            return
+        }
+
+        await start(waitForHealth: true)
+        if running && healthy && wasManaged { enableSystemProxy() }
+        if running && healthy && (!wasManaged || systemManaged) {
+            detail = "端口切换成功：HTTP \(port) / SOCKS5 \(port + 1)"
+            return
+        }
+
+        let reason = detail
+        if running {
+            guard await stop() else {
+                throw HarborProxyError.invalid("新端口未能接管系统代理且清理失败，请先安全清理代理：" + detail)
+            }
+        }
+        configuredHTTPPort = previous
+        persist()
+        await start(waitForHealth: true)
+        if running && healthy && wasManaged { enableSystemProxy() }
+        throw HarborProxyError.invalid(
+            "新端口切换失败（\(reason)）；已回退至 HTTP \(previous) / SOCKS5 \(previous + 1)" +
+            (wasManaged && !systemManaged ? "，但系统代理未恢复，请检查网络代理设置" : "")
+        )
     }
 
     func updateForcedProxyDomains(_ domains: [String]) throws {
@@ -268,6 +436,33 @@ final class HarborProxyManager: ObservableObject {
         subscriptions.append(HarborProxySubscription(name: name, url: url))
         persist()
     }
+
+    @discardableResult
+    func renameNode(_ id: String, to rawName: String) -> Bool {
+        guard let index = nodes.firstIndex(where: { $0.id == id }) else {
+            detail = "节点已不存在，请刷新订阅"
+            return false
+        }
+        do {
+            nodes[index].customName = try HarborProxyNodeNaming.customName(
+                rawName, sourceName: nodes[index].name
+            )
+            persist()
+            detail = "节点已重命名为「\(nodes[index].displayName)」"
+            return true
+        } catch {
+            detail = error.localizedDescription
+            return false
+        }
+    }
+
+    func restoreNodeName(_ id: String) {
+        guard let index = nodes.firstIndex(where: { $0.id == id }),
+              nodes[index].customName != nil else { return }
+        nodes[index].customName = nil
+        persist()
+        detail = "已恢复订阅名称「\(nodes[index].name)」"
+    }
     @discardableResult
     func removeSubscription(_ id: String) -> Bool {
         guard !busy, !latencyTesting else {
@@ -315,13 +510,14 @@ final class HarborProxyManager: ObservableObject {
                   let text = String(data: data, encoding: .utf8) else {
                 throw HarborProxyError.invalid("订阅响应无效")
             }
-            let replacement = HarborProxyLinks.parse(text).map { original -> HarborProxyNode in
+            let incoming = HarborProxyLinks.parse(text).map { original -> HarborProxyNode in
                 var node = original
                 node.subscriptionID = id
                 return node
             }
-            guard !replacement.isEmpty else { throw HarborProxyError.invalid("订阅无支持的节点格式") }
+            guard !incoming.isEmpty else { throw HarborProxyError.invalid("订阅无支持的节点格式") }
             let old = nodes.filter { $0.subscriptionID == id }
+            let replacement = HarborProxyNodeNaming.preservingCustomNames(from: old, in: incoming)
             nodes.removeAll { $0.subscriptionID == id }
             nodes += replacement
             if let chosen = selectedID, old.contains(where: { $0.id == chosen }) {
@@ -333,37 +529,137 @@ final class HarborProxyManager: ObservableObject {
         } catch { detail = "更新失败：" + error.localizedDescription }
     }
 
+    /// Explicit refresh of the selected node (also used when routing changes).
     func select(_ id: String) async {
-        guard nodes.contains(where: { $0.id == id }) else { return }
-        let wasRunning = running
-        let wasManaged = systemManaged
-        if wasRunning && !stop() { return }
-        selectedID = id; persist()
-        if wasRunning {
-            await start()
-            if wasManaged && healthy { enableSystemProxy() }
+        await queueActivation(id, restart: true, userInitiated: true)
+    }
+
+    /// All rows are selectable, including while a previous node is starting.
+    /// The most recent click wins; no click is silently discarded due to busy.
+    func activate(_ id: String) async {
+        await queueActivation(id, restart: false, userInitiated: true)
+    }
+
+    private func queueActivation(_ id: String, restart: Bool, userInitiated: Bool) async {
+        guard nodes.contains(where: { $0.id == id }) else {
+            detail = "所选节点已不存在，请刷新订阅"
+            return
+        }
+        pendingActivation.enqueue(id, restart: restart, userInitiated: userInitiated)
+        switchingNodeID = id
+        guard !activationInProgress else { return }
+        activationInProgress = true
+        defer {
+            activationInProgress = false
+            switchingNodeID = nil
+        }
+
+        while let request = pendingActivation.takeNext() {
+            // Startup, subscription refresh, and another switch can be in progress.
+            // Keep the request queued instead of disabling every node button.
+            while busy || installingCore {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            await activateOne(
+                request.nodeID,
+                restart: request.restart,
+                userInitiated: request.userInitiated
+            )
         }
     }
-    /// Select-and-connect, matching v2rayN's one-click node workflow.
-    /// If another application currently owns system proxy settings, the
-    /// existing fail-closed policy remains in place; no takeover occurs.
-    func activate(_ id: String) async {
-        guard !busy, nodes.contains(where: { $0.id == id }) else { return }
-        if id != selectedID {
-            await select(id)
-        } else if !running {
-            await start()
+
+    private func activateOne(_ id: String, restart: Bool, userInitiated: Bool) async {
+        guard nodes.contains(where: { $0.id == id }) else {
+            detail = "所选节点已不存在"
+            return
         }
-        guard running, healthy, !systemManaged else { return }
-        enableSystemProxy()
+        guard let preserveSystemProxy = prepareSystemProxyForActivation() else { return }
+        let previousID = selectedID
+        let wasRunning = running
+        let wasManaged = preserveSystemProxy
+
+        autoManageSystemProxy = HarborProxyConnectionIntent.shouldManageSystemProxy(
+            persistedPreference: autoManageSystemProxy,
+            userInitiated: userInitiated
+        )
+
+        // Remember the selection before starting: even a failed first attempt
+        // must not force the user to connect the old node before choosing another.
+        selectedID = id
+        persist()
+
+        if wasRunning && previousID == id && !restart {
+            if checkingConnectivity {
+                detail = "当前节点已启动，正在完成网络检测"
+                return
+            }
+            if healthy {
+                if !systemManaged && autoManageSystemProxy {
+                    enableSystemProxy(interactive: userInitiated)
+                }
+                return
+            }
+        }
+
+        if wasRunning {
+            // Keep the macOS proxy settings and ownership snapshot untouched:
+            // Xray's fixed ports do not change when only the remote node changes.
+            guard await stopCore() else {
+                detail = "旧代理内核仍未退出，请稍候重试：" + detail
+                return
+            }
+        }
+
+        await start(
+            preservingSystemProxy: wasManaged,
+            systemProxyInteractive: userInitiated
+        )
+        if !running {
+            let failure = detail
+            // Restore the previous active node if the replacement fails.
+            if wasRunning, let previousID, previousID != id,
+               nodes.contains(where: { $0.id == previousID }) {
+                selectedID = previousID
+                await start(
+                    preservingSystemProxy: wasManaged,
+                    systemProxyInteractive: false
+                )
+                if running {
+                    detail = "新节点连接失败：\(failure)；已恢复原连接"
+                } else {
+                    detail = "新节点连接失败：\(failure)；原连接恢复失败：" + detail
+                }
+                // Preserve the user's next choice for retry if no client is live.
+                if !running { selectedID = id }
+                persist()
+            }
+            return
+        }
+
+        if wasManaged {
+            // The unchanged system proxy already targets our fixed listener.
+            systemManaged = HarborSystemProxy.isOwned()
+            if !systemManaged {
+                detail = "Xray 已切换，但系统代理被其他程序更改；未覆盖其配置"
+            } else {
+                detail = "已切换节点 · 系统代理端口保持不变"
+            }
+        }
+        // For a previously unmanaged connection the asynchronous health check
+        // will take over the system proxy only after a verified outbound success.
     }
 
     /// The visible 'clear proxy' action never silently deletes another
     /// application's system settings or node/subscription configurations.
-    func clearProxy() {
+    func clearProxy() async {
         if running || HarborSystemProxy.hasBackup {
-            _ = stop()
+            if await stop() {
+                autoManageSystemProxy = false
+                persist()
+            }
         } else {
+            autoManageSystemProxy = false
+            persist()
             detail = "Harbor 当前没有启用代理；其他程序的系统代理设置未修改"
         }
     }
@@ -375,19 +671,31 @@ final class HarborProxyManager: ObservableObject {
         persist()
     }
 
-    func start() async {
+    func start(
+        preservingSystemProxy: Bool = false,
+        waitForHealth: Bool = false,
+        systemProxyInteractive: Bool = false
+    ) async {
         guard !busy, !running else { return }
         // A former Xray can still be alive if its health state was lost.
         // Do not overwrite our process handle and leave an orphan listening.
-        if child != nil && !stop() { return }
+        if child != nil {
+            guard await stopCore() else { return }
+        }
         if FileManager.default.fileExists(atPath: runtimeRecordURL.path) {
-            cleanupOrphan()
+            await cleanupOrphan()
             guard !FileManager.default.fileExists(atPath: runtimeRecordURL.path) else {
                 detail = "发现上次未清理的 Xray 进程，已阻止重复启动"
                 return
             }
         }
-        guard !HarborSystemProxy.hasBackup else { detail = "请先恢复残留的系统代理设置"; return }
+        guard let recoveredOwnership = prepareSystemProxyForActivation() else { return }
+        let keepSystemProxy = preservingSystemProxy || recoveredOwnership
+        guard !HarborSystemProxy.hasBackup ||
+                (keepSystemProxy && HarborSystemProxy.isOwned()) else {
+            detail = "系统代理状态尚未安全恢复"
+            return
+        }
         guard let node = selectedNode else { detail = "先导入并选择节点"; return }
         guard coreInstalled else { detail = "请从安装包恢复内置 Xray 内核"; return }
         busy = true; defer { busy = false }
@@ -417,17 +725,79 @@ final class HarborProxyManager: ObservableObject {
             var ready = false
             for _ in 0..<25 {
                 guard process.isRunning else { break }
-                if !portFree(port) && !portFree(port + 1) { ready = true; break }
+                if portListening(port) && portListening(port + 1) { ready = true; break }
                 try? await Task.sleep(for: .milliseconds(150))
             }
-            let checked = ready ? await probe(port: port) : false
-            guard process.isRunning, checked else {
-                _ = stop()
-                throw HarborProxyError.invalid("Xray 未能完成联网验证，请检查节点配置")
+            // Opening the two local listeners is the startup condition.
+            // External HTTPS probes can take 4s × 3 on a slow/blocked node;
+            // they must not hold up the UI or serialize every node switch.
+            guard HarborProxyStartupPolicy.canPublishListenerReady(
+                xrayRunning: process.isRunning, portsListening: ready
+            ) else {
+                _ = await stopCore()
+                throw HarborProxyError.invalid("Xray 未能监听本地 HTTP/SOCKS5 端口，请检查端口或节点配置")
             }
-            running = true; healthy = true; status = "已连接"
+            running = true
+            healthy = false
+            checkingConnectivity = true
+            status = "已启动 · 正在检测网络"
             detail = "HTTP 127.0.0.1:\(port) · SOCKS5 \(port + 1)"
-        } catch { _ = stop(); status = "连接失败"; detail = error.localizedDescription }
+            connectionGeneration &+= 1
+            let generation = connectionGeneration
+            if waitForHealth {
+                // Explicit port migration still requires complete verification
+                // before we consider the macOS system proxy switch committed.
+                await finishHealthCheck(
+                    port: port,
+                    generation: generation,
+                    systemProxyInteractive: systemProxyInteractive
+                )
+            } else {
+                healthTask?.cancel()
+                healthTask = Task { [weak self] in
+                    guard let self else { return }
+                    await self.finishHealthCheck(
+                        port: port,
+                        generation: generation,
+                        systemProxyInteractive: systemProxyInteractive
+                    )
+                }
+            }
+        } catch {
+            _ = await stopCore()
+            status = "连接失败"
+            detail = error.localizedDescription
+        }
+    }
+
+    /// Complete outbound verification in the background for ordinary node
+    /// starts. Only the still-current Xray generation may publish the result.
+    private func finishHealthCheck(
+        port: Int,
+        generation: UInt64,
+        systemProxyInteractive: Bool
+    ) async {
+        let reachable = await probe(port: port)
+        guard generation == connectionGeneration,
+              running, localPort == port else { return }
+        guard coreProcessAlive else {
+            _ = await stopCore()
+            status = "代理内核已退出"
+            detail = "本地监听进程意外退出，请重新连接或检查节点配置"
+            return
+        }
+        checkingConnectivity = false
+        healthy = reachable
+        if reachable {
+            status = "已连接"
+            detail = "HTTP 127.0.0.1:\(port) · SOCKS5 \(port + 1)"
+            if autoManageSystemProxy && !systemManaged {
+                enableSystemProxy(interactive: systemProxyInteractive)
+            }
+        } else {
+            status = "内核已启动 · 网络检测失败"
+            detail = "本地 HTTP/SOCKS5 端口已就绪，但外网检测失败；可以直接切换其他节点"
+        }
     }
 
     func verify() async {
@@ -440,31 +810,45 @@ final class HarborProxyManager: ObservableObject {
 
     private func probe(port: Int) async -> Bool {
         let nodeID = selectedID
-        let addresses = ["https://www.apple.com/library/test/success.html",
-                         "https://www.gstatic.com/generate_204",
-                         "https://www.cloudflare.com/cdn-cgi/trace"]
-        for address in addresses {
-            let started = ContinuousClock.now
-            let succeeded = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-                proc.arguments = ["-q", "--silent", "--fail", "--noproxy", "", "--proxy",
-                                  "http://127.0.0.1:\(port)", "--connect-timeout", "2",
-                                  "--max-time", "4", "--output", "/dev/null", address]
-                proc.standardError = FileHandle.nullDevice
-                proc.standardOutput = FileHandle.nullDevice
-                proc.terminationHandler = { p in continuation.resume(returning: p.terminationStatus == 0) }
-                do { try proc.run() } catch { continuation.resume(returning: false) }
-            }
-            if succeeded {
-                let duration = started.duration(to: .now).components
-                let milliseconds = max(1, Int(duration.seconds * 1_000 + duration.attoseconds / 1_000_000_000_000_000))
-                if let nodeID { probeResults[nodeID] = HarborProxyProbeResult(milliseconds: milliseconds) }
-                return true
-            }
+        if let milliseconds = await probeAddress(
+            "https://www.apple.com/library/test/success.html",
+            port: port
+        ) {
+            if let nodeID { probeResults[nodeID] = HarborProxyProbeResult(milliseconds: milliseconds) }
+            return true
+        }
+
+        // Independent fallbacks run together. A blocked target therefore adds
+        // one timeout window instead of two serial timeout windows.
+        async let gstatic = probeAddress("https://www.gstatic.com/generate_204", port: port)
+        async let cloudflare = probeAddress("https://www.cloudflare.com/cdn-cgi/trace", port: port)
+        let fallbackResults = await [gstatic, cloudflare]
+        if let milliseconds = fallbackResults.compactMap({ $0 }).min() {
+            if let nodeID { probeResults[nodeID] = HarborProxyProbeResult(milliseconds: milliseconds) }
+            return true
         }
         if let nodeID { probeResults[nodeID] = HarborProxyProbeResult(milliseconds: nil) }
         return false
+    }
+
+    private func probeAddress(_ address: String, port: Int) async -> Int? {
+        if Task.isCancelled { return nil }
+        let started = ContinuousClock.now
+        let succeeded = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+            proc.arguments = ["-q", "--silent", "--fail", "--noproxy", "", "--proxy",
+                              "http://127.0.0.1:\(port)", "--connect-timeout", "2",
+                              "--max-time", "4", "--output", "/dev/null", address]
+            proc.standardError = FileHandle.nullDevice
+            proc.standardOutput = FileHandle.nullDevice
+            proc.terminationHandler = { p in continuation.resume(returning: p.terminationStatus == 0) }
+            do { try proc.run() } catch { continuation.resume(returning: false) }
+        }
+        guard succeeded, !Task.isCancelled else { return nil }
+        let duration = started.duration(to: .now).components
+        return max(1, Int(duration.seconds * 1_000
+            + duration.attoseconds / 1_000_000_000_000_000))
     }
 
     /// User-triggered latency checks. Each node uses a short-lived independent
@@ -502,32 +886,68 @@ final class HarborProxyManager: ObservableObject {
         latencyCancellationRequested = true
     }
 
-    func enableSystemProxy() {
+    func enableSystemProxy(interactive: Bool = false) {
         guard running, healthy, let localPort else { detail = "请先连接并验证当前节点"; return }
+        if systemManaged && HarborSystemProxy.isOwned() { return }
+        if interactive {
+            autoManageSystemProxy = true
+            persist()
+        }
         do {
-            try HarborSystemProxy.enable(port: localPort, forcedProxyDomains: forcedProxyDomains)
+            try HarborSystemProxy.enable(port: localPort, forcedProxyDomains: forcedProxyDomains,
+                                         interactive: interactive)
             systemManaged = true
-            detail = "已设置 macOS 系统代理，可随时清除"
-        } catch { detail = error.localizedDescription }
+            autoManageSystemProxy = true
+            persist()
+            detail = "已接管 macOS 系统代理"
+        } catch {
+            systemManaged = false
+            detail = "本地节点已连接，但系统代理未接管：" + error.localizedDescription
+        }
     }
 
     func clearSystemProxy() {
         do {
-            try HarborSystemProxy.restore(interactive: true)
+            try HarborSystemProxy.restore(interactive: false)
             systemManaged = false
+            autoManageSystemProxy = false
+            persist()
             detail = "原系统代理设置已恢复"
         } catch { detail = error.localizedDescription }
     }
 
     @discardableResult
-    func stop(interactive: Bool = true) -> Bool {
+    func stop(interactive: Bool = false) async -> Bool {
         if HarborProxyRecoveryPolicy.mustRestoreBeforeStop(hasBackup: HarborSystemProxy.hasBackup) {
             do { try HarborSystemProxy.restore(interactive: interactive) }
-            catch { detail = "系统代理未恢复，请先清除再关闭：" + error.localizedDescription; return false }
+            catch { detail = "系统代理未恢复，已保留代理内核运行：" + error.localizedDescription; return false }
         }
         systemManaged = false
+        return await stopCore()
+    }
+
+    /// Stop only our Xray child. Node switching keeps the fixed macOS proxy
+    /// address and the ownership/recovery snapshot intact; no authorization.
+    private var coreProcessAlive: Bool {
+        if child?.isRunning == true { return true }
+        if let adoptedPID { return Darwin.kill(adoptedPID, 0) == 0 }
+        return false
+    }
+
+    private func stopCore() async -> Bool {
+        connectionGeneration &+= 1
+        healthTask?.cancel()
+        healthTask = nil
+        if adoptedPID != nil {
+            await cleanupOrphan()
+            guard !FileManager.default.fileExists(atPath: runtimeRecordURL.path) else {
+                detail = "旧 Xray 进程尚未退出，不能切换节点"
+                return false
+            }
+            adoptedPID = nil
+        }
         if child == nil && FileManager.default.fileExists(atPath: runtimeRecordURL.path) {
-            cleanupOrphan()
+            await cleanupOrphan()
             guard !FileManager.default.fileExists(atPath: runtimeRecordURL.path) else {
                 detail = "存在未清理的 Xray 进程，不能标记为已关闭"
                 return false
@@ -536,9 +956,13 @@ final class HarborProxyManager: ObservableObject {
         if let child {
             if child.isRunning {
                 child.terminate()
-                for _ in 0..<20 where child.isRunning { usleep(50_000) }
+                for _ in 0..<20 where child.isRunning {
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
                 if child.isRunning { _ = Darwin.kill(child.processIdentifier, SIGKILL) }
-                for _ in 0..<20 where child.isRunning { usleep(50_000) }
+                for _ in 0..<20 where child.isRunning {
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
                 if child.isRunning {
                     detail = "代理内核未能退出，请手动检查进程"
                     return false
@@ -549,13 +973,75 @@ final class HarborProxyManager: ObservableObject {
         if let configPath { try? FileManager.default.removeItem(at: configPath) }
         try? FileManager.default.removeItem(at: runtimeRecordURL)
         configPath = nil; localPort = nil
-        running = false; healthy = false; status = "已关闭"
+        running = false; healthy = false; checkingConnectivity = false; status = "已关闭"
+        return true
+    }
+
+    /// A previous app instance can exit without stopping Xray if macOS
+    /// declined restoring the system proxy. Reuse its already-working listener
+    /// instead of waiting for it to quit and racing for fixed ports.
+    private func adoptExistingXray() -> Bool {
+        guard HarborSystemProxy.isOwned(),
+              let data = try? Data(contentsOf: runtimeRecordURL),
+              let record = try? JSONDecoder().decode(HarborProxyProcessRecord.self, from: data),
+              selectedNode != nil,
+              recordedXrayIsOrphan(record),
+              portListening(configuredHTTPPort),
+              portListening(configuredHTTPPort + 1) else { return false }
+        adoptedPID = record.pid
+        configPath = URL(fileURLWithPath: record.configPath)
+        localPort = configuredHTTPPort
+        running = true
+        systemManaged = true
+        healthy = false
+        checkingConnectivity = true
+        status = "已启动 · 正在检测网络"
+        detail = "已接管上次运行的 Xray，端口保持不变"
+        connectionGeneration &+= 1
+        let generation = connectionGeneration
+        let port = configuredHTTPPort
+        healthTask?.cancel()
+        healthTask = Task { [weak self] in
+            guard let self else { return }
+            await self.finishHealthCheck(
+                port: port,
+                generation: generation,
+                systemProxyInteractive: false
+            )
+        }
         return true
     }
 
     /// Only remove an orphan that matches Harbor's unique config path and executable.
     /// Never kill a PID solely because a prior runtime record contains that number.
-    private func cleanupOrphan() {
+    private func recordedXrayIsOrphan(_ record: HarborProxyProcessRecord) -> Bool {
+        let config = URL(fileURLWithPath: record.configPath).standardizedFileURL
+        guard record.pid > 0,
+              config.deletingLastPathComponent() == root.standardizedFileURL,
+              config.lastPathComponent.hasPrefix("runtime-"),
+              config.pathExtension == "json",
+              record.executablePath == root.appendingPathComponent("xray").path,
+              Darwin.kill(record.pid, 0) == 0 else { return false }
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-ww", "-p", String(record.pid), "-o", "ppid=", "-o", "command="]
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            let parts = output.split(maxSplits: 1, whereSeparator: { $0.isWhitespace })
+            return process.terminationStatus == 0 &&
+                parts.count == 2 && parts[0] == "1" &&
+                parts[1].contains(record.executablePath) &&
+                parts[1].contains(record.configPath) &&
+                parts[1].contains("run")
+        } catch { return false }
+    }
+
+    private func cleanupOrphan() async {
         guard let data = try? Data(contentsOf: runtimeRecordURL),
               let record = try? JSONDecoder().decode(HarborProxyProcessRecord.self, from: data),
               record.pid > 0 else { return }
@@ -567,38 +1053,51 @@ final class HarborProxyManager: ObservableObject {
             detail = "检测到异常的旧代理恢复记录，已停止自动清理"
             return
         }
-        let command = Process()
-        let pipe = Pipe()
-        command.executableURL = URL(fileURLWithPath: "/bin/ps")
-        command.arguments = ["-ww", "-p", String(record.pid), "-o", "command="]
-        command.standardOutput = pipe
-        command.standardError = FileHandle.nullDevice
-        do {
-            try command.run()
-            command.waitUntilExit()
-            let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            if command.terminationStatus == 0,
-               output.contains(record.executablePath),
-               output.contains(record.configPath),
-               output.contains("run") {
-                _ = Darwin.kill(record.pid, SIGTERM)
-                for _ in 0..<20 where Darwin.kill(record.pid, 0) == 0 { usleep(50_000) }
-                guard Darwin.kill(record.pid, 0) != 0 else {
-                    detail = "旧代理进程尚未退出，请手动处理"
+        let isAlive = Darwin.kill(record.pid, 0) == 0
+        if isAlive {
+            guard recordedXrayIsOrphan(record) else {
+                detail = "旧 Xray 仍由其他进程管理或运行身份已变更，已停止自动清理"
+                return
+            }
+            _ = Darwin.kill(record.pid, SIGTERM)
+            for _ in 0..<20 where Darwin.kill(record.pid, 0) == 0 {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            if Darwin.kill(record.pid, 0) == 0 {
+                // Revalidate immediately before escalating, protecting against
+                // PID reuse and accidental termination of unrelated processes.
+                guard recordedXrayIsOrphan(record) else {
+                    detail = "旧 Xray 身份发生变化，已停止自动清理"
                     return
                 }
+                _ = Darwin.kill(record.pid, SIGKILL)
+                for _ in 0..<20 where Darwin.kill(record.pid, 0) == 0 {
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
             }
-            try? FileManager.default.removeItem(at: config)
-            try? FileManager.default.removeItem(at: runtimeRecordURL)
-        } catch { detail = "旧代理进程检查失败：" + error.localizedDescription }
+            guard Darwin.kill(record.pid, 0) != 0 else {
+                detail = "旧 Xray 未退出，端口保持占用；不会自动更换端口"
+                return
+            }
+        }
+        try? FileManager.default.removeItem(at: config)
+        try? FileManager.default.removeItem(at: runtimeRecordURL)
     }
 
     private func choosePort() throws -> Int {
-        for port in stride(from: 18080, through: 18160, by: 2)
-            where portFree(port) && portFree(port + 1) { return port }
-        throw HarborProxyError.invalid("无可用代理监听端口")
+        let port = try HarborProxyPortPolicy.validate(httpPort: configuredHTTPPort)
+        if portListening(port) {
+            throw HarborProxyError.invalid("HTTP 端口 \(port) 被其他进程占用。请关闭占用程序，或在代理页面手动更改端口；不会自动切换端口。")
+        }
+        if portListening(port + 1) {
+            throw HarborProxyError.invalid("SOCKS5 端口 \(port + 1) 被其他进程占用。请关闭占用程序，或在代理页面手动更改端口；不会自动切换端口。")
+        }
+        return port
     }
-    private func portFree(_ port: Int) -> Bool {
+    /// Check for a real listening socket instead of probing with bind(). A
+    /// recently closed TCP connection can keep a port in TIME_WAIT and make a
+    /// bind preflight fail even though Xray can immediately listen again.
+    private func portListening(_ port: Int) -> Bool {
         let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
         defer { Darwin.close(fd) }
@@ -609,7 +1108,7 @@ final class HarborProxyManager: ObservableObject {
         address.sin_addr = in_addr(s_addr: in_addr_t(INADDR_LOOPBACK).bigEndian)
         return withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
             }
         }
     }

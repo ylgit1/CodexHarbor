@@ -30,6 +30,18 @@ struct HarborProxyRecoveryPolicyTests {
             isSystemManaged: false, ownsSystemProxy: false))
     }
 
+    @Test("A complete takeover by another proxy client is safe to relinquish")
+    func externalTakeover() {
+        #expect(!HarborProxyRecoveryPolicy.requiresRecovery(
+            hasBackup: true, isRunning: true,
+            isSystemManaged: true, ownsSystemProxy: false,
+            currentUsesManagedListener: false))
+        #expect(HarborProxyRecoveryPolicy.requiresRecovery(
+            hasBackup: true, isRunning: true,
+            isSystemManaged: true, ownsSystemProxy: false,
+            currentUsesManagedListener: true))
+    }
+
     @Test("Stop must restore even when the system proxy is working")
     func stopGuard() {
         #expect(HarborProxyRecoveryPolicy.mustRestoreBeforeStop(hasBackup: true))

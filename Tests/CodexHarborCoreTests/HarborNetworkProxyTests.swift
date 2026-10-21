@@ -5,6 +5,93 @@ import Testing
 
 @Suite("Independent network proxy")
 struct HarborNetworkProxyTests {
+    @Test("Custom node names are validated and survive subscription replacement")
+    func customNodeNames() throws {
+        let original = HarborProxyNode(
+            id: "old", name: "订阅原名", customName: "我的美国节点",
+            protocolName: "vless", host: "node.example.com", port: 443,
+            credential: "credential", security: "tls"
+        )
+        let refreshed = HarborProxyNode(
+            id: "new", name: "供应商新名称", protocolName: "vless",
+            host: "node.example.com", port: 443,
+            credential: "credential", security: "tls"
+        )
+        let result = HarborProxyNodeNaming.preservingCustomNames(
+            from: [original], in: [refreshed]
+        )
+        #expect(result.first?.name == "供应商新名称")
+        #expect(result.first?.displayName == "我的美国节点")
+        #expect(try HarborProxyNodeNaming.customName("  新名称  ", sourceName: "原名") == "新名称")
+        #expect(try HarborProxyNodeNaming.customName("原名", sourceName: "原名") == nil)
+        #expect(throws: HarborProxyError.self) {
+            try HarborProxyNodeNaming.customName("   ", sourceName: "原名")
+        }
+    }
+
+    @Test("Local listeners report ready without waiting for outbound HTTPS probes")
+    func localStartupReadiness() {
+        #expect(HarborProxyStartupPolicy.canPublishListenerReady(xrayRunning: true, portsListening: true))
+        #expect(!HarborProxyStartupPolicy.canPublishListenerReady(xrayRunning: false, portsListening: true))
+        #expect(!HarborProxyStartupPolicy.canPublishListenerReady(xrayRunning: true, portsListening: false))
+    }
+
+    @Test("Node clicks remain selectable and the last click wins during a switch")
+    func queuedActivation() {
+        var queue = HarborProxyActivationQueue()
+        #expect(queue.takeNext() == nil)
+
+        // A first connection must be selectable even when it differs from
+        // the saved last node; later clicks overwrite only pending requests.
+        queue.enqueue("new-node", restart: false, userInitiated: true)
+        #expect(queue.takeNext()?.nodeID == "new-node")
+        #expect(queue.takeNext() == nil)
+
+        queue.enqueue("old-node", restart: false, userInitiated: false)
+        queue.enqueue("new-node", restart: false, userInitiated: true)
+        queue.enqueue("last-clicked-node", restart: true, userInitiated: true)
+        let last = queue.takeNext()
+        #expect(last?.nodeID == "last-clicked-node")
+        #expect(last?.restart == true)
+        #expect(last?.userInitiated == true)
+        #expect(queue.takeNext() == nil)
+    }
+
+    @Test("A node click resumes system proxy takeover after clear")
+    func explicitConnectionIntent() {
+        #expect(HarborProxyConnectionIntent.shouldManageSystemProxy(
+            persistedPreference: false, userInitiated: true
+        ))
+        #expect(HarborProxyConnectionIntent.shouldManageSystemProxy(
+            persistedPreference: true, userInitiated: false
+        ))
+        #expect(!HarborProxyConnectionIntent.shouldManageSystemProxy(
+            persistedPreference: false, userInitiated: false
+        ))
+    }
+
+    @Test("Local proxy ports are stable and user-configurable")
+    func stableListenerPorts() throws {
+        #expect(HarborProxyPortPolicy.defaultHTTPPort == 18080)
+        #expect(HarborProxyPortPolicy.defaultSOCKSPort == 18081)
+        #expect(try HarborProxyPortPolicy.validate(httpPort: 18080) == 18080)
+        #expect(try HarborProxyPortPolicy.validate(httpPort: 18082) == 18082)
+        #expect(HarborProxyPortPolicy.socksPort(for: 18082) == 18083)
+        #expect(throws: HarborProxyError.self) {
+            try HarborProxyPortPolicy.validate(httpPort: 1023)
+        }
+        #expect(throws: HarborProxyError.self) {
+            try HarborProxyPortPolicy.validate(httpPort: 65535)
+        }
+        let node = HarborProxyNode(name: "test", protocolName: "vless",
+            host: "node.example.com", port: 443,
+            credential: "00000000-0000-0000-0000-000000000001")
+        let config = try HarborXrayConfig.make(node: node, httpPort: 18082, ruleMode: false)
+        let json = try #require(JSONSerialization.jsonObject(with: config) as? [String: Any])
+        let listeners = try #require(json["inbounds"] as? [[String: Any]])
+        #expect(listeners.compactMap { $0["port"] as? Int } == [18082, 18083])
+    }
+
     @Test("Xray creates loopback listeners and isolated routing")
     func xrayConfiguration() throws {
         let node = HarborProxyNode(name: "test", protocolName: "vless",

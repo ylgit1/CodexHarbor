@@ -1,9 +1,68 @@
 import Foundation
 import SQLite3
 
+/// Stable listener ports. Never auto-increment to another pair when occupied.
+public enum HarborProxyPortPolicy {
+    public static let defaultHTTPPort = 18080
+    public static let defaultSOCKSPort = 18081
+
+    @discardableResult
+    public static func validate(httpPort: Int) throws -> Int {
+        guard (1024...65534).contains(httpPort) else {
+            throw HarborProxyError.invalid("HTTP 代理端口必须在 1024～65534 之间（SOCKS5 使用下一端口）")
+        }
+        return httpPort
+    }
+
+    public static func socksPort(for httpPort: Int) -> Int { httpPort + 1 }
+}
+
+/// Local readiness is independent of external HTTPS probe success; network
+/// verification is performed asynchronously after the listeners are ready.
+public enum HarborProxyStartupPolicy {
+    public static func canPublishListenerReady(xrayRunning: Bool, portsListening: Bool) -> Bool {
+        xrayRunning && portsListening
+    }
+}
+
+/// An explicit node click always means "use this proxy". A prior clear action
+/// may pause automatic takeover, but it must not permanently turn later node
+/// selections into local-listener-only starts.
+public enum HarborProxyConnectionIntent {
+    public static func shouldManageSystemProxy(
+        persistedPreference: Bool,
+        userInitiated: Bool
+    ) -> Bool {
+        persistedPreference || userInitiated
+    }
+}
+
+/// Latest-intent-wins node activation, independent of Xray startup/teardown.
+public struct HarborProxyActivationQueue: Sendable {
+    public struct Request: Sendable, Equatable {
+        public let nodeID: String
+        public let restart: Bool
+        public let userInitiated: Bool
+    }
+
+    private var pending: Request?
+
+    public init() {}
+
+    public mutating func enqueue(_ nodeID: String, restart: Bool, userInitiated: Bool) {
+        pending = Request(nodeID: nodeID, restart: restart, userInitiated: userInitiated)
+    }
+
+    public mutating func takeNext() -> Request? {
+        defer { pending = nil }
+        return pending
+    }
+}
+
 public struct HarborProxyNode: Codable, Identifiable, Sendable, Hashable {
     public var id: String
     public var name: String
+    public var customName: String?
     public var protocolName: String
     public var host: String
     public var port: Int
@@ -20,12 +79,14 @@ public struct HarborProxyNode: Codable, Identifiable, Sendable, Hashable {
     public var flow: String
     public var alterID: Int
     public var subscriptionID: String
-    public init(id: String = UUID().uuidString, name: String, protocolName: String, host: String,
+    public init(id: String = UUID().uuidString, name: String, customName: String? = nil,
+                protocolName: String, host: String,
                 port: Int, credential: String, encryption: String = "none", network: String = "tcp",
                 security: String = "none", sni: String = "", headerHost: String = "", path: String = "",
                 fingerprint: String = "", publicKey: String = "", shortID: String = "",
                 flow: String = "", alterID: Int = 0, subscriptionID: String = "") {
-        self.id = id; self.name = name; self.protocolName = protocolName; self.host = host
+        self.id = id; self.name = name; self.customName = customName
+        self.protocolName = protocolName; self.host = host
         self.port = port; self.credential = credential; self.encryption = encryption
         self.network = network; self.security = security; self.sni = sni
         self.headerHost = headerHost; self.path = path; self.fingerprint = fingerprint
@@ -33,6 +94,63 @@ public struct HarborProxyNode: Codable, Identifiable, Sendable, Hashable {
         self.alterID = alterID; self.subscriptionID = subscriptionID
     }
     public var label: String { "\(protocolName.uppercased()) · \(host):\(port)" }
+    public var displayName: String { customName ?? name }
+}
+
+/// User-assigned node names stay separate from provider remarks, so a
+/// subscription refresh can update connection data without erasing the alias.
+public enum HarborProxyNodeNaming {
+    public static let maximumLength = 80
+
+    private struct Endpoint: Hashable {
+        var protocolName: String
+        var host: String
+        var port: Int
+        var credential: String
+        var encryption: String
+        var network: String
+        var security: String
+        var sni: String
+        var headerHost: String
+        var path: String
+        var fingerprint: String
+        var publicKey: String
+        var shortID: String
+        var flow: String
+        var alterID: Int
+
+        init(_ node: HarborProxyNode) {
+            protocolName = node.protocolName; host = node.host; port = node.port
+            credential = node.credential; encryption = node.encryption
+            network = node.network; security = node.security; sni = node.sni
+            headerHost = node.headerHost; path = node.path
+            fingerprint = node.fingerprint; publicKey = node.publicKey
+            shortID = node.shortID; flow = node.flow; alterID = node.alterID
+        }
+    }
+
+    public static func customName(_ rawValue: String, sourceName: String) throws -> String? {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { throw HarborProxyError.invalid("节点名称不能为空") }
+        guard value.count <= maximumLength else {
+            throw HarborProxyError.invalid("节点名称最多 \(maximumLength) 个字符")
+        }
+        return value == sourceName ? nil : value
+    }
+
+    public static func preservingCustomNames(
+        from current: [HarborProxyNode],
+        in replacements: [HarborProxyNode]
+    ) -> [HarborProxyNode] {
+        let aliases = current.reduce(into: [Endpoint: String]()) { result, node in
+            if let customName = node.customName { result[Endpoint(node)] = customName }
+        }
+        return replacements.map { replacement in
+            var node = replacement
+            node.customName = aliases[Endpoint(replacement)]
+            return node
+        }
+    }
 }
 
 public struct HarborProxySubscription: Codable, Identifiable, Sendable, Hashable {

@@ -5,7 +5,10 @@ import SystemConfiguration
 
 /// Separate from the ChatGPT transport. Never edit a different application's
 /// active proxy settings, even if an old Harbor recovery file is present.
+@MainActor
 enum HarborSystemProxy {
+    private static var sessionAuthorization: AuthorizationRef?
+
     private struct Snapshot: Codable {
         var serviceID: String
         var original: Data
@@ -33,6 +36,14 @@ enum HarborSystemProxy {
             .appendingPathComponent("Library/Application Support/CodexHarbor/NetworkProxy/system-recovery.json")
     }
     static var hasBackup: Bool { FileManager.default.fileExists(atPath: backupURL.path) }
+
+    /// Recover the actual managed listener port if the app exited before
+    /// restoring the previous macOS network settings.
+    static var ownedHTTPPort: Int? {
+        guard isOwned(), let snapshot = load(),
+              let managed = decoded(snapshot.managed) else { return nil }
+        return (managed["HTTPPort"] as? NSNumber)?.intValue
+    }
 
     private static func decoded(_ data: Data) -> [String: Any]? {
         try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
@@ -76,6 +87,24 @@ enum HarborSystemProxy {
         return equal(SCNetworkProtocolGetConfiguration(p) as? [String: Any] ?? [:], desired)
     }
 
+    /// True only while at least one active proxy entry still points to the
+    /// listener recorded by Harbor. A complete takeover by another client is
+    /// safe to relinquish and must not strand node switching in recovery mode.
+    static var currentUsesManagedListener: Bool {
+        guard let snapshot = load(), let managed = decoded(snapshot.managed),
+              let prefs = SCPreferencesCreate(nil, "com.codexharbor.proxy.read" as CFString, nil),
+              let target = proxy(prefs, serviceID: snapshot.serviceID) else { return false }
+        let current = SCNetworkProtocolGetConfiguration(target) as? [String: Any] ?? [:]
+        let harborPort = (managed["HTTPPort"] as? NSNumber)?.intValue ?? -1
+        return ["HTTP", "HTTPS", "SOCKS"].contains { label in
+            let enabled = (current[label + "Enable"] as? NSNumber)?.boolValue == true
+            let host = current[label + "Proxy"] as? String
+            let port = (current[label + "Port"] as? NSNumber)?.intValue ?? -1
+            let targetPort = label == "SOCKS" ? harborPort + 1 : harborPort
+            return enabled && host == "127.0.0.1" && port == targetPort
+        }
+    }
+
     static func activeProxyDescription() -> String {
         guard let settings = SCDynamicStoreCopyProxies(nil) as? [String: Any] else { return "无法读取系统代理" }
         let labels = [
@@ -92,23 +121,42 @@ enum HarborSystemProxy {
         return items.isEmpty ? "未启用" : items.joined(separator: " · ")
     }
 
+    @MainActor
     private final class Authorized {
         let prefs: SCPreferences
-        let auth: AuthorizationRef
+        nonisolated(unsafe) let auth: AuthorizationRef
+        nonisolated(unsafe) private var ownsReference: Bool
         init(interactive: Bool) throws {
-            var reference: AuthorizationRef?
-            let flags: AuthorizationFlags = interactive ? [.interactionAllowed, .extendRights] : [.extendRights]
-            guard AuthorizationCreate(nil, nil, flags, &reference) == errAuthorizationSuccess,
-                  let reference else { throw Failure.authorization }
+            let reference: AuthorizationRef
+            if let cached = sessionAuthorization {
+                reference = cached
+                ownsReference = false
+            } else {
+                var created: AuthorizationRef?
+                let flags: AuthorizationFlags = interactive ? [.interactionAllowed, .extendRights] : [.extendRights]
+                guard AuthorizationCreate(nil, nil, flags, &created) == errAuthorizationSuccess,
+                      let created else { throw Failure.authorization }
+                reference = created
+                ownsReference = true
+            }
             guard let preferences = SCPreferencesCreateWithAuthorization(
                 nil, "com.codexharbor.proxy.write" as CFString, nil, reference
             ) else {
-                AuthorizationFree(reference, [])
+                if ownsReference { AuthorizationFree(reference, []) }
                 throw Failure.authorization
             }
-            prefs = preferences; auth = reference
+            prefs = preferences
+            auth = reference
         }
-        deinit { AuthorizationFree(auth, []) }
+        func retainGrantedSession() {
+            if ownsReference {
+                sessionAuthorization = auth
+                ownsReference = false
+            }
+        }
+        deinit {
+            if ownsReference { AuthorizationFree(auth, []) }
+        }
     }
 
     private static func apply(_ proto: SCNetworkProtocol, prefs: SCPreferences, values: [String: Any]) throws {
@@ -117,7 +165,8 @@ enum HarborSystemProxy {
         else { throw Failure.changeFailed }
     }
 
-    static func enable(port: Int, forcedProxyDomains: [String] = HarborProxyDomainRules.defaults) throws {
+    static func enable(port: Int, forcedProxyDomains: [String] = HarborProxyDomainRules.defaults,
+                       interactive: Bool = false) throws {
         guard (1024...65535).contains(port) else { throw Failure.unavailable }
         if hasBackup { throw Failure.notOwned }
         // Fail closed before requesting authorization. This prevents a subtle
@@ -126,7 +175,7 @@ enum HarborSystemProxy {
               let (id, active) = currentService(inspector) else { throw Failure.unavailable }
         let inspected = SCNetworkProtocolGetConfiguration(active) as? [String: Any] ?? [:]
         if hasOther(inspected) { throw Failure.inUse }
-        let context = try Authorized(interactive: true)
+        let context = try Authorized(interactive: interactive)
         guard let target = proxy(context.prefs, serviceID: id) else { throw Failure.unavailable }
         let previous = SCNetworkProtocolGetConfiguration(target) as? [String: Any] ?? [:]
         if hasOther(previous) { throw Failure.inUse }
@@ -157,6 +206,7 @@ enum HarborSystemProxy {
         do {
             try apply(target, prefs: context.prefs, values: updated)
             guard isOwned() else { throw Failure.changeFailed }
+            context.retainGrantedSession()
         } catch {
             try? apply(target, prefs: context.prefs, values: previous)
             if let restored = SCNetworkProtocolGetConfiguration(target) as? [String: Any],
@@ -183,15 +233,7 @@ enum HarborSystemProxy {
             // Another client has already taken over the system proxy.
             // Relinquish our recovery marker only if macOS no longer points
             // to Harbor's former local HTTP/HTTPS port.
-            let harborPort = (managed["HTTPPort"] as? NSNumber)?.intValue ?? -1
-            let stillUsesHarbor = ["HTTP", "HTTPS", "SOCKS"].contains { label in
-                let enabled = (current[label + "Enable"] as? NSNumber)?.boolValue == true
-                let host = current[label + "Proxy"] as? String
-                let port = (current[label + "Port"] as? NSNumber)?.intValue ?? -1
-                let targetPort = label == "SOCKS" ? harborPort + 1 : harborPort
-                return enabled && host == "127.0.0.1" && port == targetPort
-            }
-            guard !stillUsesHarbor else { throw Failure.notOwned }
+            guard !currentUsesManagedListener else { throw Failure.notOwned }
             try FileManager.default.removeItem(at: backupURL)
             return true
         }
@@ -205,6 +247,7 @@ enum HarborSystemProxy {
               equal(SCNetworkProtocolGetConfiguration(verified) as? [String: Any] ?? [:], original)
         else { throw Failure.changeFailed }
         try FileManager.default.removeItem(at: backupURL)
+        context.retainGrantedSession()
         return true
     }
 }

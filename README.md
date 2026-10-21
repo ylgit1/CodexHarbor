@@ -23,11 +23,11 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 
 ## 下载安装
 
-- [最新 DMG · GitHub 公共镜像（无需登录）](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.6/Codex-Harbor-v0.1.6-arm64.dmg)
+- [最新 DMG · GitHub 公共镜像（无需登录）](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.7/Codex-Harbor-v0.1.7-arm64.dmg)
 - [最新 DMG · Gitee 文件（访问大文件可能需要登录）](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg)
-- [Gitee v0.1.6 固定版本](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/v0.1.6/Codex-Harbor-v0.1.6-arm64.dmg)
+- [Gitee v0.1.7 固定版本](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/v0.1.7/Codex-Harbor-v0.1.7-arm64.dmg)
 
-v0.1.6 DMG 的 SHA-256 校验值见 [GitHub Release 附件](https://github.com/ylgit1/CodexHarbor/releases/tag/v0.1.6) 中的 `SHA256SUMS`。
+v0.1.7 DMG 的 SHA-256 校验值见 [GitHub Release 附件](https://github.com/ylgit1/CodexHarbor/releases/tag/v0.1.7) 中的 `SHA256SUMS`。
 Gitee Raw 大文件要求用户登录；不能登录时使用 GitHub 公共下载镜像。
 要求 macOS 14 或更新版本及 Apple Silicon；Xray、`geoip.dat`、`geosite.dat`
 已内置，首次启动不需要下载代理内核。

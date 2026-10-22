@@ -193,6 +193,9 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var nodes: [HarborProxyNode] = []
     @Published private(set) var subscriptions: [HarborProxySubscription] = []
     @Published private(set) var selectedID: String?
+    /// Runtime identity is separate from the desired/saved profile; the UI
+    /// must never call a merely selected node "connected".
+    @Published private(set) var activeNodeID: String?
     @Published private(set) var running = false
     @Published private(set) var healthy = false
     @Published private(set) var checkingConnectivity = false
@@ -277,6 +280,38 @@ final class HarborProxyManager: ObservableObject {
     private var wakeObserver: NSObjectProtocol?
     private var systemProxyMonitor: HarborSystemProxyChangeMonitor?
     var selectedNode: HarborProxyNode? { nodes.first { $0.id == selectedID } }
+    var activeNode: HarborProxyNode? { nodes.first { $0.id == activeNodeID } }
+
+    private func runningConfigMatches(_ id: String, path: URL?) -> Bool {
+        guard let node = nodes.first(where: { $0.id == id }),
+              let path, let data = try? Data(contentsOf: path) else { return false }
+        return HarborProxyRuntimeIdentity.matches(configuration: data, node: node)
+    }
+
+    /// Minimal, bounded, append-only, permission-restricted switch journal.
+    /// Node IDs are hashed, never record IP, hostname, SNI, credentials or URLs.
+    private func proxyAudit(_ event: String, nodeID: String? = nil, note: String = "") {
+        let marker = nodeID.map { id in
+            SHA256.hash(data: Data(id.utf8)).prefix(6).map { String(format: "%02x", $0) }.joined()
+        } ?? "none"
+        let destination = root.appendingPathComponent("proxy-switch-diagnostics.log")
+        let fd = destination.path.withCString {
+            Darwin.open($0, O_WRONLY | O_CREAT | O_APPEND, mode_t(0o600))
+        }
+        guard fd >= 0 else { return }
+        defer { _ = Darwin.close(fd) }
+        _ = Darwin.fchmod(fd, mode_t(0o600))
+        let time = ISO8601DateFormatter().string(from: .now)
+        let line = "\(time) event=\(event) node=\(marker) pid=\(child?.processIdentifier ?? adoptedPID ?? 0) port=\(localPort ?? 0) \(note)\n"
+        let bytes = Array(line.utf8)
+        bytes.withUnsafeBytes { ptr in
+            if let base = ptr.baseAddress { _ = Darwin.write(fd, base, ptr.count) }
+        }
+        if (try? FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.intValue ?? 0 > 128 * 1024 {
+            // No unbounded growth; resume with a fresh audit on the next event.
+            _ = Darwin.ftruncate(fd, 0)
+        }
+    }
     var coreInstalled: Bool {
         let files = ["xray", "geoip.dat", "geosite.dat"]
         return files.allSatisfy {
@@ -816,7 +851,7 @@ final class HarborProxyManager: ObservableObject {
         }
         guard let subscription = subscriptions.first(where: { $0.id == id }) else { return false }
         let matching = nodes.filter { $0.subscriptionID == id }
-        if running && matching.contains(where: { $0.id == selectedID }) {
+        if running && matching.contains(where: { $0.id == activeNodeID }) {
             detail = "正在使用此订阅节点，请先清理代理再删除订阅"
             return false
         }
@@ -944,7 +979,7 @@ final class HarborProxyManager: ObservableObject {
             return
         }
         guard let preserveSystemProxy = prepareSystemProxyForActivation() else { return }
-        let previousID = selectedID
+        let previousID = activeNodeID ?? selectedID
         let wasRunning = running
         let wasManaged = preserveSystemProxy
 
@@ -953,10 +988,9 @@ final class HarborProxyManager: ObservableObject {
             userInitiated: userInitiated
         )
 
-        // Remember the selection before starting: even a failed first attempt
-        // must not force the user to connect the old node before choosing another.
-        selectedID = id
-        persist()
+        // The requested profile is only committed after its Xray listeners
+        // and actual outbound identity have been verified.
+        proxyAudit("switch_requested", nodeID: id, note: "running=\(wasRunning)")
 
         if wasRunning && previousID == id && !restart {
             if checkingConnectivity {
@@ -975,37 +1009,40 @@ final class HarborProxyManager: ObservableObject {
             // Keep the macOS proxy settings and ownership snapshot untouched:
             // Xray's fixed ports do not change when only the remote node changes.
             guard await stopCore() else {
+                proxyAudit("old_stop_failed", nodeID: id)
                 detail = "旧代理内核仍未退出，请稍候重试：" + detail
                 return
             }
+            proxyAudit("old_stopped", nodeID: previousID)
         }
 
         await start(
+            nodeID: id,
             preservingSystemProxy: wasManaged,
             systemProxyInteractive: userInitiated
         )
         if !running {
             let failure = detail
             // Restore the previous active node if the replacement fails.
+            proxyAudit("switch_failed", nodeID: id)
             if wasRunning, let previousID, previousID != id,
                nodes.contains(where: { $0.id == previousID }) {
-                selectedID = previousID
                 await start(
                     preservingSystemProxy: wasManaged,
                     systemProxyInteractive: false
                 )
                 if running {
+                    proxyAudit("rollback_restored", nodeID: previousID)
                     detail = "新节点连接失败：\(failure)；已恢复原连接"
                 } else {
+                    proxyAudit("rollback_failed", nodeID: previousID)
                     detail = "新节点连接失败：\(failure)；原连接恢复失败：" + detail
                 }
-                // Preserve the user's next choice for retry if no client is live.
-                if !running { selectedID = id }
-                persist()
             }
             return
         }
 
+        proxyAudit("switch_listener_committed", nodeID: id)
         if wasManaged {
             // The unchanged system proxy already targets our fixed listener.
             systemManaged = HarborSystemProxy.isOwned()
@@ -1043,6 +1080,7 @@ final class HarborProxyManager: ObservableObject {
     }
 
     func start(
+        nodeID: String? = nil,
         preservingSystemProxy: Bool = false,
         waitForHealth: Bool = false,
         systemProxyInteractive: Bool = false
@@ -1067,7 +1105,10 @@ final class HarborProxyManager: ObservableObject {
             detail = "系统代理状态尚未安全恢复"
             return
         }
-        guard let node = selectedNode else { detail = "先导入并选择节点"; return }
+        guard let node = nodes.first(where: { $0.id == (nodeID ?? selectedID) }) else {
+            detail = "先导入并选择节点"
+            return
+        }
         guard coreInstalled else { detail = "请从安装包恢复内置 Xray 内核"; return }
         busy = true; defer { busy = false }
         status = "正在连接"; detail = ""
@@ -1125,7 +1166,18 @@ final class HarborProxyManager: ObservableObject {
                 _ = await stopCore()
                 throw HarborProxyError.invalid("Xray 未能监听本地 HTTP/SOCKS5 端口，请检查端口或节点配置")
             }
+            guard runningConfigMatches(node.id, path: file) else {
+                proxyAudit("runtime_config_mismatch", nodeID: node.id)
+                _ = await stopCore()
+                throw HarborProxyError.invalid("运行配置与目标节点不一致，未将切换标记为成功")
+            }
+            // Commit UI identity only after the listener belongs to the new
+            // process and its complete outbound configuration matches the node.
+            activeNodeID = node.id
+            selectedID = node.id
+            persist()
             running = true
+            proxyAudit("listener_ready", nodeID: node.id)
             startLivenessMonitoring()
             healthy = false
             checkingConnectivity = true
@@ -1175,8 +1227,17 @@ final class HarborProxyManager: ObservableObject {
             detail = "本地监听进程意外退出，请重新连接或检查节点配置"
             return
         }
+        guard let activeNodeID, runningConfigMatches(activeNodeID, path: configPath) else {
+            checkingConnectivity = false
+            healthy = false
+            proxyAudit("health_identity_mismatch", nodeID: activeNodeID)
+            status = "运行配置与选中节点不一致"
+            detail = "Xray 已启动，但无法核对实际运行节点；请重新选择节点"
+            return
+        }
         checkingConnectivity = false
         healthy = reachable
+        proxyAudit(reachable ? "health_success" : "health_failed", nodeID: activeNodeID)
         if reachable {
             status = "已连接"
             detail = "HTTP 127.0.0.1:\(port) · SOCKS5 \(port + 1)"
@@ -1192,7 +1253,9 @@ final class HarborProxyManager: ObservableObject {
     func verify() async {
         guard running, let port = localPort, !busy else { return }
         busy = true; defer { busy = false }
-        healthy = await probe(port: port)
+        let reachable = await probe(port: port)
+        healthy = reachable && activeNodeID != nil && runningConfigMatches(activeNodeID!, path: configPath)
+        proxyAudit(healthy ? "manual_verify_success" : "manual_verify_failed", nodeID: activeNodeID)
         status = healthy ? "已连接" : "连接异常"
         detail = healthy ? "当前节点可访问外网" : "内核运行中，但测试目标不可达；可尝试切换节点"
     }
@@ -1280,36 +1343,50 @@ final class HarborProxyManager: ObservableObject {
             let batch = Array(targets[offset..<min(offset + batchSize, targets.count)])
             latencyTestingIDs = Set(batch.map(\.id))
             latencyCurrentID = batch.first?.id
-            await withTaskGroup(of: (String, Int?).self) { group in
+            await withTaskGroup(of: (String, Int?, String?).self) { group in
                 for node in batch {
                     group.addTask {
-                        let milliseconds: Int?
                         if kind == .tcp {
-                            milliseconds = await HarborNodeLatencyTester.measureTCP(
-                                node: node,
-                                cancellation: cancellation
+                            let milliseconds = await HarborNodeLatencyTester.measureTCP(
+                                node: node, cancellation: cancellation
                             )
-                        } else {
-                            milliseconds = await HarborNodeLatencyTester.measure(
-                                node: node,
-                                root: latencyRoot,
-                                ruleMode: latencyRuleMode,
-                                forcedProxyDomains: latencyForcedDomains,
-                                cancellation: cancellation
-                            )
+                            return (node.id, milliseconds, nil)
                         }
-                        return (node.id, milliseconds)
+                        let report = await HarborNodeLatencyTester.measure(
+                            node: node, root: latencyRoot,
+                            ruleMode: latencyRuleMode,
+                            forcedProxyDomains: latencyForcedDomains,
+                            cancellation: cancellation
+                        )
+                        return (node.id, report.milliseconds, report.failure)
                     }
                 }
-                for await (id, result) in group {
+                for await (id, result, failure) in group {
                     guard !latencyCancellationRequested, !Task.isCancelled else { continue }
                     let previous = probeResults[id]
                     probeResults[id] = HarborProxyProbeResult(
                         milliseconds: kind == .real ? result : previous?.milliseconds,
                         tcpMilliseconds: kind == .tcp ? result : previous?.tcpMilliseconds,
                         realTested: kind == .real || previous?.realTested == true,
-                        tcpTested: kind == .tcp || previous?.tcpTested == true
+                        tcpTested: kind == .tcp || previous?.tcpTested == true,
+                        realFailureReason: kind == .real ? failure : previous?.realFailureReason
                     )
+                    if kind == .real {
+                        let errorCategory = result == nil ? "failed" : "success"
+                        // Fixed categories only: no raw Xray stderr, address or secrets.
+                        let category: String
+                        switch failure {
+                        case nil: category = "ok"
+                        case let reason? where reason.contains("超时"): category = "timeout"
+                        case let reason? where reason.contains("TLS"): category = "tls"
+                        case let reason? where reason.contains("DNS"): category = "dns"
+                        case let reason? where reason.contains("连接"): category = "connect"
+                        case let reason? where reason.contains("监听"): category = "listener"
+                        default: category = "other"
+                        }
+                        proxyAudit("real_probe_\(errorCategory)", nodeID: id,
+                                   note: "reason=\(category)")
+                    }
                     if result != nil { succeeded += 1 }
                     latencyTestingIDs.remove(id)
                     latencyCompleted += 1
@@ -1317,6 +1394,8 @@ final class HarborProxyManager: ObservableObject {
             }
         }
         let label = kind == .tcp ? "TCP 测速" : "真实测速"
+        proxyAudit(kind == .tcp ? "tcp_probe_batch_done" : "real_probe_batch_done",
+                   note: "tested=\(latencyCompleted) successes=\(succeeded)")
         if !latencyCancellationRequested && !Task.isCancelled {
             lastCompletedLatencyTestKind = kind
             latencyCompletionSerial += 1
@@ -1324,6 +1403,11 @@ final class HarborProxyManager: ObservableObject {
         detail = latencyCancellationRequested || Task.isCancelled
             ? "已停止测速，完成 \(latencyCompleted)/\(latencyTotal) 个节点"
             : "\(label)完成：可用 \(succeeded)，不可用 \(latencyCompleted - succeeded)"
+        if kind == .real, targets.count == 1,
+           let reason = probeResults[targets[0].id]?.realFailureReason,
+           !latencyCancellationRequested {
+            detail += " · " + reason
+        }
     }
 
     func cancelLatencyTests() {
@@ -1430,7 +1514,16 @@ final class HarborProxyManager: ObservableObject {
     }
 
     private func reconcileXrayLiveness() async {
-        guard running, !coreProcessAlive else { return }
+        guard running else { return }
+        if coreProcessAlive {
+            if let activeNodeID, !runningConfigMatches(activeNodeID, path: configPath) {
+                healthy = false
+                status = "代理运行配置与选中节点不一致"
+                detail = "运行配置发生变化，已取消已连接状态；请重新选择节点"
+                proxyAudit("periodic_identity_mismatch", nodeID: activeNodeID)
+            }
+            return
+        }
         await handleUnexpectedXrayExit(pid: child?.processIdentifier ?? adoptedPID)
     }
 
@@ -1451,7 +1544,9 @@ final class HarborProxyManager: ObservableObject {
         }
         _ = await stopCore()
         systemManaged = false
+        activeNodeID = nil
         healthy = false
+        proxyAudit("unexpected_xray_exit")
         status = "代理内核异常退出"
         detail = restorationFailure.map {
             "Xray 意外退出，系统代理未能自动恢复：\($0)。请使用代理页面的恢复操作"
@@ -1507,6 +1602,7 @@ final class HarborProxyManager: ObservableObject {
         if let configPath { try? FileManager.default.removeItem(at: configPath) }
         try? FileManager.default.removeItem(at: runtimeRecordURL)
         configPath = nil; localPort = nil
+        activeNodeID = nil
         running = false; healthy = false; checkingConnectivity = false; status = "已关闭"
         refreshSystemProxyState()
         return true
@@ -1529,10 +1625,24 @@ final class HarborProxyManager: ObservableObject {
         running = true
         startLivenessMonitoring()
         systemManaged = true
+        // Adopt the actual outbound, never just the saved selectedID. If an
+        // older connection differs, keep its listeners alive but clearly show
+        // identity as unknown instead of reporting a false successful switch.
+        let configData = configPath.flatMap { try? Data(contentsOf: $0) }
+        let matched = configData.flatMap { data in
+            nodes.first { HarborProxyRuntimeIdentity.matches(configuration: data, node: $0) }
+        }
+        activeNodeID = matched?.id
         healthy = false
-        checkingConnectivity = true
-        status = "已启动 · 正在检测网络"
-        detail = "已接管上次运行的 Xray，端口保持不变"
+        checkingConnectivity = matched != nil
+        status = matched == nil ? "运行节点未能匹配保存的配置" : "已启动 · 正在检测网络"
+        detail = matched == nil ? "已有代理仍在运行，但其实际节点不在当前列表；重新选择节点以恢复一致" : "已核验并接管上次运行的节点"
+        proxyAudit(matched == nil ? "adopt_identity_unknown" : "adopt_matched", nodeID: matched?.id)
+        if let matched, selectedID != matched.id {
+            selectedID = matched.id
+            persist()
+        }
+        guard matched != nil else { return true }
         connectionGeneration &+= 1
         let generation = connectionGeneration
         let port = configuredHTTPPort

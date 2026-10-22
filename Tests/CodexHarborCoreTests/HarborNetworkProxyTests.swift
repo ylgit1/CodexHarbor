@@ -5,6 +5,50 @@ import Testing
 
 @Suite("Independent network proxy")
 struct HarborNetworkProxyTests {
+    @Test("Runtime outbound must match complete node identity, not UI selection")
+    func runtimeOutboundVerification() throws {
+        let node = HarborProxyNode(
+            name: "test", protocolName: "vless", host: "198.51.100.15",
+            port: 2096, credential: "00000000-0000-0000-0000-000000000001",
+            network: "ws", security: "tls", sni: "example.org",
+            headerHost: "cdn.example.org", path: "/ws", fingerprint: "chrome"
+        )
+        let config = try HarborXrayConfig.make(
+            node: node, httpPort: 18080, ruleMode: true, routeVerificationViaProxy: true
+        )
+        #expect(HarborProxyRuntimeIdentity.matches(configuration: config, node: node))
+        var changed = node
+        changed.id = "another-local-id"
+        changed.name = "Renamed profile"
+        #expect(HarborProxyRuntimeIdentity.matches(configuration: config, node: changed))
+        changed = node
+        changed.host = "198.51.100.20"
+        #expect(!HarborProxyRuntimeIdentity.matches(configuration: config, node: changed))
+        changed = node
+        changed.credential = "00000000-0000-0000-0000-000000000002"
+        #expect(!HarborProxyRuntimeIdentity.matches(configuration: config, node: changed))
+        changed = node
+        changed.sni = "different.example.org"
+        #expect(!HarborProxyRuntimeIdentity.matches(configuration: config, node: changed))
+        changed = node
+        changed.headerHost = "different.example.org"
+        #expect(!HarborProxyRuntimeIdentity.matches(configuration: config, node: changed))
+        changed = node
+        changed.path = "/changed"
+        #expect(!HarborProxyRuntimeIdentity.matches(configuration: config, node: changed))
+        #expect(!HarborProxyRuntimeIdentity.matches(configuration: Data("{}".utf8), node: node))
+    }
+
+    @Test("A TLS or upstream timeout does not erase successful TCP measurement")
+    func failedRealProbeReason() {
+        let result = HarborProxyProbeResult(
+            milliseconds: nil, tcpMilliseconds: 35, realTested: true,
+            tcpTested: true, realFailureReason: "HTTPS 超时（TLS / WebSocket / 上游网络）"
+        )
+        #expect(!result.succeeded)
+        #expect(result.tcpMilliseconds == 35)
+        #expect(result.realFailureReason?.contains("超时") == true)
+    }
     @Test("Workbench fits the minimum-height desktop window without clipping")
     func compactDashboardLayout() {
         let compact = HarborDashboardSizing.resolve(width: 805, height: 585)

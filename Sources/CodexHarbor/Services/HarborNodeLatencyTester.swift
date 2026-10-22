@@ -47,6 +47,18 @@ final class HarborLatencyCancellation: @unchecked Sendable {
     }
 }
 
+/// Safe summaries of probe failures, not raw Xray stderr or credentials.
+struct HarborNodeDelayReport: Sendable {
+    let milliseconds: Int?
+    let failure: String?
+    static func failed(_ description: String) -> Self {
+        Self(milliseconds: nil, failure: description)
+    }
+    static func succeeded(_ value: Int) -> Self {
+        Self(milliseconds: value, failure: nil)
+    }
+}
+
 /// One v2rayN-style real-delay attempt. The temporary Xray and curl process
 /// are isolated from the active proxy and can both be stopped immediately.
 private final class HarborRealDelayAttempt: @unchecked Sendable {
@@ -66,12 +78,16 @@ private final class HarborRealDelayAttempt: @unchecked Sendable {
     }
 
     func run(node: HarborProxyNode, root: URL, ruleMode: Bool,
-             forcedProxyDomains: [String], cancellation: HarborLatencyCancellation) -> Int? {
-        guard !cancellation.isCancelled,
-              let port = HarborNodeLatencyTester.reservePortPair() else { return nil }
+             forcedProxyDomains: [String], cancellation: HarborLatencyCancellation) -> HarborNodeDelayReport {
+        guard !cancellation.isCancelled else { return .failed("测试已取消") }
+        guard let port = HarborNodeLatencyTester.reservePortPair() else {
+            return .failed("测速端口不可用")
+        }
         defer { HarborNodeLatencyTester.releasePortPair(port) }
 
-        guard let token = cancellation.observe({ [weak self] in self?.cancel() }) else { return nil }
+        guard let token = cancellation.observe({ [weak self] in self?.cancel() }) else {
+            return .failed("测试已取消")
+        }
         defer { cancellation.removeObserver(token) }
 
         let xray = root.appendingPathComponent("xray")
@@ -84,7 +100,9 @@ private final class HarborRealDelayAttempt: @unchecked Sendable {
                 forcedProxyDomains: forcedProxyDomains,
                 routeVerificationViaProxy: true
               ),
-              (try? data.write(to: configPath, options: .atomic)) != nil else { return nil }
+              (try? data.write(to: configPath, options: .atomic)) != nil else {
+            return .failed("节点配置无效或 Xray 不可用")
+        }
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configPath.path)
         defer { try? FileManager.default.removeItem(at: configPath) }
 
@@ -94,10 +112,10 @@ private final class HarborRealDelayAttempt: @unchecked Sendable {
         engine.arguments = ["run", "-config", configPath.path]
         engine.standardOutput = FileHandle.nullDevice
         engine.standardError = FileHandle.nullDevice
-        guard install(engine, asRequest: false) else { return nil }
+        guard install(engine, asRequest: false) else { return .failed("测试已取消") }
         do { try engine.run() } catch {
             clear(engine, asRequest: false)
-            return nil
+            return .failed("Xray 启动失败")
         }
         if isCancelled, engine.isRunning { engine.terminate() }
         defer {
@@ -110,13 +128,15 @@ private final class HarborRealDelayAttempt: @unchecked Sendable {
             port: port,
             process: engine,
             cancellation: cancellation
-        ), !isCancelled else { return nil }
+        ) else { return .failed(isCancelled ? "测试已取消" : "Xray 本地监听启动失败") }
+        guard !isCancelled else { return .failed("测试已取消") }
+        var lastError = "HTTPS 请求失败"
 
         for address in [
             "https://www.gstatic.com/generate_204",
             "https://www.cloudflare.com/cdn-cgi/trace"
         ] {
-            guard !isCancelled else { return nil }
+            guard !isCancelled else { return .failed("测试已取消") }
             let curl = Process()
             let output = Pipe()
             curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
@@ -135,22 +155,34 @@ private final class HarborRealDelayAttempt: @unchecked Sendable {
             curl.environment = environment
             curl.standardOutput = output
             curl.standardError = FileHandle.nullDevice
-            guard install(curl, asRequest: true) else { return nil }
+            guard install(curl, asRequest: true) else { return .failed("测试已取消") }
             do { try curl.run() } catch {
                 clear(curl, asRequest: true)
+                lastError = "HTTPS 测试工具启动失败"
                 continue
             }
             if isCancelled, curl.isRunning { curl.terminate() }
             curl.waitUntilExit()
             clear(curl, asRequest: true)
-            guard !isCancelled else { return nil }
+            guard !isCancelled else { return .failed("测试已取消") }
             let value = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if curl.terminationStatus == 0, let seconds = Double(value), seconds >= 0 {
-                return max(1, Int((seconds * 1_000).rounded()))
+                return .succeeded(max(1, Int((seconds * 1_000).rounded())))
+            }
+            // curl exit codes are intentionally coarse. A timeout alone
+            // cannot tell TLS handshake filtering from a broken proxy path.
+            switch curl.terminationStatus {
+            case 28: lastError = "HTTPS 超时（TLS / WebSocket / 上游网络）"
+            case 35: lastError = "TLS 握手失败"
+            case 52, 56: lastError = "远端断开代理连接"
+            case 5, 6: lastError = "DNS 解析失败"
+            case 7: lastError = "代理连接失败"
+            case 22: lastError = "HTTPS 返回错误状态"
+            default: lastError = "HTTPS 验证未通过（代码 \(curl.terminationStatus)）"
             }
         }
-        return nil
+        return .failed(lastError)
     }
 
     private var isCancelled: Bool {
@@ -216,7 +248,7 @@ enum HarborNodeLatencyTester {
 
     static func measure(node: HarborProxyNode, root: URL, ruleMode: Bool,
                         forcedProxyDomains: [String] = HarborProxyDomainRules.defaults,
-                        cancellation: HarborLatencyCancellation) async -> Int? {
+                        cancellation: HarborLatencyCancellation) async -> HarborNodeDelayReport {
         let attempt = HarborRealDelayAttempt()
         return await withTaskCancellationHandler {
             await Task.detached(priority: .utility) {

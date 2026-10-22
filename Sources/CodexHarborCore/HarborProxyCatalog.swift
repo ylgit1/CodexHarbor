@@ -65,14 +65,17 @@ public struct HarborProxyProbeResult: Sendable, Equatable {
     /// A TCP-only probe must never mark HTTPS as failed (or vice versa).
     public var realTested: Bool
     public var tcpTested: Bool
+    public var realFailureReason: String?
     public var succeeded: Bool { milliseconds != nil }
     public init(milliseconds: Int?, tcpMilliseconds: Int? = nil, checkedAt: Date = .now,
-                realTested: Bool? = nil, tcpTested: Bool? = nil) {
+                realTested: Bool? = nil, tcpTested: Bool? = nil,
+                realFailureReason: String? = nil) {
         self.milliseconds = milliseconds
         self.tcpMilliseconds = tcpMilliseconds
         self.checkedAt = checkedAt
         self.realTested = realTested ?? (milliseconds != nil)
         self.tcpTested = tcpTested ?? (tcpMilliseconds != nil)
+        self.realFailureReason = realFailureReason
     }
 }
 

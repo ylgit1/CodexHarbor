@@ -1,6 +1,25 @@
 import Foundation
 import SQLite3
 
+/// Compares the *loaded Xray outbound*, including transport settings and
+/// credentials, with a subscription profile. The comparison is entirely local:
+/// no node addresses or secrets are written to diagnostics.
+public enum HarborProxyRuntimeIdentity {
+    public static func matches(configuration: Data, node: HarborProxyNode) -> Bool {
+        guard let document = try? JSONSerialization.jsonObject(with: configuration) as? [String: Any],
+              let outbounds = document["outbounds"] as? [[String: Any]],
+              let running = outbounds.first(where: { $0["tag"] as? String == "proxy" }),
+              let expectedData = try? HarborXrayConfig.make(
+                node: node, httpPort: HarborProxyPortPolicy.defaultHTTPPort, ruleMode: false
+              ),
+              let expected = try? JSONSerialization.jsonObject(with: expectedData) as? [String: Any],
+              let expectedOutbound = (expected["outbounds"] as? [[String: Any]])?.first else {
+            return false
+        }
+        return NSDictionary(dictionary: running).isEqual(to: expectedOutbound)
+    }
+}
+
 /// Stable listener ports. Never auto-increment to another pair when occupied.
 public enum HarborProxyPortPolicy {
     public static let defaultHTTPPort = 18080

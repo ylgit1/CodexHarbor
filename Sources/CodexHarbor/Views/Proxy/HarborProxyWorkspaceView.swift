@@ -201,7 +201,7 @@ struct HarborProxyWorkspaceView: View {
             let id = target.id
             if let subscription = proxy.subscriptions.first(where: { $0.id == id }) {
                 let count = proxy.nodes.filter { $0.subscriptionID == id }.count
-                let inUse = proxy.running && proxy.selectedNode?.subscriptionID == id
+                let inUse = proxy.running && proxy.activeNode?.subscriptionID == id
                 HarborDestructiveConfirmDialog(
                     title: "删除订阅「\(subscription.name)」？",
                     message: inUse
@@ -262,7 +262,7 @@ struct HarborProxyWorkspaceView: View {
         if proxy.requiresRecovery { return HarborColors.red }
         if proxy.switchingNodeID != nil { return HarborColors.orange }
         if proxy.running && !proxy.healthy { return HarborColors.orange }
-        if proxy.running && proxy.systemManaged { return HarborColors.green }
+        if proxy.running && proxy.activeNodeID != nil && proxy.systemManaged { return HarborColors.green }
         if proxy.running { return HarborColors.blue }
         if proxy.busy { return HarborColors.orange }
         return .secondary
@@ -273,7 +273,7 @@ struct HarborProxyWorkspaceView: View {
         if proxy.switchingNodeID != nil { return "正在切换节点…" }
         if proxy.running && proxy.checkingConnectivity { return "代理已启动 · 检测网络中" }
         if proxy.running && !proxy.healthy { return "代理连接异常" }
-        if proxy.running && proxy.systemManaged { return "正在使用代理" }
+        if proxy.running && proxy.activeNodeID != nil && proxy.systemManaged { return "正在使用代理" }
         if proxy.running { return "本地代理已连接" }
         if proxy.busy { return "正在处理代理…" }
         return "未使用 Harbor 代理"
@@ -286,14 +286,14 @@ struct HarborProxyWorkspaceView: View {
             return "HTTP/SOCKS5 端口已就绪，正在后台检测节点连通性"
         }
         if proxy.running && !proxy.healthy { return "内核已启动，但连通性检查未通过" }
-        if proxy.running && proxy.systemManaged {
-            return proxy.selectedNode.map { "系统代理已接管 · \($0.displayName)" } ?? "系统代理已接管"
+        if proxy.running && proxy.activeNodeID != nil && proxy.systemManaged {
+            return proxy.activeNode.map { "系统代理已接管 · \($0.displayName)" } ?? "系统代理已接管"
         }
         if proxy.running {
             if proxy.detail.hasPrefix("本地节点已连接，但系统代理未接管") {
                 return proxy.detail
             }
-            return proxy.selectedNode.map { "节点 \($0.displayName) 已连接 · 未接管 macOS 系统代理" }
+            return proxy.activeNode.map { "节点 \($0.displayName) 已连接 · 未接管 macOS 系统代理" }
                 ?? "内核已连接 · 未接管系统代理"
         }
         if proxy.busy { return "操作正在后台执行，页面仍可浏览" }
@@ -318,7 +318,7 @@ struct HarborProxyWorkspaceView: View {
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
-                    if proxy.running, let node = proxy.selectedNode,
+                    if proxy.running, let node = proxy.activeNode,
                        let latency = proxy.probeResults[node.id]?.milliseconds {
                         Text("延迟 " + HarborProxyMeasurementLabel.measured(latency))
                             .font(.system(size: 10, weight: .medium))
@@ -966,7 +966,7 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func row(_ node: HarborProxyNode, compact: Bool) -> some View {
-        let active = proxy.selectedID == node.id && proxy.running
+        let active = proxy.activeNodeID == node.id && proxy.running
         let connected = active && proxy.healthy
         let probe = proxy.probeResults[node.id]
         let delay = probe?.milliseconds
@@ -1073,6 +1073,7 @@ struct HarborProxyWorkspaceView: View {
                                 delay: delay, probe: probe, connected: connected,
                                 connecting: connecting, nodeID: node.id))
                             .lineLimit(1)
+                            .help(probe?.realFailureReason ?? "真实 HTTPS 代理延迟")
                             .frame(width: 96, alignment: .leading)
                     }
                 }
@@ -1155,7 +1156,7 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func gridCard(_ node: HarborProxyNode) -> some View {
-        let active = proxy.selectedID == node.id && proxy.running
+        let active = proxy.activeNodeID == node.id && proxy.running
         let connected = active && proxy.healthy
         let connecting = proxy.switchingNodeID == node.id
         let probe = proxy.probeResults[node.id]
@@ -1216,6 +1217,7 @@ struct HarborProxyWorkspaceView: View {
                                 .font(.system(size: 10.5, weight: delay == nil ? .regular : .semibold))
                                 .monospacedDigit()
                                 .foregroundStyle(delay.map(latencyColor) ?? Color.secondary)
+                                .help(probe?.realFailureReason ?? "真实 HTTPS 代理延迟")
                         }
                     }
                     .font(.system(size: 9.5))

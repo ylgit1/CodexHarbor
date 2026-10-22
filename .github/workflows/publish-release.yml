@@ -1,0 +1,46 @@
+name: Publish Codex Harbor DMG
+
+on:
+  push:
+    branches: [release-assets]
+    paths:
+      - SHA256SUMS
+      - 'v*/SHA256SUMS'
+      - .github/workflows/publish-release.yml
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.repository == 'ylgit1/CodexHarbor'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Verify newest signed DMG against release manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="$(find . -mindepth 1 -maxdepth 1 -type d -name 'v[0-9]*' -printf '%f\n' | sort -V | tail -n 1)"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          NAME="Codex-Harbor-$TAG-arm64.dmg"
+          test -s "$TAG/$NAME"
+          test -s "$TAG/SHA256SUMS"
+          (cd "$TAG" && sha256sum --check SHA256SUMS)
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "DMG=$TAG/$NAME" >> "$GITHUB_ENV"
+      - name: Publish GitHub Release and attach verified DMG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag \
+              --title "Codex Harbor $TAG" \
+              --notes "Apple Silicon DMG. Includes bundled Xray; no Xcode or Homebrew required."
+          fi
+          gh release upload "$TAG" "$DMG" "$TAG/SHA256SUMS" --clobber

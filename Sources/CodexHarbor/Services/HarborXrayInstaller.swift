@@ -52,15 +52,10 @@ struct HarborXrayInstaller {
 
         let stagedXray = staging.appendingPathComponent("xray")
         try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: stagedXray.path)
-        let arches = try command("/usr/bin/lipo", ["-archs", stagedXray.path])
-        #if arch(arm64)
-        let desired = "arm64"
-        #else
-        let desired = "x86_64"
-        #endif
-        guard arches.split(whereSeparator: \.isWhitespace).contains(Substring(desired)) else {
-            throw HarborProxyError.invalid("安装包中的 Xray 架构与当前 Mac 不匹配")
-        }
+        // Running the binary verifies that macOS can execute its architecture.
+        // Do not call /usr/bin/lipo here: on a clean macOS install it is an
+        // Xcode Command Line Tools shim and fails even for a valid arm64 Xray.
+        // The bundle path already selects the architecture at packaging time.
         let versionOutput = try command(stagedXray.path, ["version"])
         guard let versionLine = versionOutput.split(separator: "\n").first else {
             throw HarborProxyError.invalid("安装包中的 Xray 无法运行")
@@ -105,9 +100,14 @@ struct HarborXrayInstaller {
         try process.run()
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        let result = String(decoding: data, as: UTF8.self)
         guard process.terminationStatus == 0 else {
-            throw HarborProxyError.invalid("Xray 内置资源校验失败")
+            let reason = result.trimmingCharacters(in: .whitespacesAndNewlines)
+            let message = reason.isEmpty ? "无详细信息" : String(reason.prefix(200))
+            throw HarborProxyError.invalid(
+                "内置 Xray 无法运行（退出码 \(process.terminationStatus)）：\(message)"
+            )
         }
-        return String(decoding: data, as: UTF8.self)
+        return result
     }
 }

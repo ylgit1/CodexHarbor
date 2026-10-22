@@ -5,6 +5,85 @@ import Testing
 
 @Suite("Independent network proxy")
 struct HarborNetworkProxyTests {
+    @Test("Editing subscription retains ID and validates name and HTTPS URL")
+    func editingSubscription() throws {
+        let original = HarborProxySubscription(
+            id: "stable-subscription-id", name: "原始订阅",
+            url: "https://old.example.com/list?token=old"
+        )
+        let updated = try original.updated(
+            name: "  新订阅名称  ",
+            url: "  https://new.example.com/sub?token=secret  "
+        )
+        #expect(updated.id == original.id)
+        #expect(updated.name == "新订阅名称")
+        #expect(updated.url == "https://new.example.com/sub?token=secret")
+        #expect(original.name == "原始订阅")
+        #expect(throws: HarborProxyError.self) {
+            try original.updated(name: "  ", url: "https://valid.example.com/sub")
+        }
+        #expect(throws: HarborProxyError.self) {
+            try original.updated(name: "有效名称", url: "http://insecure.example.com/sub")
+        }
+        #expect(throws: HarborProxyError.self) {
+            try original.updated(name: "有效名称", url: "https://")
+        }
+    }
+
+    @Test("Subscription update preserves matching IDs, favorites, and aliases")
+    func stableSubscriptionRefresh() {
+        let source = HarborProxyNode(id: "fav-active", name: "old", customName: "我的节点",
+            protocolName: "vless", host: "stable.example.com", port: 443,
+            credential: "credential", security: "tls", subscriptionID: "group")
+        let obsolete = HarborProxyNode(id: "expired", name: "expired",
+            protocolName: "vless", host: "expired.example.com", port: 443,
+            credential: "old", security: "tls", subscriptionID: "group")
+        let unrelated = HarborProxyNode(id: "manual", name: "manual",
+            protocolName: "vless", host: "manual.example.com", port: 443,
+            credential: "manual", subscriptionID: "")
+        let refreshed = HarborProxyNode(id: "generated-id", name: "provider changed name",
+            protocolName: "vless", host: "stable.example.com", port: 443,
+            credential: "credential", security: "tls", subscriptionID: "group")
+        let newNode = HarborProxyNode(id: "new-id", name: "new",
+            protocolName: "vless", host: "new.example.com", port: 443,
+            credential: "new", subscriptionID: "group")
+        let result = HarborProxySubscriptionReconciler.replace(
+            current: [source, obsolete, unrelated], incoming: [refreshed, newNode],
+            subscriptionID: "group", selectedID: "fav-active", keepActiveConnection: true)
+        #expect(result.nodes.count == 3)
+        #expect(result.selectedID == "fav-active")
+        #expect(!result.retainedActiveNode)
+        let stable = result.nodes.first { $0.id == "fav-active" }
+        #expect(stable?.name == "provider changed name")
+        #expect(stable?.customName == "我的节点")
+        #expect(result.nodes.contains { $0.id == "new-id" })
+        #expect(result.nodes.contains { $0.id == "manual" })
+        #expect(!result.nodes.contains { $0.id == "expired" })
+    }
+
+    @Test("Removed active subscription node stays selected until user switches")
+    func retiredActiveSubscriptionNode() {
+        let active = HarborProxyNode(id: "active", name: "old",
+            protocolName: "vless", host: "old.example.com", port: 443,
+            credential: "old", subscriptionID: "group")
+        let current = HarborProxyNode(id: "new", name: "new",
+            protocolName: "vless", host: "new.example.com", port: 443,
+            credential: "new", subscriptionID: "group")
+        let running = HarborProxySubscriptionReconciler.replace(
+            current: [active], incoming: [current],
+            subscriptionID: "group", selectedID: "active", keepActiveConnection: true)
+        #expect(running.retainedActiveNode)
+        #expect(running.selectedID == "active")
+        #expect(running.nodes.first(where: { $0.id == "active" })?.subscriptionID == "")
+        #expect(running.nodes.filter { $0.subscriptionID == "group" }.map(\.id) == ["new"])
+        let stopped = HarborProxySubscriptionReconciler.replace(
+            current: [active], incoming: [current],
+            subscriptionID: "group", selectedID: "active", keepActiveConnection: false)
+        #expect(!stopped.retainedActiveNode)
+        #expect(stopped.selectedID == "new")
+        #expect(stopped.nodes.count == 1)
+    }
+
     @Test("Custom node names are validated and survive subscription replacement")
     func customNodeNames() throws {
         let original = HarborProxyNode(
@@ -101,6 +180,12 @@ struct HarborNetworkProxyTests {
             headerHost: "host.example.com", path: "/proxy")
         let bytes = try HarborXrayConfig.make(node: node, httpPort: 18080, ruleMode: true)
         let object = try #require(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+        let outbounds = try #require(object["outbounds"] as? [[String: Any]])
+        let stream = try #require(outbounds[0]["streamSettings"] as? [String: Any])
+        let ws = try #require(stream["wsSettings"] as? [String: Any])
+        #expect(ws["host"] as? String == "host.example.com")
+        #expect(ws["path"] as? String == "/proxy")
+        #expect(ws["headers"] == nil) // Xray deprecates headers.Host for WebSocket.
         let listeners = try #require(object["inbounds"] as? [[String: Any]])
         #expect(listeners.count == 2)
         #expect(listeners.allSatisfy { ($0["listen"] as? String) == "127.0.0.1" })
@@ -152,14 +237,20 @@ struct HarborNetworkProxyTests {
 
     @Test("Installed Xray accepts generated rule-mode configuration when available")
     func validatesActualXray() throws {
-        let source = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/v2rayN/bin")
-        let binary = source.appendingPathComponent("xray/xray")
-        guard FileManager.default.isExecutableFile(atPath: binary.path),
-              FileManager.default.fileExists(atPath: source.appendingPathComponent("geosite.dat").path),
-              FileManager.default.fileExists(atPath: source.appendingPathComponent("geoip.dat").path) else {
-            return
-        }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let bundled = home.appendingPathComponent("Library/Application Support/CodexHarbor/NetworkProxy")
+        let legacy = home.appendingPathComponent("Library/Application Support/v2rayN/bin")
+        let candidates = [
+            (directory: bundled, binary: bundled.appendingPathComponent("xray")),
+            (directory: legacy, binary: legacy.appendingPathComponent("xray/xray"))
+        ]
+        guard let installed = candidates.first(where: {
+            FileManager.default.isExecutableFile(atPath: $0.binary.path)
+                && FileManager.default.fileExists(atPath: $0.directory.appendingPathComponent("geosite.dat").path)
+                && FileManager.default.fileExists(atPath: $0.directory.appendingPathComponent("geoip.dat").path)
+        }) else { return }
+        let source = installed.directory
+        let binary = installed.binary
         let node = HarborProxyNode(name: "fixture", protocolName: "vless",
             host: "node.example.com", port: 443,
             credential: "00000000-0000-0000-0000-000000000001",

@@ -20,6 +20,9 @@ struct HarborProxyWorkspaceView: View {
     @State private var editor: Editor?
     @State private var subscriptionName = ""
     @State private var subscriptionURL = ""
+    @State private var editingSubscriptionID: String?
+    @State private var subscriptionError: String?
+    @State private var subscriptionSaving = false
     @State private var nodeLinks = ""
     @State private var forcedDomainText = ""
     @State private var forcedDomainError: String?
@@ -38,7 +41,7 @@ struct HarborProxyWorkspaceView: View {
     private struct RenameTarget: Identifiable { let id: String }
 
     private enum Editor: String, Identifiable {
-        case subscription, links, importChoice, routing, ports
+        case subscription, editSubscription, links, importChoice, routing, ports
         var id: String { rawValue }
     }
 
@@ -421,6 +424,19 @@ struct HarborProxyWorkspaceView: View {
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
                 .help("新增订阅或节点")
                 Button {
+                    if let groupID,
+                       let item = proxy.subscriptions.first(where: { $0.id == groupID }) {
+                        beginEditingSubscription(item)
+                    }
+                } label: {
+                    Image(systemName: "pencil")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 20, height: 30)
+                }
+                .disabled(groupID == nil || proxy.busy || proxy.latencyTesting)
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+                .help("编辑选中订阅的名称与链接")
+                Button {
                     if let groupID {
                         Task { await proxy.refreshSubscription(groupID) }
                     }
@@ -634,7 +650,10 @@ struct HarborProxyWorkspaceView: View {
             else if hoveredSubscriptionID == item.id { hoveredSubscriptionID = nil }
         }
         .contextMenu {
+            Button("编辑订阅") { beginEditingSubscription(item) }
+                .disabled(proxy.busy || proxy.latencyTesting)
             Button("更新订阅") { Task { await proxy.refreshSubscription(item.id) } }
+                .disabled(proxy.busy || proxy.latencyTesting)
             Button("删除订阅", role: .destructive) {
                 deletionTargetID = DeletionTarget(id: item.id)
             }
@@ -1151,6 +1170,14 @@ struct HarborProxyWorkspaceView: View {
         .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue))
     }
 
+    private func beginEditingSubscription(_ item: HarborProxySubscription) {
+        editingSubscriptionID = item.id
+        subscriptionName = item.name
+        subscriptionURL = item.url
+        subscriptionError = nil
+        editor = .editSubscription
+    }
+
     private func toggleFavorite(_ id: String) {
         if !favorites.insert(id).inserted { favorites.remove(id) }
         UserDefaults.standard.set(Array(favorites), forKey: favoritesKey)
@@ -1215,8 +1242,9 @@ struct HarborProxyWorkspaceView: View {
             HStack(spacing: 14) {
                 Text(mode == .importChoice ? "新增代理配置"
                      : (mode == .subscription ? "添加订阅"
-                        : (mode == .routing ? "强制代理站点"
-                           : (mode == .ports ? "代理监听端口" : "导入节点链接"))))
+                        : (mode == .editSubscription ? "编辑订阅"
+                           : (mode == .routing ? "强制代理站点"
+                              : (mode == .ports ? "代理监听端口" : "导入节点链接")))))
                     .font(.system(size: 19, weight: .bold, design: .rounded))
                 Spacer(minLength: 0)
                 Button { editor = nil } label: {
@@ -1241,6 +1269,10 @@ struct HarborProxyWorkspaceView: View {
                 VStack(spacing: 12) {
                     importOption("订阅地址", subtitle: "通过 HTTPS 订阅获取并更新节点",
                                  symbol: "link", tint: HarborColors.blue) {
+                        editingSubscriptionID = nil
+                        subscriptionName = ""
+                        subscriptionURL = ""
+                        subscriptionError = nil
                         editor = .subscription
                     }
                     importOption("节点分享链接", subtitle: "粘贴 VLESS、VMess、Trojan 或 SS 链接",
@@ -1248,7 +1280,7 @@ struct HarborProxyWorkspaceView: View {
                         editor = .links
                     }
                 }
-            } else if mode == .subscription {
+            } else if mode == .subscription || mode == .editSubscription {
                 VStack(alignment: .leading, spacing: 7) {
                     Text("订阅名称").font(.callout.weight(.semibold))
                     TextField("例如：我的订阅", text: $subscriptionName)
@@ -1263,7 +1295,7 @@ struct HarborProxyWorkspaceView: View {
                 .padding(.bottom, 17)
                 VStack(alignment: .leading, spacing: 7) {
                     Text("HTTPS 订阅地址").font(.callout.weight(.semibold))
-                    SecureField("粘贴 https:// 开头的订阅链接", text: $subscriptionURL)
+                    TextField("粘贴 https:// 开头的订阅链接", text: $subscriptionURL)
                         .textFieldStyle(.plain)
                         .padding(.horizontal, 12)
                         .frame(height: 44)
@@ -1271,9 +1303,18 @@ struct HarborProxyWorkspaceView: View {
                                     in: RoundedRectangle(cornerRadius: 10))
                         .overlay(RoundedRectangle(cornerRadius: 10)
                             .stroke(Color.primary.opacity(0.12)))
-                    Text("订阅地址保存在系统钥匙串，添加后可手动更新")
+                    Text(mode == .editSubscription
+                         ? "只修改名称立即保存；修改 HTTPS 链接时先下载并校验最新节点，成功后一起保存，失败则保留原链接和节点。当前代理不会自动切换。"
+                         : "订阅链接加密保存在本机，添加后自动加载节点；之后可随时编辑。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let subscriptionError {
+                        Text(subscriptionError)
+                            .font(.system(size: 11))
+                            .foregroundStyle(HarborColors.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             } else if mode == .ports {
                 VStack(alignment: .leading, spacing: 12) {
@@ -1399,30 +1440,55 @@ struct HarborProxyWorkspaceView: View {
                 } else if mode != .importChoice {
                     Button {
                         if mode == .subscription {
-                            proxy.addSubscription(
-                                name: subscriptionName.trimmingCharacters(in: .whitespacesAndNewlines),
-                                url: subscriptionURL.trimmingCharacters(in: .whitespacesAndNewlines))
+                            guard proxy.addSubscription(name: subscriptionName, url: subscriptionURL) else {
+                                subscriptionError = proxy.detail
+                                return
+                            }
                             subscriptionName = ""
                             subscriptionURL = ""
+                            subscriptionError = nil
                             if let newID = proxy.subscriptions.last?.id {
                                 groupID = newID
                                 favoritesOnly = false
                                 resetFilters()
                                 Task { await proxy.refreshSubscription(newID) }
                             }
+                        } else if mode == .editSubscription {
+                            guard let id = editingSubscriptionID else { return }
+                            let name = subscriptionName
+                            let url = subscriptionURL
+                            subscriptionSaving = true
+                            subscriptionError = nil
+                            Task {
+                                let saved = await proxy.updateSubscription(id, name: name, url: url)
+                                subscriptionSaving = false
+                                if saved {
+                                    editingSubscriptionID = nil
+                                    subscriptionName = ""
+                                    subscriptionURL = ""
+                                    editor = nil
+                                } else {
+                                    subscriptionError = proxy.detail
+                                }
+                            }
+                            return
                         } else {
                             proxy.addLinks(nodeLinks)
                             nodeLinks = ""
                         }
                         editor = nil
                     } label: {
-                        Text(mode == .subscription ? "添加订阅" : "导入节点")
+                        Text(mode == .editSubscription
+                             ? (subscriptionSaving ? "正在更新节点…" : "保存订阅")
+                             : (mode == .subscription ? "添加订阅" : "导入节点"))
                     }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(HarborActionButtonStyle(
                         tint: .blue, prominence: .prominent))
-                    .disabled(mode == .subscription
-                              ? subscriptionURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    .disabled((mode == .subscription || mode == .editSubscription)
+                              ? (subscriptionName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                 || subscriptionURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                 || subscriptionSaving || proxy.busy || proxy.latencyTesting)
                               : nodeLinks.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }

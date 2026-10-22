@@ -23,12 +23,13 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 
 ## 下载安装
 
-- [最新 DMG · GitHub 公共镜像（无需登录）](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.8/Codex-Harbor-v0.1.8-arm64.dmg)
-- [最新 DMG · Gitee 文件（访问大文件可能需要登录）](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg)
-- [Gitee v0.1.8 固定版本](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/v0.1.8/Codex-Harbor-v0.1.8-arm64.dmg)
+- [最新 DMG · GitHub 公共下载（无需登录）](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg)
+- [最新 DMG · Gitee 下载（访问大文件可能需要登录）](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg)
+- [v0.1.9 固定版本 · GitHub](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/v0.1.9/Codex-Harbor-v0.1.9-arm64.dmg)
+- [v0.1.9 固定版本 · Gitee](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/v0.1.9/Codex-Harbor-v0.1.9-arm64.dmg)
 
-v0.1.8 DMG 的 SHA-256 校验值见 [GitHub Release 附件](https://github.com/ylgit1/CodexHarbor/releases/tag/v0.1.8) 中的 `SHA256SUMS`。
-Gitee Raw 大文件要求用户登录；不能登录时使用 GitHub 公共下载镜像。
+v0.1.9 DMG 可通过 [SHA-256 校验清单](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/SHA256SUMS) 核验下载完整性。
+Gitee Raw 大文件可能要求登录，无法直接下载时可使用 GitHub 公共文件下载地址。
 要求 macOS 14 或更新版本及 Apple Silicon；Xray、`geoip.dat`、`geosite.dat`
 已内置，首次启动不需要下载代理内核。
 
@@ -374,7 +375,7 @@ Transport Installer 当前同时包含 Apple Silicon（arm64）与 Intel（x86_6
 
 ## 下载与安装
 
-从上方「下载安装」下载 v0.1.8 DMG，双击打开后将 `Codex Harbor.app` 拖入 `Applications`。Gitee Raw 大文件需要登录，未登录用户可使用 GitHub 公共镜像；下载后可核对上方 SHA-256。
+从上方「下载安装」下载 v0.1.9 DMG，双击打开后将 `Codex Harbor.app` 拖入 `Applications`。Gitee Raw 大文件可能要求登录，无法直接下载时使用 GitHub 公共文件下载地址；安装前建议校验 SHA-256。
 
 构建脚本会优先沿用已安装 Agent 的签名证书，并自动识别有效的 **Apple Development / Developer ID Application** 证书或本机固定名称的自签名证书；`HarborChatGPTAgent` 使用 `com.codexharbor.agent` 代码签名标识。
 

@@ -160,6 +160,94 @@ public struct HarborProxySubscription: Codable, Identifiable, Sendable, Hashable
     public init(id: String = UUID().uuidString, name: String, url: String) {
         self.id = id; self.name = name; self.url = url
     }
+
+    /// Editing changes only metadata. The stable subscription ID is used by
+    /// imported nodes, custom names, favorites, and the active connection.
+    public func updated(name rawName: String, url rawURL: String) throws -> Self {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name.count <= 80 else {
+            throw HarborProxyError.invalid("订阅名称不能为空，且不能超过 80 个字符")
+        }
+        let url = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = URLComponents(string: url),
+              components.scheme?.lowercased() == "https",
+              let host = components.host, !host.isEmpty,
+              components.user == nil, components.password == nil,
+              !url.contains(where: \.isWhitespace) else {
+            throw HarborProxyError.invalid("请输入有效的 HTTPS 订阅地址")
+        }
+        var result = self
+        result.name = name
+        result.url = url
+        return result
+    }
+}
+
+/// Replace one subscription's profiles without changing unrelated groups or
+/// breaking identifiers for unchanged endpoints (favorites and aliases).
+/// An in-use endpoint removed by the provider is retained as an ungrouped
+/// selected node until the user explicitly switches away from it.
+public enum HarborProxySubscriptionReconciler {
+    public struct Result: Sendable {
+        public let nodes: [HarborProxyNode]
+        public let selectedID: String?
+        public let retainedActiveNode: Bool
+    }
+
+    private static func endpoint(_ node: HarborProxyNode) -> HarborProxyNode {
+        var value = node
+        value.id = ""
+        value.name = ""
+        value.customName = nil
+        value.subscriptionID = ""
+        return value
+    }
+
+    public static func replace(
+        current: [HarborProxyNode],
+        incoming: [HarborProxyNode],
+        subscriptionID: String,
+        selectedID: String?,
+        keepActiveConnection: Bool
+    ) -> Result {
+        let previous = current.filter { $0.subscriptionID == subscriptionID }
+        var previousByEndpoint: [HarborProxyNode: [HarborProxyNode]] = [:]
+        for node in previous {
+            previousByEndpoint[endpoint(node), default: []].append(node)
+        }
+
+        var refreshed: [HarborProxyNode] = []
+        for supplied in incoming {
+            var node = supplied
+            node.subscriptionID = subscriptionID
+            let key = endpoint(node)
+            if var matches = previousByEndpoint[key], !matches.isEmpty {
+                let previous = matches.removeFirst()
+                previousByEndpoint[key] = matches
+                node.id = previous.id
+                node.customName = previous.customName
+            }
+            refreshed.append(node)
+        }
+
+        var other = current.filter { $0.subscriptionID != subscriptionID }
+        var chosen = selectedID
+        var retainedActive = false
+        if let selectedID,
+           let obsolete = previous.first(where: { $0.id == selectedID }),
+           !refreshed.contains(where: { $0.id == selectedID }) {
+            if keepActiveConnection {
+                var active = obsolete
+                active.subscriptionID = ""
+                other.append(active)
+                retainedActive = true
+            } else {
+                chosen = refreshed.first?.id ?? other.first?.id
+            }
+        }
+        return Result(nodes: other + refreshed, selectedID: chosen,
+                      retainedActiveNode: retainedActive)
+    }
 }
 
 public struct HarborV2rayNImport: Sendable {
@@ -362,8 +450,9 @@ public enum HarborXrayConfig {
         switch node.network {
         case "tcp", "": stream["network"] = "tcp"
         case "ws":
-            let headers: [String: String] = node.headerHost.isEmpty ? [:] : ["Host": node.headerHost]
-            stream["wsSettings"] = ["path": node.path.isEmpty ? "/" : node.path, "headers": headers]
+            var settings: [String: Any] = ["path": node.path.isEmpty ? "/" : node.path]
+            if !node.headerHost.isEmpty { settings["host"] = node.headerHost }
+            stream["wsSettings"] = settings
         case "grpc": stream["grpcSettings"] = ["serviceName": node.path]
         default: throw HarborProxyError.invalid("暂不支持 \(node.network) 传输")
         }

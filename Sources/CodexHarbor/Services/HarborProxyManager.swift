@@ -632,12 +632,67 @@ final class HarborProxyManager: ObservableObject {
         persist(); detail = "已导入 \(items.count) 个节点"
     }
 
-    func addSubscription(name: String, url: String) {
-        guard let u = URL(string: url), u.scheme == "https" else {
-            detail = "订阅必须使用 HTTPS"; return
+    @discardableResult
+    func addSubscription(name: String, url: String) -> Bool {
+        do {
+            let subscription = try HarborProxySubscription(name: name, url: url)
+                .updated(name: name, url: url)
+            subscriptions.append(subscription)
+            persist()
+            detail = "已添加订阅「\(subscription.name)」"
+            return true
+        } catch {
+            detail = error.localizedDescription
+            return false
         }
-        subscriptions.append(HarborProxySubscription(name: name, url: url))
-        persist()
+    }
+
+    /// Rename-only saves immediately. A changed HTTPS address is fetched and
+    /// validated before committing either the URL or its new node collection.
+    /// On failure the previous subscription, nodes and active Xray stay intact.
+    @discardableResult
+    func updateSubscription(_ id: String, name: String, url: String) async -> Bool {
+        guard !busy, !latencyTesting else {
+            detail = "请等待当前代理操作结束后编辑订阅"
+            return false
+        }
+        guard let index = subscriptions.firstIndex(where: { $0.id == id }) else {
+            detail = "订阅已不存在"
+            return false
+        }
+        do {
+            let updated = try subscriptions[index].updated(name: name, url: url)
+            guard updated.url != subscriptions[index].url else {
+                subscriptions[index] = updated
+                persist()
+                detail = "订阅「\(updated.name)」名称已保存，节点无需更新"
+                return true
+            }
+            guard let sourceURL = URL(string: updated.url) else {
+                throw HarborProxyError.invalid("订阅地址无效")
+            }
+            busy = true
+            detail = "正在获取新订阅并校验节点…"
+            defer { busy = false }
+            do {
+                let incoming = try await downloadSubscriptionNodes(from: sourceURL, id: id)
+                let update = applySubscriptionNodes(incoming, id: id)
+                // Both values are committed only after a successful download.
+                subscriptions[index] = updated
+                persist()
+                detail = "订阅「\(updated.name)」已保存并更新 \(update.count) 个节点" +
+                    (update.retainedActive
+                        ? "；原连接保持运行，请手动选择新节点"
+                        : "；不会自动切换当前连接")
+                return true
+            } catch {
+                detail = "新链接更新失败，原链接和节点均已保留：" + error.localizedDescription
+                return false
+            }
+        } catch {
+            detail = error.localizedDescription
+            return false
+        }
     }
 
     @discardableResult
@@ -697,39 +752,62 @@ final class HarborProxyManager: ObservableObject {
         busy = true
         defer { busy = false }
         do {
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 15
-            let config = URLSessionConfiguration.ephemeral
-            if running, healthy, let localPort {
-                config.connectionProxyDictionary = [
-                    "HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": localPort,
-                    "HTTPSEnable": 1, "HTTPSProxy": "127.0.0.1", "HTTPSPort": localPort
-                ]
-            }
-            let session = URLSession(configuration: config)
-            defer { session.invalidateAndCancel() }
-            let (data, response) = try await session.data(for: request)
-            guard (response as? HTTPURLResponse)?.statusCode == 200, data.count <= 2_000_000,
-                  let text = String(data: data, encoding: .utf8) else {
-                throw HarborProxyError.invalid("订阅响应无效")
-            }
-            let incoming = HarborProxyLinks.parse(text).map { original -> HarborProxyNode in
-                var node = original
-                node.subscriptionID = id
-                return node
-            }
-            guard !incoming.isEmpty else { throw HarborProxyError.invalid("订阅无支持的节点格式") }
-            let old = nodes.filter { $0.subscriptionID == id }
-            let replacement = HarborProxyNodeNaming.preservingCustomNames(from: old, in: incoming)
-            nodes.removeAll { $0.subscriptionID == id }
-            nodes += replacement
-            if let chosen = selectedID, old.contains(where: { $0.id == chosen }) {
-                selectedID = replacement.first?.id
-            }
+            let incoming = try await downloadSubscriptionNodes(from: url, id: id)
+            let update = applySubscriptionNodes(incoming, id: id)
             persist()
-            subscriptionUpdatedAt[id] = .now
-            detail = "订阅更新完成：\(replacement.count) 个节点"
-        } catch { detail = "更新失败：" + error.localizedDescription }
+            detail = "订阅更新完成：\(update.count) 个节点" +
+                (update.retainedActive
+                    ? "；原连接仍在运行，请手动选择最新节点"
+                    : "")
+        } catch { detail = "更新失败，已保留原节点：" + error.localizedDescription }
+    }
+
+    /// Both refresh and changed-URL edits use the same validation and parsing.
+    private func downloadSubscriptionNodes(from url: URL, id: String) async throws -> [HarborProxyNode] {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        let config = URLSessionConfiguration.ephemeral
+        if running, healthy, let localPort {
+            config.connectionProxyDictionary = [
+                "HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": localPort,
+                "HTTPSEnable": 1, "HTTPSProxy": "127.0.0.1", "HTTPSPort": localPort
+            ]
+        }
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+        let (data, response) = try await session.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200,
+              data.count <= 2_000_000,
+              let text = String(data: data, encoding: .utf8) else {
+            throw HarborProxyError.invalid("订阅响应不是有效的 HTTP 200 文本（最大 2 MB）")
+        }
+        let incoming = HarborProxyLinks.parse(text).map { original -> HarborProxyNode in
+            var node = original
+            node.subscriptionID = id
+            return node
+        }
+        guard !incoming.isEmpty else {
+            throw HarborProxyError.invalid("订阅没有可识别的节点，已拒绝清空旧列表")
+        }
+        return incoming
+    }
+
+    /// No Xray restart is performed. Preserve matching profile IDs, aliases
+    /// and favorites; retain an active endpoint removed by the provider until
+    /// the user explicitly connects to a new profile.
+    @discardableResult
+    private func applySubscriptionNodes(_ incoming: [HarborProxyNode], id: String)
+        -> (count: Int, retainedActive: Bool) {
+        let merged = HarborProxySubscriptionReconciler.replace(
+            current: nodes, incoming: incoming, subscriptionID: id,
+            selectedID: selectedID, keepActiveConnection: running
+        )
+        let validIDs = Set(merged.nodes.map(\.id))
+        nodes = merged.nodes
+        selectedID = merged.selectedID
+        probeResults = probeResults.filter { validIDs.contains($0.key) }
+        subscriptionUpdatedAt[id] = .now
+        return (incoming.count, merged.retainedActiveNode)
     }
 
     /// Explicit refresh of the selected node (also used when routing changes).

@@ -387,10 +387,27 @@ struct HarborLocalAccessView: View {
 
                 Divider().opacity(0.32)
 
-                if nodes.isEmpty {
+                if !serviceRunning {
                     HStack(spacing: 9) {
-                        ProgressView().controlSize(.small)
-                        Text(serviceRunning ? "正在读取链路诊断…" : "启动服务后显示真实链路诊断")
+                        Image(systemName: "pause.circle")
+                            .font(.system(size: 15))
+                            .foregroundStyle(.secondary)
+                        Text("服务已关闭，启动后显示真实链路诊断")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 88)
+                } else if nodes.isEmpty {
+                    let reading = bridge.isDiagnosing || bridge.runtime.agent == .starting
+                    HStack(spacing: 9) {
+                        if reading {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "info.circle")
+                                .font(.system(size: 15))
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(reading ? "正在读取链路诊断…" : "尚未获得链路诊断，请点击上方「检测」重试")
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.secondary)
                     }

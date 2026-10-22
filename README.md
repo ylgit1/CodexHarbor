@@ -1,6 +1,7 @@
 # Codex Harbor
 
 <p align="center">
+  <img src="Resources/AppIcon-1024.png" width="96" height="96" alt="Codex Harbor 白底蓝青渐变应用图标"><br>
   <strong>原生 macOS AI 开发控制中心</strong><br>
   管理 Codex 连接，让 ChatGPT 安全接入本地项目，并把修改、测试、构建与打包串成可验证的 Coding Task。
 </p>
@@ -19,6 +20,18 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 它不是简单编辑 `~/.codex/config.toml` 的配置工具：Codex Harbor 会读取真实运行状态，以事务方式切换连接，对敏感配置和历史任务做保护，并通过独立的 `HarborChatGPTAgent` 将经过授权的本地开发能力暴露给 ChatGPT。
 
 > Codex Harbor 是独立开源项目，不是 OpenAI 或 Cloudflare 的官方产品。
+
+## 下载安装
+
+- [最新 DMG · GitHub 公共下载（无需登录）](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg)
+- [最新 DMG · Gitee 下载（访问大文件可能需要登录）](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg)
+- [v0.1.9 固定版本 · GitHub](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/v0.1.9/Codex-Harbor-v0.1.9-arm64.dmg)
+- [v0.1.9 固定版本 · Gitee](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/v0.1.9/Codex-Harbor-v0.1.9-arm64.dmg)
+
+v0.1.9 DMG 可通过 [SHA-256 校验清单](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/SHA256SUMS) 核验下载完整性。
+Gitee Raw 大文件可能要求登录，无法直接下载时可使用 GitHub 公共文件下载地址。
+要求 macOS 14 或更新版本及 Apple Silicon；Xray、`geoip.dat`、`geosite.dat`
+已内置，首次启动不需要下载代理内核。
 
 ## 核心能力
 
@@ -91,6 +104,33 @@ flowchart LR
 并在明确确认后**设置或清除当前 macOS 网络的 HTTP/HTTPS/SOCKS 系统代理**。代理只监听
 127.0.0.1 的 HTTP/SOCKS5 端口，不启用 TUN，不直接修改 Codex 连接设置或 ChatGPT
 本地管道/公网 HTTPS 的业务配置。菜单栏提供启动和停止代理的快捷操作。
+
+**监听端口保持稳定**：默认 HTTP/HTTPS 为 `127.0.0.1:18080`，SOCKS5 为
+`127.0.0.1:18081`，被占用时直接报出端口冲突，不再静默递增到 `18082`。
+「网络代理」当前节点卡片显示实时监听端口，并可一键复制 HTTP/SOCKS5 地址；
+点齿轮可手动设置端口。已接管系统代理时更改端口会先恢复旧设置、
+重连新端口并同步接管 macOS；失败会尝试回滚旧配置。VPN 的 IP 路由监控与 HTTP/SOCKS 端口无关。
+
+**节点切换/重启恢复**：列表与卡片中的任意节点在未连接、连接中和已连接时
+均可点击；快速连续点击会执行最后一次选择。切换节点只更新独立 Xray 内核，
+保持 HTTP/SOCKS 固定端口与当前系统代理配置，不再为每次切换重复申请 macOS
+管理员权限。应用启动时会恢复最后节点与之前的系统代理意图，自动接管采用非交互方式；
+macOS 未授予网络设置权限时只保持本地 Xray 运行并显示具体原因，
+**不尝试绕过系统授权机制**。退出时同样不主动弹出系统权限窗口，
+如果无权安全恢复网络设置则保留代理内核以免断网，下一次启动重新接管。
+应用内实际地址均按原始端口字符串显示（无千分位符）。
+
+**快速启动**：Xray 监听本地 HTTP/SOCKS5 端口成功后立即显示「代理已启动 · 检测网络中」，
+Apple / Google / Cloudflare HTTPS 连通性探测在后台运行，不再阻塞节点选择、
+快速切换与界面反馈；后台探测只更新对应版本的当前连接，旧节点结果不会覆盖新状态。
+首次开启系统代理仍需等待网络检测成功，避免将 macOS 流量接管到不可用节点。
+手动修改监听端口继续采用完整联网验证和失败回滚。
+
+「网络代理 → 代理路由」右侧的站点规则按钮可编辑**强制代理域名**，一行一个域名，
+默认包含 `gitee.com` 和 `gitee.io`（同时覆盖子域名）。强制代理规则排在
+`geosite:cn` / `geoip:cn` 直连规则之前，且在规则/全局模式均生效；
+修改后已连接节点会重新连接以应用规则。规则随订阅配置保存在钥匙串，兼容旧版设置。
+这些规则只适用于真正进入 Harbor Xray 的流量，不会强制接管忽略系统代理的应用程序。
 
 **不需要预先安装 v2rayN，也不需要首次启动下载内核**：发行包已内置当前 Mac 架构的
 XTLS Xray-core、`geoip.dat` 和 `geosite.dat`。首次启动会把它们复制到 Harbor 独立目录，
@@ -335,7 +375,7 @@ Transport Installer 当前同时包含 Apple Silicon（arm64）与 Intel（x86_6
 
 ## 下载与安装
 
-从 [Releases](../../releases) 下载最新的 macOS 压缩包，解压后将 `Codex Harbor.app` 放入“应用程序”。
+从上方「下载安装」下载 v0.1.9 DMG，双击打开后将 `Codex Harbor.app` 拖入 `Applications`。Gitee Raw 大文件可能要求登录，无法直接下载时使用 GitHub 公共文件下载地址；安装前建议校验 SHA-256。
 
 构建脚本会优先沿用已安装 Agent 的签名证书，并自动识别有效的 **Apple Development / Developer ID Application** 证书或本机固定名称的自签名证书；`HarborChatGPTAgent` 使用 `com.codexharbor.agent` 代码签名标识。
 

@@ -78,12 +78,36 @@ public final class HarborUICaptureService {
                 "ScreenCaptureKit 无法列出窗口：\(diagnostic)"
             )
         }
-        let candidates = available.windows.filter {
+        // AX and ScreenCaptureKit enumerate windows independently. Right
+        // after a Space change or activation, AX may see a window before SCK
+        // has published its on-screen frame. Retry missing matches briefly,
+        // but never weaken the exactly-one-window privacy requirement.
+        var matches = available.windows.filter {
             $0.owningApplication?.bundleIdentifier == bundleID &&
             $0.title == windowTitle && $0.isOnScreen
         }
-        guard candidates.count == 1, let window = candidates.first else {
-            throw BridgeError.permissionDenied("无法唯一识别目标窗口，已拒绝截图以防捕获其他窗口")
+        if matches.isEmpty {
+            for _ in 0..<2 {
+                try await Task.sleep(for: .milliseconds(180))
+                let refreshed = try await SCShareableContent.excludingDesktopWindows(
+                    false, onScreenWindowsOnly: true
+                )
+                matches = refreshed.windows.filter {
+                    $0.owningApplication?.bundleIdentifier == bundleID &&
+                    $0.title == windowTitle && $0.isOnScreen
+                }
+                if !matches.isEmpty { break }
+            }
+        }
+        guard matches.count == 1, let window = matches.first else {
+            if matches.isEmpty {
+                throw BridgeError.permissionDenied(
+                    "已授权截图，但目标窗口不在当前桌面画面中。请恢复最小化窗口、切回对应桌面后重试"
+                )
+            }
+            throw BridgeError.permissionDenied(
+                "找到多个同名的目标窗口（\(matches.count) 个），为避免截错窗口已拒绝截图。请关闭重复窗口后重试"
+            )
         }
 
         let config = SCStreamConfiguration()

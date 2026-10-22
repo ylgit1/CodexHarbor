@@ -61,6 +61,59 @@ public enum ConnectionHealth: Equatable, Sendable {
     case unavailable(String? = nil)
 }
 
+/// A selected profile is not "healthy" merely because it exists or because
+/// credentials were valid at some indefinite point in the past.
+/// Layout budget for the minimum supported Mac window. Keep the three
+/// summary cards visible without squeezing their controls below tap targets.
+public struct HarborDashboardSizing: Sendable {
+    public let compact: Bool
+    public let flowHeight: Double
+    public let cardHeight: Double
+    public let gap: Double
+    public let topInset: Double
+    public let bottomInset: Double
+
+    public static func resolve(width: Double, height: Double) -> Self {
+        let compact = height < 700
+        return Self(
+            compact: compact,
+            flowHeight: compact
+                ? max(208, min(246, height * 0.38))
+                : max(306, min(430, height * 0.45)),
+            cardHeight: compact ? 228 : 270,
+            gap: compact ? 10 : max(12, min(24, width * 0.013)),
+            topInset: compact ? 12 : max(15, min(30, height * 0.024)),
+            bottomInset: compact ? 14 : 22
+        )
+    }
+
+    public var requiredHeight: Double {
+        50 + flowHeight + cardHeight + 2 * gap + topInset + bottomInset
+    }
+}
+
+/// Avoid unreadable, ellipsized node names in the proxy table when
+/// the sidebar leaves too little space for all fixed-width columns.
+public enum HarborProxyTableSizing {
+    public static func usesCompactRows(workspaceWidth: Double) -> Bool {
+        workspaceWidth < 950
+    }
+}
+
+public enum HarborConnectionReadiness {
+    public static func recentlyVerified(
+        health: ConnectionHealth?,
+        checkedAt: Date?,
+        now: Date = Date(),
+        maxAge: TimeInterval = 15 * 60
+    ) -> Bool {
+        guard case .available = health,
+              let checkedAt else { return false }
+        let age = now.timeIntervalSince(checkedAt)
+        return age >= 0 && age <= maxAge
+    }
+}
+
 public enum HarborProfileKind: String, Codable, Sendable {
     case harbor
     case customResponses

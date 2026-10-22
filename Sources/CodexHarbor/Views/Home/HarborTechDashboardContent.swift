@@ -9,6 +9,7 @@ struct HarborTechDashboardContent: View {
     @ObservedObject var model: AppModel
     @ObservedObject var bridge: ChatGPTBridgeViewModel
     @ObservedObject var proxy: HarborProxyManager
+    @Environment(\.colorScheme) private var colorScheme
 
     let effectiveConnectionKind: CodexConnectionKind?
     let activeDisplayName: String
@@ -40,8 +41,19 @@ struct HarborTechDashboardContent: View {
     private let teal = Color(red: 0.03, green: 0.72, blue: 0.57)
     private let electric = Color(red: 0.16, green: 0.51, blue: 0.98)
     private let violet = Color(red: 0.58, green: 0.34, blue: 0.96)
-    private let techInk = Color(red: 0.08, green: 0.19, blue: 0.36)
-    private let techMutedInk = Color(red: 0.23, green: 0.34, blue: 0.49)
+    private var isDark: Bool { colorScheme == .dark }
+    private var techInk: Color {
+        isDark ? Color(red: 0.89, green: 0.95, blue: 1) :
+                 Color(red: 0.08, green: 0.19, blue: 0.36)
+    }
+    private var techCircleFill: Color {
+        isDark ? Color(red: 0.13, green: 0.23, blue: 0.36).opacity(0.94)
+               : Color.white.opacity(0.78)
+    }
+    private var techMutedInk: Color {
+        isDark ? Color(red: 0.70, green: 0.82, blue: 0.94) :
+                 Color(red: 0.23, green: 0.34, blue: 0.49)
+    }
 
     private var systemProxyAvailable: Bool { proxy.running && proxy.healthy && proxy.systemManaged }
     private var codexModel: String {
@@ -71,9 +83,44 @@ struct HarborTechDashboardContent: View {
         }
         return systemProxyAvailable ? teal : (proxy.running ? electric : .secondary)
     }
+    private var activeCodexHealth: (health: ConnectionHealth?, checkedAt: Date?) {
+        switch effectiveConnectionKind {
+        case .account:
+            guard let id = model.selectedAccountProfileID else { return (nil, nil) }
+            return (model.accountProfileHealth[id], model.accountProfileDiagnostics[id]?.checkedAt)
+        case .harborKey, .apiKey:
+            guard let id = model.activeProfileID else { return (nil, nil) }
+            return (model.apiProfileHealth[id], model.apiProfileDiagnostics[id]?.checkedAt)
+        case nil:
+            return (nil, nil)
+        }
+    }
+
+    private var activeCodexVerified: Bool {
+        connected && HarborConnectionReadiness.recentlyVerified(
+            health: activeCodexHealth.health,
+            checkedAt: activeCodexHealth.checkedAt
+        )
+    }
+
+    private var codexVerificationState: String {
+        guard connected else { return "未配置" }
+        if model.isCheckingConnectionHealth { return "检测中" }
+        if activeCodexVerified {
+            return effectiveConnectionKind == .account ? "凭据已验证" : "服务已验证"
+        }
+        switch activeCodexHealth.health {
+        case .expired: return "已过期"
+        case .unavailable: return "不可用"
+        case .checking: return "检测中"
+        default: return "待复检"
+        }
+    }
+
     private var allEnabledServicesHealthy: Bool {
-        connected
+        activeCodexVerified
             && (!proxy.running || proxy.healthy)
+            && !proxy.requiresRecovery
             && (!bridge.configuration.enabled || bridgeConnected)
     }
     private var latestActivityText: String {
@@ -84,32 +131,33 @@ struct HarborTechDashboardContent: View {
     var body: some View {
         GeometryReader { geometry in
             let space = geometry.size
-            let flowHeight = max(306, space.height * 0.465)
-            let cardsHeight = max(274, space.height * 0.40)
-            let gap = max(12, min(24, space.width * 0.013))
+            let sizing = HarborDashboardSizing.resolve(
+                width: Double(space.width), height: Double(space.height)
+            )
+            let gap = CGFloat(sizing.gap)
             ScrollView {
                 VStack(alignment: .leading, spacing: gap) {
-                    pageHeader
-                    pathPanel
-                        .frame(height: flowHeight)
+                    pageHeader(compact: sizing.compact)
+                    pathPanel(compact: sizing.compact)
+                        .frame(height: CGFloat(sizing.flowHeight))
                     ViewThatFits(in: .horizontal) {
                         HStack(alignment: .top, spacing: gap) {
-                            codexCard.frame(maxWidth: .infinity)
-                            proxyCard.frame(maxWidth: .infinity)
-                            chatGPTCard.frame(maxWidth: .infinity)
+                            codexCard(compact: sizing.compact).frame(maxWidth: .infinity)
+                            proxyCard(compact: sizing.compact).frame(maxWidth: .infinity)
+                            chatGPTCard(compact: sizing.compact).frame(maxWidth: .infinity)
                         }
                         VStack(spacing: gap) {
-                            codexCard
-                            proxyCard
-                            chatGPTCard
+                            codexCard(compact: sizing.compact)
+                            proxyCard(compact: sizing.compact)
+                            chatGPTCard(compact: sizing.compact)
                         }
                     }
-                    .frame(minHeight: cardsHeight, alignment: .top)
+                    .frame(minHeight: CGFloat(sizing.cardHeight), alignment: .top)
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
                 .padding(.horizontal, max(20, min(48, space.width * 0.025)))
-                .padding(.top, max(15, min(30, space.height * 0.024)))
-                .padding(.bottom, 22)
+                .padding(.top, CGFloat(sizing.topInset))
+                .padding(.bottom, CGFloat(sizing.bottomInset))
             }
             .scrollIndicators(.automatic)
             .overlay(alignment: .topTrailing) {
@@ -187,7 +235,7 @@ struct HarborTechDashboardContent: View {
         }
     }
 
-    private var pageHeader: some View {
+    private func pageHeader(compact: Bool) -> some View {
         HStack(alignment: .center, spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
                 Text("工作台")
@@ -198,14 +246,16 @@ struct HarborTechDashboardContent: View {
             }
             Spacer(minLength: 12)
             HarborStatusBadge(
-                title: allEnabledServicesHealthy ? "当前服务状态就绪" : "部分服务需要关注",
+                title: allEnabledServicesHealthy ? "当前配置检查通过" : "有连接需要复检或修复",
                 color: allEnabledServicesHealthy ? teal : HarborColors.orange,
                 pulses: false
             )
-            Text("最近事件  \(latestActivityText)")
-                .font(.system(size: 9.5, weight: .medium))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+            if !compact {
+                Text("最近事件  \(latestActivityText)")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             Button(action: refreshAll) {
                 HStack(spacing: 6) {
                     if isRefreshing {
@@ -221,7 +271,9 @@ struct HarborTechDashboardContent: View {
             .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
             .disabled(isRefreshing || isCheckingMCP || bridge.isWorking ||
                       bridge.isDiagnosing || model.isCheckingConnectionHealth)
-            .help("检查 Codex 凭据、ChatGPT MCP 状态；完成后显示结果")
+            .help(isRefreshing || isCheckingMCP || bridge.isWorking ||
+                  bridge.isDiagnosing || model.isCheckingConnectionHealth
+                  ? "当前检测尚未完成" : "检查 Codex 凭据、ChatGPT MCP 状态；完成后显示结果")
             Button {
                 let dark = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
                 NSApp.appearance = NSAppearance(named: dark ? .aqua : .darkAqua)
@@ -231,6 +283,7 @@ struct HarborTechDashboardContent: View {
             }
             .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
             .help("切换浅色/深色外观")
+            .accessibilityLabel("切换浅色与深色外观")
         }
         .frame(minHeight: 50)
     }
@@ -238,27 +291,42 @@ struct HarborTechDashboardContent: View {
     // Diagram instead of three more cards: the AI services are independent
     // endpoints; the central network layer is optional and never asserts
     // that a specific client request actually traversed the proxy.
-    private var pathPanel: some View {
+    private func pathPanel(compact: Bool) -> some View {
         GeometryReader { area in
             let w = area.size.width
             let h = area.size.height
-            let scale = min(1.42, max(0.88, w / 1000))
+            let scale = min(1.42, max(0.68, min(w / 1000, h / 305)))
             ZStack {
                 RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .fill(Color(red: 0.90, green: 0.95, blue: 1.0))
+                    .fill(isDark
+                          ? Color(red: 0.035, green: 0.085, blue: 0.15)
+                          : Color(red: 0.90, green: 0.95, blue: 1.0))
                 if let backdrop = Self.networkBackdrop {
                     Image(nsImage: backdrop)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
                         .frame(width: w, height: h)
                         .clipped()
-                        .saturation(0.92)
-                        .brightness(0.035)
+                        .saturation(isDark ? 0.65 : 0.92)
+                        .brightness(isDark ? -0.14 : 0.035)
+                        // A transparent navy scrim preserves the original
+                        // planetary texture without leaving a bright image
+                        // slab against the dark sidebar and cards.
+                        .overlay {
+                            if isDark {
+                                Color(red: 0.025, green: 0.072, blue: 0.14)
+                                    .opacity(0.79)
+                            }
+                        }
                         .allowsHitTesting(false)
                         .accessibilityHidden(true)
                 } else {
                     LinearGradient(
-                        colors: [
+                        colors: isDark ? [
+                            Color(red: 0.05, green: 0.12, blue: 0.21),
+                            Color(red: 0.08, green: 0.16, blue: 0.29),
+                            Color(red: 0.04, green: 0.10, blue: 0.20)
+                        ] : [
                             Color(red: 0.87, green: 0.93, blue: 1.0),
                             Color(red: 0.78, green: 0.88, blue: 1.0),
                             Color(red: 0.93, green: 0.96, blue: 1.0)
@@ -271,9 +339,9 @@ struct HarborTechDashboardContent: View {
                 // readable while retaining the much lighter background art.
                 LinearGradient(
                     colors: [
-                        Color(red: 0.02, green: 0.10, blue: 0.24).opacity(0.08),
-                        Color(red: 0.02, green: 0.12, blue: 0.30).opacity(0.17),
-                        Color.white.opacity(0.05)
+                        Color(red: 0.02, green: 0.10, blue: 0.24).opacity(isDark ? 0.18 : 0.08),
+                        Color(red: 0.02, green: 0.12, blue: 0.30).opacity(isDark ? 0.20 : 0.17),
+                        Color.white.opacity(isDark ? 0.03 : 0.05)
                     ],
                     startPoint: .top,
                     endPoint: .bottom
@@ -297,12 +365,12 @@ struct HarborTechDashboardContent: View {
                     Text(systemProxyAvailable ? "代理已接管" : "系统网络")
                         .foregroundStyle(techInk.opacity(0.82))
                 }
-                .font(.system(size: 10 * scale, weight: .semibold, design: .monospaced))
+                .font(.system(size: max(10, 10 * scale), weight: .semibold, design: .monospaced))
                 .padding(.horizontal, max(22, w * 0.032))
                 .position(x: w / 2, y: max(26, h * 0.10))
 
                 hologramEndpoint(
-                    title: "CODEX", status: connected ? "已配置" : "未连接",
+                    title: "CODEX", status: codexVerificationState,
                     detail: activeDisplayName, subtitle: codexModel,
                     icon: "terminal.fill",
                     tint: teal, scale: scale
@@ -326,7 +394,7 @@ struct HarborTechDashboardContent: View {
                 VStack(spacing: max(4, h * 0.015)) {
                         ZStack {
                             Circle()
-                                .fill(Color.white.opacity(0.76))
+                                .fill(isDark ? techCircleFill : Color.white.opacity(0.76))
                                 .frame(width: 128 * scale, height: 128 * scale)
                                 .shadow(color: techInk.opacity(0.12), radius: 18, y: 8)
                             Circle()
@@ -353,26 +421,29 @@ struct HarborTechDashboardContent: View {
                                 .shadow(color: violet.opacity(0.25), radius: 8, y: 3)
                         }
                         Text("NETWORK CORE")
-                            .font(.system(size: 11 * scale, weight: .bold, design: .monospaced))
+                            .font(.system(size: max(10, 11 * scale), weight: .bold, design: .monospaced))
                             .tracking(1.4)
                             .foregroundStyle(techInk)
                         Text(proxyState)
-                            .font(.system(size: 10 * scale, weight: .semibold))
-                            .foregroundStyle(systemProxyAvailable ? teal : Color.white.opacity(0.7))
+                            .font(.system(size: max(10, 10 * scale), weight: .semibold))
+                            .foregroundStyle(systemProxyAvailable ? teal : techMutedInk)
                             .lineLimit(1)
-                        Text(proxy.running
-                             ? (proxy.selectedNode?.displayName ?? "本地代理")
-                             : "直连可用 · 代理非必需")
-                            .font(.system(size: 9 * scale))
-                            .foregroundStyle(techMutedInk.opacity(0.82))
-                            .lineLimit(1)
+                        if !compact {
+                            Text(proxy.running
+                                 ? (proxy.selectedNode?.displayName ?? "本地代理")
+                                 : "直连可用 · 代理非必需")
+                                .font(.system(size: max(10, 10 * scale)))
+                                .foregroundStyle(techMutedInk.opacity(0.82))
+                                .lineLimit(1)
+                        }
                     }
                     .frame(width: max(160, w * 0.22))
                     .contentShape(Rectangle())
                 .position(x: w * 0.50, y: h * 0.66)
                 .help("网络路径示意，代理管理请使用下方功能卡片")
 
-                HStack(spacing: 10) {
+                if !compact {
+                    HStack(spacing: 10) {
                     Image(systemName: "arrow.triangle.branch")
                         .foregroundStyle(teal)
                     Text("实线 · 可选代理")
@@ -383,10 +454,11 @@ struct HarborTechDashboardContent: View {
                     Text("网络路径示意 ≠ 实际流量归属")
                         .foregroundStyle(techMutedInk.opacity(0.72))
                 }
-                .font(.system(size: 9 * scale, weight: .medium))
+                .font(.system(size: max(10, 9 * scale), weight: .medium))
                 .foregroundStyle(techInk.opacity(0.78))
                 .padding(.horizontal, max(22, w * 0.032))
                 .position(x: w / 2, y: h * 0.925)
+                }
             }
             .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 24).stroke(electric.opacity(0.27)))
@@ -400,7 +472,7 @@ struct HarborTechDashboardContent: View {
         VStack(spacing: 6 * scale) {
                 ZStack {
                     Circle()
-                        .fill(Color.white.opacity(0.78))
+                        .fill(techCircleFill)
                         .frame(width: 108 * scale, height: 108 * scale)
                         .shadow(color: techInk.opacity(0.10), radius: 17 * scale, y: 7 * scale)
                     Circle()
@@ -418,22 +490,22 @@ struct HarborTechDashboardContent: View {
                         .shadow(color: tint.opacity(0.22), radius: 7, y: 2)
                 }
                 Text(title)
-                    .font(.system(size: 11 * scale, weight: .bold, design: .monospaced))
+                    .font(.system(size: max(10, 11 * scale), weight: .bold, design: .monospaced))
                     .tracking(1)
                     .foregroundStyle(techInk)
                 HStack(spacing: 5) {
                     Circle().fill(tint).frame(width: 5 * scale, height: 5 * scale)
                     Text(status)
                 }
-                .font(.system(size: 10 * scale, weight: .medium))
+                .font(.system(size: max(10, 10 * scale), weight: .medium))
                 .foregroundStyle(tint)
                 Text(detail)
-                    .font(.system(size: 11 * scale, weight: .semibold))
+                    .font(.system(size: max(10, 11 * scale), weight: .semibold))
                     .foregroundStyle(techInk.opacity(0.88))
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Text(subtitle)
-                    .font(.system(size: 9 * scale))
+                    .font(.system(size: max(10, 9 * scale)))
                     .foregroundStyle(techMutedInk.opacity(0.76))
                     .lineLimit(1)
             }
@@ -444,11 +516,11 @@ struct HarborTechDashboardContent: View {
     }
 
     private func glassCard<Content: View>(
-        tint: Color, @ViewBuilder content: () -> Content
+        tint: Color, compact: Bool, @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 12, content: content)
-            .padding(14)
-            .frame(maxWidth: .infinity, minHeight: 270, alignment: .topLeading)
+        VStack(alignment: .leading, spacing: compact ? 8 : 12, content: content)
+            .padding(compact ? 12 : 14)
+            .frame(maxWidth: .infinity, minHeight: compact ? 228 : 270, alignment: .topLeading)
             .background {
                 RoundedRectangle(cornerRadius: 16)
                     .fill(HarborColors.cardBackground)
@@ -483,6 +555,7 @@ struct HarborTechDashboardContent: View {
             }
             .buttonStyle(HarborInteractivePlainButtonStyle(tint: tint, cornerRadius: 7))
             .help("进入" + title)
+            .accessibilityLabel("打开" + title + "页面")
         }
     }
 
@@ -498,21 +571,21 @@ struct HarborTechDashboardContent: View {
         .frame(height: 19)
     }
 
-    private var codexCard: some View {
+    private func codexCard(compact: Bool) -> some View {
         let since = Calendar.current.startOfDay(for: .now)
         let kinds: [CodexConnectionKind] = [.account, .harborKey, .apiKey]
         let stats = kinds.map { model.codexRequestMetrics(for: $0, profileID: nil, since: since) }
         let count = stats.reduce(0) { $0 + $1.count }
         let successes = stats.reduce(0) { $0 + $1.successfulCount }
         let tokens = kinds.reduce(0) { $0 + model.codexTokenSummary(for: $1, profileID: nil, since: since).totalTokens }
-        return glassCard(tint: teal) {
+        return glassCard(tint: teal, compact: compact) {
             cardHeader("Codex 连接", icon: "point.3.connected.trianglepath.dotted", tint: teal,
-                       status: connected ? "已配置" : "未连接", action: onManageCodex)
+                       status: codexVerificationState, action: onManageCodex)
             HStack(spacing: 11) {
                 Image(systemName: "chevron.left.forwardslash.chevron.right")
-                    .font(.system(size: 22, weight: .semibold))
+                    .font(.system(size: compact ? 19 : 22, weight: .semibold))
                     .foregroundStyle(teal)
-                    .frame(width: 49, height: 49)
+                    .frame(width: compact ? 40 : 49, height: compact ? 40 : 49)
                     .background(teal.opacity(0.11), in: RoundedRectangle(cornerRadius: 14))
                 VStack(alignment: .leading, spacing: 4) {
                     Text(activeDisplayName)
@@ -530,7 +603,7 @@ struct HarborTechDashboardContent: View {
             detailRow("Token", tokens.formatted())
             detailRow("成功率", count > 0 ?
                       (Double(successes) / Double(count)).formatted(.percent.precision(.fractionLength(1))) : "—")
-            if let accountExpiryText, effectiveConnectionKind == .account {
+            if !compact, let accountExpiryText, effectiveConnectionKind == .account {
                 Text(accountExpiryText)
                     .font(.system(size: 9.5))
                     .foregroundStyle(.secondary)
@@ -544,15 +617,15 @@ struct HarborTechDashboardContent: View {
         }
     }
 
-    private var proxyCard: some View {
-        glassCard(tint: violet) {
+    private func proxyCard(compact: Bool) -> some View {
+        glassCard(tint: violet, compact: compact) {
             cardHeader("网络代理", icon: "network", tint: violet,
                        status: proxyState, action: onOpenNetworkProxy)
             HStack(spacing: 9) {
                 Image(systemName: proxy.running ? "globe.asia.australia.fill" : "network.slash")
-                    .font(.system(size: 23))
+                    .font(.system(size: compact ? 19 : 23))
                     .foregroundStyle(violet)
-                    .frame(width: 44, height: 44)
+                    .frame(width: compact ? 40 : 44, height: compact ? 40 : 44)
                     .background(violet.opacity(0.09), in: RoundedRectangle(cornerRadius: 13))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(proxy.running ? (proxy.selectedNode?.displayName ?? "当前节点") : "使用系统网络")
@@ -576,6 +649,10 @@ struct HarborTechDashboardContent: View {
                 }
                 .buttonStyle(HarborActionButtonStyle(tint: violet, prominence: .secondary))
                 .popover(isPresented: $nodePickerOpen, arrowEdge: .bottom) { proxySwitcher }
+                .disabled(proxy.busy || proxy.latencyTesting || proxy.nodes.isEmpty)
+                .help(proxy.nodes.isEmpty ? "请先在网络代理页添加订阅或节点"
+                      : (proxy.busy || proxy.latencyTesting
+                         ? "请在当前代理操作完成后切换节点" : "选择其他代理节点"))
                 actionPill("代理管理", icon: "arrow.up.right", tint: violet, action: onOpenNetworkProxy)
             }
         }
@@ -601,6 +678,7 @@ struct HarborTechDashboardContent: View {
                 }
                 .buttonStyle(HarborInteractivePlainButtonStyle(tint: violet, cornerRadius: 5))
                 .help("复制" + title + "代理地址")
+                .accessibilityLabel("复制" + title + "代理地址")
             } else {
                 Text("—").foregroundStyle(.secondary)
             }
@@ -637,6 +715,8 @@ struct HarborTechDashboardContent: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(HarborInteractivePlainButtonStyle(tint: violet, cornerRadius: 7))
+                        .disabled(proxy.busy || proxy.latencyTesting)
+                        .accessibilityLabel("连接节点：" + node.displayName)
                     }
                 }
             }
@@ -648,15 +728,15 @@ struct HarborTechDashboardContent: View {
         .frame(width: 330)
     }
 
-    private var chatGPTCard: some View {
-        glassCard(tint: electric) {
+    private func chatGPTCard(compact: Bool) -> some View {
+        glassCard(tint: electric, compact: compact) {
             cardHeader("ChatGPT 接入", icon: "desktopcomputer", tint: electric,
                        status: bridgeState, action: onOpenLocalAccess)
             HStack(spacing: 11) {
                 Image(systemName: "point.3.connected.trianglepath.dotted")
-                    .font(.system(size: 22))
+                    .font(.system(size: compact ? 19 : 22))
                     .foregroundStyle(electric)
-                    .frame(width: 49, height: 49)
+                    .frame(width: compact ? 40 : 49, height: compact ? 40 : 49)
                     .background(electric.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(bridge.configuration.enabled ? bridge.configuration.transportMode.displayName : "本地 MCP 服务")

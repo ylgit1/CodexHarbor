@@ -20,7 +20,15 @@ enum HarborRadius {
 }
 
 enum HarborColors {
-    static let blue = Color(red: 0.105, green: 0.405, blue: 0.94)
+    // macOS resolves a dynamic NSColor when the app's appearance changes.
+    // Keep the restrained light-mode blue, but brighten the foreground tint
+    // on charcoal backgrounds so outline buttons remain easy to identify.
+    static let blue = Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
+        if appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
+            return NSColor(srgbRed: 0.43, green: 0.70, blue: 1.0, alpha: 1)
+        }
+        return NSColor(srgbRed: 0.105, green: 0.405, blue: 0.94, alpha: 1)
+    }))
     static let green = Color(red: 0.095, green: 0.69, blue: 0.36)
     static let purple = Color(red: 0.49, green: 0.29, blue: 0.90)
     static let orange = Color(red: 0.98, green: 0.49, blue: 0.16)

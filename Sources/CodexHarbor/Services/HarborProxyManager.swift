@@ -16,6 +16,8 @@ private struct HarborProxyState: Codable, Equatable, Sendable {
     // Optional to preserve existing Keychain configurations on upgrade.
     var httpListenPort: Int?
     var autoManageSystemProxy: Bool?
+    // Optional for backwards-compatible decoding of encrypted existing state.
+    var nodeServerLocations: [String: HarborProxyIPLocation]?
 }
 @MainActor
 private struct HarborProxyProcessRecord: Codable {
@@ -180,6 +182,11 @@ private final class HarborSystemProxyChangeMonitor: @unchecked Sendable {
     }
 }
 
+enum HarborProxyLatencyTestKind: Sendable {
+    case tcp
+    case real
+}
+
 @MainActor
 final class HarborProxyManager: ObservableObject {
     static let shared = HarborProxyManager()
@@ -200,12 +207,18 @@ final class HarborProxyManager: ObservableObject {
     private var activationInProgress = false
     private var autoManageSystemProxy = true
     @Published private(set) var probeResults: [String: HarborProxyProbeResult] = [:]
+    @Published private(set) var nodeServerLocations: [String: HarborProxyIPLocation] = [:]
+    @Published private(set) var lastCompletedLatencyTestKind: HarborProxyLatencyTestKind?
+    @Published private(set) var latencyCompletionSerial = 0
     @Published private(set) var latencyTesting = false
     @Published private(set) var installingCore = false
     @Published private(set) var latencyCurrentID: String?
+    @Published private(set) var latencyTestingIDs: Set<String> = []
+    @Published private(set) var latencyTestKind: HarborProxyLatencyTestKind?
     @Published private(set) var latencyCompleted = 0
     @Published private(set) var latencyTotal = 0
     private var latencyCancellationRequested = false
+    private var latencyCancellation: HarborLatencyCancellation?
     @Published private(set) var subscriptionUpdatedAt: [String: Date] = [:]
     @Published var routingRules = true {
         didSet {
@@ -221,6 +234,7 @@ final class HarborProxyManager: ObservableObject {
     private let persistence: HarborProxyPersistence
     private var persistenceGeneration = 0
     private var persistenceTask: Task<Void, Never>?
+    private var geoRefreshTask: Task<Void, Never>?
     private var configurationLoaded = false
     private var child: Process?
     private var adoptedPID: Int32?
@@ -248,7 +262,16 @@ final class HarborProxyManager: ObservableObject {
     /// Used to prevent a delayed health probe from updating a newer node.
     private var connectionGeneration: UInt64 = 0
     private var healthTask: Task<Void, Never>?
+    /// Cheap process-only check, started only while Xray runs. Handles adoption
+    /// of a previous process, where Process.terminationHandler is unavailable.
+    private var livenessTask: Task<Void, Never>?
+    private var intentionallyStoppingCore = false
     private var runtimeRecordURL: URL { root.appendingPathComponent("active-process.json") }
+    /// Private, local-only Xray warnings. Refreshed for each new Xray process;
+    /// never included in the public app logs or remote MCP payloads.
+    private var runtimeErrorLogURL: URL { root.appendingPathComponent("xray-runtime-warnings.log") }
+    private let maxRuntimeErrorLogBytes: UInt64 = 512 * 1024
+    private let retainedRuntimeErrorTailBytes: UInt64 = 64 * 1024
     private let root: URL
     private var appActivationObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
@@ -346,7 +369,11 @@ final class HarborProxyManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.refreshSystemProxyState(synchronizeOwnership: true) }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.refreshSystemProxyState(synchronizeOwnership: true)
+                await self.reconcileXrayLiveness()
+            }
         }
     }
 
@@ -387,6 +414,7 @@ final class HarborProxyManager: ObservableObject {
                 let state = try await persistence.load()
                 store = state
                 nodes = state.nodes
+                nodeServerLocations = state.nodeServerLocations ?? [:]
                 subscriptions = state.subscriptions
                 selectedID = state.selectedID
                 routingRules = state.routingRules
@@ -457,6 +485,7 @@ final class HarborProxyManager: ObservableObject {
             refreshSystemProxyState()
             startupTrace("adopted-existing-xray")
             bootstrapped = true
+            scheduleGeoIPRefresh()
             return
         }
         await cleanupOrphan()
@@ -476,11 +505,67 @@ final class HarborProxyManager: ObservableObject {
         if let lastID = selectedNode?.id, coreInstalled {
             await queueActivation(lastID, restart: false, userInitiated: false)
         }
+        scheduleGeoIPRefresh()
+    }
+
+    func serverLocation(for node: HarborProxyNode) -> HarborProxyIPLocation? {
+        nodeServerLocations[node.host.lowercased()]
+    }
+
+    /// Resolve DNS once at startup and whenever subscription contents change.
+    /// Only a new resolved IP triggers an HTTPS GeoIP lookup. Results are
+    /// stored with the already-encrypted proxy state, and there is no timer.
+    private func scheduleGeoIPRefresh() {
+        geoRefreshTask?.cancel()
+        guard configurationLoaded else { return }
+        let hosts = Array(Set(nodes.map { $0.host.lowercased() }.filter { !$0.isEmpty })).sorted()
+        geoRefreshTask = Task(priority: .utility) { [weak self] in
+            var consecutiveFailures = 0
+            for host in hosts {
+                guard !Task.isCancelled, let self else { return }
+                guard let resolvedIP = await HarborNodeGeoIPResolver.resolvedIP(for: host),
+                      !Task.isCancelled else { continue }
+                if let existing = self.nodeServerLocations[host],
+                   existing.matches(resolvedIP) { continue }
+                // A changed IP makes the old country invalid even if the
+                // geolocation service is temporarily unreachable.
+                if self.nodeServerLocations[host] != nil {
+                    self.nodeServerLocations.removeValue(forKey: host)
+                    self.persist()
+                }
+                let reused = self.nodeServerLocations.values.first {
+                    $0.matches(resolvedIP)
+                }?.countryCode
+                let countryCode: String?
+                if let reused {
+                    countryCode = reused
+                } else {
+                    countryCode = await HarborNodeGeoIPResolver.countryCode(
+                        for: resolvedIP,
+                        proxyPort: self.running && self.healthy ? self.localPort : nil
+                    )
+                    // A provider outage should not trigger hundreds of timeouts.
+                    if countryCode == nil { consecutiveFailures += 1 }
+                    else { consecutiveFailures = 0 }
+                    if consecutiveFailures >= 2 { return }
+                    // Respect free provider limits; never fan out requests.
+                    try? await Task.sleep(for: .milliseconds(1100))
+                }
+                guard !Task.isCancelled,
+                      self.nodes.contains(where: { $0.host.lowercased() == host }),
+                      let countryCode else { continue }
+                self.nodeServerLocations[host] = HarborProxyIPLocation(
+                    ip: resolvedIP, countryCode: countryCode
+                )
+                self.persist()
+            }
+        }
     }
 
     private func persist() {
         guard configurationLoaded else { return }
         store.nodes = nodes
+        store.nodeServerLocations = nodeServerLocations
         store.subscriptions = subscriptions
         store.selectedID = selectedID
         store.routingRules = routingRules
@@ -584,6 +669,7 @@ final class HarborProxyManager: ObservableObject {
             )
             nodes = merged.nodes
             subscriptions = merged.subscriptions
+            scheduleGeoIPRefresh()
             selectedID = merged.selectedID
             persist()
             detail = "迁移成功：\(imported.nodes.count) 个节点、\(imported.subscriptions.count) 条订阅；\(imported.unsupportedCount) 条非支持类型未导入。原 v2rayN 配置未修改。"
@@ -628,6 +714,7 @@ final class HarborProxyManager: ObservableObject {
         let items = HarborProxyLinks.parse(value)
         guard !items.isEmpty else { detail = "未找到有效节点链接"; return }
         nodes += items
+        scheduleGeoIPRefresh()
         if selectedID == nil { selectedID = items[0].id }
         persist(); detail = "已导入 \(items.count) 个节点"
     }
@@ -736,6 +823,7 @@ final class HarborProxyManager: ObservableObject {
         subscriptions.removeAll { $0.id == id }
         let removedIDs = Set(matching.map(\.id))
         nodes.removeAll { removedIDs.contains($0.id) }
+        scheduleGeoIPRefresh()
         for nodeID in removedIDs { probeResults.removeValue(forKey: nodeID) }
         subscriptionUpdatedAt.removeValue(forKey: id)
         if let selectedID, removedIDs.contains(selectedID) {
@@ -805,6 +893,7 @@ final class HarborProxyManager: ObservableObject {
         let validIDs = Set(merged.nodes.map(\.id))
         nodes = merged.nodes
         selectedID = merged.selectedID
+        scheduleGeoIPRefresh()
         probeResults = probeResults.filter { validIDs.contains($0.key) }
         subscriptionUpdatedAt[id] = .now
         return (incoming.count, merged.retainedActiveNode)
@@ -985,7 +1074,8 @@ final class HarborProxyManager: ObservableObject {
         do {
             let port = try choosePort()
             let config = try HarborXrayConfig.make(node: node, httpPort: port, ruleMode: routingRules,
-                                                  forcedProxyDomains: forcedProxyDomains)
+                                                  forcedProxyDomains: forcedProxyDomains,
+                                                  routeVerificationViaProxy: true)
             let file = root.appendingPathComponent("runtime-\(UUID().uuidString).json")
             try config.write(to: file, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
@@ -995,7 +1085,23 @@ final class HarborProxyManager: ObservableObject {
             process.currentDirectoryURL = root
             process.arguments = ["run", "-config", file.path]
             process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
+            // A private O_APPEND file survives host-app restarts without a pipe
+            // SIGPIPE. The low-frequency liveness monitor bounds its size.
+            let errorFD = runtimeErrorLogURL.path.withCString {
+                Darwin.open($0, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, mode_t(0o600))
+            }
+            if errorFD >= 0 {
+                _ = Darwin.fchmod(errorFD, mode_t(0o600))
+                process.standardError = FileHandle(fileDescriptor: errorFD, closeOnDealloc: true)
+            } else {
+                process.standardError = FileHandle.nullDevice
+            }
+            process.terminationHandler = { [weak self] finished in
+                let pid = finished.processIdentifier
+                Task { @MainActor [weak self] in
+                    await self?.handleUnexpectedXrayExit(pid: pid)
+                }
+            }
             try process.run()
             child = process; localPort = port
             let record = HarborProxyProcessRecord(
@@ -1020,6 +1126,7 @@ final class HarborProxyManager: ObservableObject {
                 throw HarborProxyError.invalid("Xray 未能监听本地 HTTP/SOCKS5 端口，请检查端口或节点配置")
             }
             running = true
+            startLivenessMonitoring()
             healthy = false
             checkingConnectivity = true
             status = "已启动 · 正在检测网络"
@@ -1091,26 +1198,16 @@ final class HarborProxyManager: ObservableObject {
     }
 
     private func probe(port: Int) async -> Bool {
-        let nodeID = selectedID
-        if let milliseconds = await probeAddress(
-            "https://www.apple.com/library/test/success.html",
-            port: port
-        ) {
-            if let nodeID { probeResults[nodeID] = HarborProxyProbeResult(milliseconds: milliseconds) }
-            return true
-        }
-
-        // Independent fallbacks run together. A blocked target therefore adds
-        // one timeout window instead of two serial timeout windows.
+        // Both hosts are explicitly routed to the remote proxy outbound in
+        // HarborXrayConfig, even when the user has enabled regional direct rules.
+        // A successful direct request must never make a broken proxy look healthy.
         async let gstatic = probeAddress("https://www.gstatic.com/generate_204", port: port)
         async let cloudflare = probeAddress("https://www.cloudflare.com/cdn-cgi/trace", port: port)
         let fallbackResults = await [gstatic, cloudflare]
-        if let milliseconds = fallbackResults.compactMap({ $0 }).min() {
-            if let nodeID { probeResults[nodeID] = HarborProxyProbeResult(milliseconds: milliseconds) }
-            return true
-        }
-        if let nodeID { probeResults[nodeID] = HarborProxyProbeResult(milliseconds: nil) }
-        return false
+        // The proxy-health HTTPS result is intentionally separate from the
+        // Active-connection health stays separate from user-triggered real
+        // delay results so a background check never changes the list value.
+        return fallbackResults.contains { $0 != nil }
     }
 
     private func probeAddress(_ address: String, port: Int) async -> Int? {
@@ -1133,11 +1230,25 @@ final class HarborProxyManager: ObservableObject {
             + duration.attoseconds / 1_000_000_000_000_000))
     }
 
-    /// User-triggered latency checks. Each node uses a short-lived independent
-    /// Xray process and HTTPS request; never switch the active system proxy.
+    func testTCPLatency(_ ids: [String]) async {
+        await testLatency(ids, kind: .tcp)
+    }
+
+    func testRealLatency(_ ids: [String]) async {
+        await testLatency(ids, kind: .real)
+    }
+
+    /// Retained for existing callers: latency without an explicit kind means
+    /// the stronger end-to-end HTTPS measurement.
     func testLatency(_ ids: [String]) async {
-        guard !latencyTesting, !busy, coreInstalled else {
-            if !coreInstalled { detail = "请先恢复内置 Xray，才能测试节点延迟" }
+        await testRealLatency(ids)
+    }
+
+    private func testLatency(_ ids: [String], kind: HarborProxyLatencyTestKind) async {
+        guard !latencyTesting, !busy, kind == .tcp || coreInstalled else {
+            if kind == .real && !coreInstalled {
+                detail = "内置 Xray 不完整，暂时无法进行真实测速"
+            }
             return
         }
         let uniqueIDs = Array(NSOrderedSet(array: ids)) as? [String] ?? ids
@@ -1145,27 +1256,80 @@ final class HarborProxyManager: ObservableObject {
         guard !targets.isEmpty else { return }
 
         latencyTesting = true
+        latencyTestKind = kind
         latencyCancellationRequested = false
+        let cancellation = HarborLatencyCancellation()
+        latencyCancellation = cancellation
         latencyCompleted = 0
         latencyTotal = targets.count
+        var succeeded = 0
         defer {
             latencyTesting = false
             latencyCurrentID = nil
+            latencyTestingIDs = []
+            latencyTestKind = nil
             latencyCancellationRequested = false
+            latencyCancellation = nil
         }
-        for node in targets {
+        let batchSize = HarborProxyLatencyPolicy.parallelCount
+        let latencyRoot = root
+        let latencyRuleMode = routingRules
+        let latencyForcedDomains = forcedProxyDomains
+        for offset in stride(from: 0, to: targets.count, by: batchSize) {
             if latencyCancellationRequested || Task.isCancelled { break }
-            latencyCurrentID = node.id
-            let result = await HarborNodeLatencyTester.measure(node: node, root: root, ruleMode: routingRules,
-                                                                 forcedProxyDomains: forcedProxyDomains)
-            probeResults[node.id] = HarborProxyProbeResult(milliseconds: result)
-            latencyCompleted += 1
+            let batch = Array(targets[offset..<min(offset + batchSize, targets.count)])
+            latencyTestingIDs = Set(batch.map(\.id))
+            latencyCurrentID = batch.first?.id
+            await withTaskGroup(of: (String, Int?).self) { group in
+                for node in batch {
+                    group.addTask {
+                        let milliseconds: Int?
+                        if kind == .tcp {
+                            milliseconds = await HarborNodeLatencyTester.measureTCP(
+                                node: node,
+                                cancellation: cancellation
+                            )
+                        } else {
+                            milliseconds = await HarborNodeLatencyTester.measure(
+                                node: node,
+                                root: latencyRoot,
+                                ruleMode: latencyRuleMode,
+                                forcedProxyDomains: latencyForcedDomains,
+                                cancellation: cancellation
+                            )
+                        }
+                        return (node.id, milliseconds)
+                    }
+                }
+                for await (id, result) in group {
+                    guard !latencyCancellationRequested, !Task.isCancelled else { continue }
+                    let previous = probeResults[id]
+                    probeResults[id] = HarborProxyProbeResult(
+                        milliseconds: kind == .real ? result : previous?.milliseconds,
+                        tcpMilliseconds: kind == .tcp ? result : previous?.tcpMilliseconds,
+                        realTested: kind == .real || previous?.realTested == true,
+                        tcpTested: kind == .tcp || previous?.tcpTested == true
+                    )
+                    if result != nil { succeeded += 1 }
+                    latencyTestingIDs.remove(id)
+                    latencyCompleted += 1
+                }
+            }
         }
-        detail = "本次测试完成 \(latencyCompleted)/\(latencyTotal) 个节点；测试为经过 Xray 的 HTTPS 请求耗时"
+        let label = kind == .tcp ? "TCP 测速" : "真实测速"
+        if !latencyCancellationRequested && !Task.isCancelled {
+            lastCompletedLatencyTestKind = kind
+            latencyCompletionSerial += 1
+        }
+        detail = latencyCancellationRequested || Task.isCancelled
+            ? "已停止测速，完成 \(latencyCompleted)/\(latencyTotal) 个节点"
+            : "\(label)完成：可用 \(succeeded)，不可用 \(latencyCompleted - succeeded)"
     }
 
     func cancelLatencyTests() {
         latencyCancellationRequested = true
+        latencyCancellation?.cancel()
+        latencyTestingIDs = []
     }
 
     func enableSystemProxy(interactive: Bool = false) {
@@ -1224,8 +1388,88 @@ final class HarborProxyManager: ObservableObject {
         return false
     }
 
+    private func startLivenessMonitoring() {
+        guard livenessTask == nil else { return }
+        livenessTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(30)) }
+                catch { return }
+                guard let self, !Task.isCancelled else { return }
+                await self.reconcileXrayLiveness()
+                self.trimRuntimeErrorLogIfNeeded()
+            }
+        }
+    }
+
+    /// At most 512 KiB between low-rate checks, then retain the newest 64 KiB.
+    /// O_APPEND on the child's stderr descriptor ensures it keeps writing at
+    /// EOF even after this same-inode truncation, without restarting Xray.
+    private func trimRuntimeErrorLogIfNeeded() {
+        let url = runtimeErrorLogURL
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? NSNumber,
+              size.uint64Value > maxRuntimeErrorLogBytes,
+              let reader = try? FileHandle(forReadingFrom: url) else { return }
+        defer { try? reader.close() }
+        let end = (try? reader.seekToEnd()) ?? size.uint64Value
+        let start = end > retainedRuntimeErrorTailBytes ? end - retainedRuntimeErrorTailBytes : 0
+        guard (try? reader.seek(toOffset: start)) != nil,
+              let recent = try? reader.read(upToCount: Int(end - start)) else { return }
+        let fd = url.path.withCString { Darwin.open($0, O_WRONLY | O_TRUNC | O_APPEND) }
+        guard fd >= 0 else { return }
+        defer { _ = Darwin.close(fd) }
+        recent.withUnsafeBytes { data in
+            guard let base = data.baseAddress else { return }
+            var written = 0
+            while written < data.count {
+                let n = Darwin.write(fd, base.advanced(by: written), data.count - written)
+                guard n > 0 else { break }
+                written += n
+            }
+        }
+    }
+
+    private func reconcileXrayLiveness() async {
+        guard running, !coreProcessAlive else { return }
+        await handleUnexpectedXrayExit(pid: child?.processIdentifier ?? adoptedPID)
+    }
+
+    private func handleUnexpectedXrayExit(pid: Int32?) async {
+        guard let pid,
+              HarborProxyLivenessPolicy.shouldHandleUnexpectedExit(
+                  running: running,
+                  intentionallyStopping: intentionallyStoppingCore,
+                  processMatches: pid == child?.processIdentifier || pid == adoptedPID,
+                  coreAlive: coreProcessAlive
+              ) else { return }
+        // If an Xray crash leaves macOS pointing to dead listeners, restore
+        // the previous network configuration without prompting for privileges.
+        var restorationFailure: String?
+        if HarborSystemProxy.hasBackup {
+            do { try HarborSystemProxy.restore(interactive: false) }
+            catch { restorationFailure = error.localizedDescription }
+        }
+        _ = await stopCore()
+        systemManaged = false
+        healthy = false
+        status = "代理内核异常退出"
+        detail = restorationFailure.map {
+            "Xray 意外退出，系统代理未能自动恢复：\($0)。请使用代理页面的恢复操作"
+        } ?? "Xray 意外退出，已尝试恢复原系统代理。诊断记录：xray-runtime-warnings.log"
+        refreshSystemProxyState(synchronizeOwnership: true)
+    }
+
     private func stopCore() async -> Bool {
+        intentionallyStoppingCore = true
+        defer {
+            intentionallyStoppingCore = false
+            // A failed cleanup must not silently disable failure detection for
+            // a child that is still running.
+            if running && livenessTask == nil { startLivenessMonitoring() }
+        }
         connectionGeneration &+= 1
+        livenessTask?.cancel()
+        livenessTask = nil
         healthTask?.cancel()
         healthTask = nil
         if adoptedPID != nil {
@@ -1283,6 +1527,7 @@ final class HarborProxyManager: ObservableObject {
         configPath = URL(fileURLWithPath: record.configPath)
         localPort = configuredHTTPPort
         running = true
+        startLivenessMonitoring()
         systemManaged = true
         healthy = false
         checkingConnectivity = true

@@ -18,6 +18,55 @@ struct CodexConfigurationManagerTests {
         #expect(usage.expiresAt == "2026-09-01T09:03:45")
     }
 
+    @Test("Telemetry batch preserves all events without rewriting for each item")
+    func activityJournalBatch() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let store = ConnectionActivityStore(paths: fixture.paths)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let first = ConnectionActivityEvent(
+            timestamp: now.addingTimeInterval(-60), connectionKind: .account,
+            profileID: nil, kind: .codexRequest, succeeded: true,
+            durationMilliseconds: 100
+        )
+        let second = ConnectionActivityEvent(
+            timestamp: now, connectionKind: .account,
+            profileID: nil, kind: .codexRequest, succeeded: false,
+            durationMilliseconds: 200
+        )
+        let events = try store.append(contentsOf: [first, second], to: [], now: now)
+        #expect(events.count == 2)
+        #expect(try store.load().count == 2)
+        let same = try store.append(contentsOf: [], to: events, now: now)
+        #expect(same == events)
+    }
+
+    @Test("Rolling activity journal retains a bounded month without verbose JSON")
+    func activityJournalCapacity() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let store = ConnectionActivityStore(paths: fixture.paths)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let events = (0...ConnectionActivityStore.maximumRetainedEvents).map { index in
+            ConnectionActivityEvent(
+                timestamp: now.addingTimeInterval(-TimeInterval(index)),
+                connectionKind: .account,
+                profileID: nil,
+                kind: .codexRequest,
+                succeeded: true,
+                durationMilliseconds: 100
+            )
+        }
+        let retained = try store.append(
+            ConnectionActivityEvent(timestamp: now, connectionKind: .account,
+                profileID: nil, kind: .codexRequest, succeeded: true,
+                durationMilliseconds: 90),
+            to: events, now: now
+        )
+        #expect(retained.count == ConnectionActivityStore.maximumRetainedEvents)
+        #expect(try store.load().count == ConnectionActivityStore.maximumRetainedEvents)
+    }
+
     @Test("Connection activity summaries stay scoped to profile and week")
     func summarizesConnectionActivity() throws {
         let fixture = try Fixture()

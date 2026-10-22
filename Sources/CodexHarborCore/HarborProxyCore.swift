@@ -429,9 +429,25 @@ public enum HarborProxyDomainRules {
     }
 }
 
+/// Keep an intentional stop/switch distinct from an unexpected Xray exit.
+public enum HarborProxyLivenessPolicy {
+    public static func shouldHandleUnexpectedExit(
+        running: Bool, intentionallyStopping: Bool,
+        processMatches: Bool, coreAlive: Bool
+    ) -> Bool {
+        running && !intentionallyStopping && processMatches && !coreAlive
+    }
+}
+
 public enum HarborXrayConfig {
+    /// Endpoints used solely to verify the actual remote proxy route.
+    /// Keep them ahead of regional direct rules; otherwise a 200 response can
+    /// be mistaken for proof that the remote Xray outbound works.
+    public static let verificationHosts = ["full:www.gstatic.com", "full:www.cloudflare.com"]
+
     public static func make(node: HarborProxyNode, httpPort: Int, ruleMode: Bool,
-                            forcedProxyDomains: [String] = HarborProxyDomainRules.defaults) throws -> Data {
+                            forcedProxyDomains: [String] = HarborProxyDomainRules.defaults,
+                            routeVerificationViaProxy: Bool = false) throws -> Data {
         guard (1024...65534).contains(httpPort), (1...65535).contains(node.port),
               !node.host.isEmpty, !node.credential.isEmpty else {
             throw HarborProxyError.invalid("代理节点无效")
@@ -478,6 +494,10 @@ public enum HarborXrayConfig {
         }
         let forced = try HarborProxyDomainRules.normalized(forcedProxyDomains)
         var rules: [[String: Any]] = []
+        if routeVerificationViaProxy {
+            rules.append(["type": "field", "domain": verificationHosts,
+                          "outboundTag": "proxy"])
+        }
         if !forced.isEmpty {
             // First-match-wins: Gitee/custom sites must not be swallowed by geosite:cn
             // or resolve to a Chinese IP and fall through to geoip:cn.

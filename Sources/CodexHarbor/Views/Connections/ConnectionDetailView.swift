@@ -185,7 +185,7 @@ struct HarborConnectionDetailView: View {
                         .frame(height: 48)
                         .opacity(0.38)
 
-                    usageMetric("平均响应", value: durationText(average), color: HarborColors.orange)
+                    usageMetric("平均任务耗时", value: durationText(average), color: HarborColors.orange)
                 }
                 .frame(maxWidth: .infinity, minHeight: 78)
             }

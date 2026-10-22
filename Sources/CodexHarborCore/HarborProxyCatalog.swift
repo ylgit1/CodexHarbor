@@ -38,13 +38,76 @@ public enum HarborProxyRegion: String, CaseIterable, Sendable {
     }
 }
 
+/// Real-delay probes are bounded because every concurrent item owns one
+/// isolated Xray process and an HTTPS request.
+public enum HarborProxyLatencyPolicy {
+    public static let parallelCount = 4
+    public static let connectTimeoutSeconds = 2
+    public static let requestTimeoutSeconds = 5
+    public static let listenerStartupTimeoutMilliseconds = 3_000
+    public static let goodUpperBoundMilliseconds = 1_500
+    public static let warningUpperBoundMilliseconds = 2_000
+}
+
+public enum HarborProxyMeasurementLabel {
+    public static func measured(_ milliseconds: Int) -> String {
+        "\(milliseconds) ms"
+    }
+
+    public static let explanation =
+        "通过独立 Xray 和节点代理完成 HTTPS 请求的真实延迟；它验证代理可用性，但不等同于下载带宽"
+}
+
 public struct HarborProxyProbeResult: Sendable, Equatable {
     public var milliseconds: Int?
+    public var tcpMilliseconds: Int?
     public var checkedAt: Date
+    /// A TCP-only probe must never mark HTTPS as failed (or vice versa).
+    public var realTested: Bool
+    public var tcpTested: Bool
     public var succeeded: Bool { milliseconds != nil }
-    public init(milliseconds: Int?, checkedAt: Date = .now) {
+    public init(milliseconds: Int?, tcpMilliseconds: Int? = nil, checkedAt: Date = .now,
+                realTested: Bool? = nil, tcpTested: Bool? = nil) {
         self.milliseconds = milliseconds
+        self.tcpMilliseconds = tcpMilliseconds
         self.checkedAt = checkedAt
+        self.realTested = realTested ?? (milliseconds != nil)
+        self.tcpTested = tcpTested ?? (tcpMilliseconds != nil)
+    }
+}
+
+/// Cached geolocation describes the node SERVER address, never its egress IP.
+public struct HarborProxyIPLocation: Codable, Equatable, Sendable {
+    public var ip: String
+    public var countryCode: String
+
+    public init(ip: String, countryCode: String) {
+        self.ip = ip
+        self.countryCode = countryCode.uppercased()
+    }
+
+    public var countryName: String {
+        switch countryCode {
+        case "HK": return "香港"
+        case "TW": return "台湾"
+        case "MO": return "澳门"
+        default:
+            return Locale(identifier: "zh_CN").localizedString(forRegionCode: countryCode) ?? "其他"
+        }
+    }
+
+    public var flag: String {
+        guard countryCode.count == 2,
+              countryCode.unicodeScalars.allSatisfy({ (65...90).contains($0.value) }) else {
+            return "🌐"
+        }
+        return String(String.UnicodeScalarView(countryCode.unicodeScalars.compactMap {
+            UnicodeScalar(0x1F1E6 + $0.value - 65)
+        }))
+    }
+
+    public func matches(_ resolvedIP: String) -> Bool {
+        ip == resolvedIP && countryCode.count == 2
     }
 }
 

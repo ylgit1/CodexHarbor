@@ -115,6 +115,8 @@ struct HarborLocalTransportConfigurationSheet: View {
             }
             .buttonStyle(HarborInteractivePlainButtonStyle(tint: Color.primary, cornerRadius: 9))
             .keyboardShortcut(.cancelAction)
+            .accessibilityLabel("关闭连接配置弹窗")
+            .help("关闭连接配置")
         }
     }
 

@@ -182,6 +182,25 @@ struct HarborLocalAccessView: View {
         }
     }
 
+    private var actionUnavailableHint: String {
+        if operation != nil || bridge.isWorking || bridge.isSwitchingTransport || bridge.isDiagnosing {
+            return "正在执行连接操作，请等待完成"
+        }
+        if bridge.configuration.allowedRoots.isEmpty {
+            return "请先添加允许访问的目录"
+        }
+        if !isConfigured(selectedMode) {
+            return "请先配置选中的接入方式"
+        }
+        if !bridge.agentRunning && bridge.runtime.agent != .starting {
+            return "请先启动 ChatGPT 接入服务"
+        }
+        if selectedMode != bridge.configuration.transportMode {
+            return "请先选择当前正在使用的连接方式"
+        }
+        return "该操作当前不可用，请检查连接状态"
+    }
+
     private func serviceToggleButton(serviceRunning: Bool, enabled: Bool) -> some View {
         Button {
             if serviceRunning {
@@ -200,7 +219,9 @@ struct HarborLocalAccessView: View {
             prominence: .secondary
         ))
         .disabled(!enabled)
-        .help(serviceRunning ? "关闭 ChatGPT 接入（需确认）" : "启动当前选择的连接方式")
+        .help(enabled
+              ? (serviceRunning ? "关闭 ChatGPT 接入（需确认）" : "启动当前选择的连接方式")
+              : actionUnavailableHint)
     }
 
     private func detectButton(enabled: Bool) -> some View {
@@ -219,7 +240,7 @@ struct HarborLocalAccessView: View {
         }
         .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
         .disabled(!enabled)
-        .help(enabled ? "检测当前连接" : "请先选择当前正在使用的连接")
+        .help(enabled ? "检测当前连接" : actionUnavailableHint)
     }
 
     private func reconnectButton(enabled: Bool) -> some View {
@@ -230,7 +251,7 @@ struct HarborLocalAccessView: View {
         }
         .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
         .disabled(!enabled)
-        .help(enabled ? "重新连接当前连接" : "请先选择当前正在使用的连接")
+        .help(enabled ? "重新连接当前连接" : actionUnavailableHint)
     }
 
     private func switchButton(
@@ -245,7 +266,7 @@ struct HarborLocalAccessView: View {
         .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .prominent))
         .disabled(!enabled)
         .help(enabled ? "切换到\(targetName)" :
-              (isCurrent ? "当前已经使用该连接" : "请先完成\(targetName)配置"))
+              (isCurrent ? "当前已经使用该连接" : actionUnavailableHint))
     }
 
     private func chatGPTSettingsButton(enabled: Bool) -> some View {
@@ -261,6 +282,7 @@ struct HarborLocalAccessView: View {
         }
         .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
         .disabled(!enabled)
+        .help(enabled ? "打开 ChatGPT 的接入配置页面" : actionUnavailableHint)
     }
 
 

@@ -14,6 +14,7 @@ struct HarborProxyWorkspaceView: View {
     @State private var protocolFilter = "全部"
     @State private var latencyFilter = "全部"
     @State private var latencyAscending: Bool? = nil
+    @State private var latencySortMetric: HarborProxyLatencyTestKind = .real
     @State private var page = 1
     @State private var pageSize = 10
     @State private var gridMode = false
@@ -35,6 +36,9 @@ struct HarborProxyWorkspaceView: View {
     @State private var deletionTargetID: DeletionTarget?
     @State private var renameTarget: RenameTarget?
     @State private var renameText = ""
+    @AppStorage("com.codexharbor.proxy.nodeNameColumnWidth")
+    private var nodeNameColumnWidth = 230.0
+    @State private var nodeNameDragStart: Double?
     @FocusState private var nodeSearchFocused: Bool
 
     private struct DeletionTarget: Identifiable { let id: String }
@@ -63,9 +67,13 @@ struct HarborProxyWorkspaceView: View {
             if protocolFilter != "全部" && node.protocolName.uppercased() != protocolFilter { return false }
             if latencyFilter != "全部" {
                 guard let delay = proxy.probeResults[node.id]?.milliseconds else { return false }
-                if latencyFilter == "快速" && delay >= 200 { return false }
-                if latencyFilter == "一般" && (delay < 200 || delay >= 500) { return false }
-                if latencyFilter == "较慢" && delay < 500 { return false }
+                if latencyFilter == "快速"
+                    && delay >= HarborProxyLatencyPolicy.goodUpperBoundMilliseconds { return false }
+                if latencyFilter == "一般"
+                    && (delay < HarborProxyLatencyPolicy.goodUpperBoundMilliseconds
+                        || delay >= HarborProxyLatencyPolicy.warningUpperBoundMilliseconds) { return false }
+                if latencyFilter == "较慢"
+                    && delay < HarborProxyLatencyPolicy.warningUpperBoundMilliseconds { return false }
             }
             let text = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
             return text.isEmpty || node.displayName.localizedCaseInsensitiveContains(text)
@@ -76,8 +84,12 @@ struct HarborProxyWorkspaceView: View {
         if let ascending = latencyAscending {
             let position = Dictionary(uniqueKeysWithValues: result.enumerated().map { ($0.element.id, $0.offset) })
             result.sort { a, b in
-                let x = proxy.probeResults[a.id]?.milliseconds
-                let y = proxy.probeResults[b.id]?.milliseconds
+                let x = latencySortMetric == .tcp
+                    ? proxy.probeResults[a.id]?.tcpMilliseconds
+                    : proxy.probeResults[a.id]?.milliseconds
+                let y = latencySortMetric == .tcp
+                    ? proxy.probeResults[b.id]?.tcpMilliseconds
+                    : proxy.probeResults[b.id]?.milliseconds
                 switch (x, y) {
                 case let (lhs?, rhs?) where lhs != rhs: return ascending ? lhs < rhs : lhs > rhs
                 case (_?, nil): return true
@@ -102,8 +114,9 @@ struct HarborProxyWorkspaceView: View {
     }
     private var regions: [String] {
         let actual = Set(groupNodes.map(location))
-        return ["全部"] + ["香港", "美国", "日本", "新加坡", "台湾", "德国", "韩国", "英国", "其他"]
-            .filter(actual.contains)
+        let priority = ["香港", "美国", "日本", "新加坡", "台湾", "德国", "韩国", "英国"]
+        return ["全部"] + priority.filter(actual.contains)
+            + actual.subtracting(Set(priority)).sorted()
     }
 
     var body: some View {
@@ -115,8 +128,10 @@ struct HarborProxyWorkspaceView: View {
                     .frame(height: 68)
                 HStack(alignment: .top, spacing: 11) {
                     subscriptionSidebar
-                        .frame(width: min(390, max(215, geometry.size.width * 0.22)))
-                    nodeTable
+                        .frame(width: min(300, max(220, geometry.size.width * 0.22)))
+                    nodeTable(compact: HarborProxyTableSizing.usesCompactRows(
+                        workspaceWidth: Double(geometry.size.width)
+                    ))
                         .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
                 }
                 .frame(minHeight: 0, maxHeight: .infinity)
@@ -150,8 +165,17 @@ struct HarborProxyWorkspaceView: View {
         .onChange(of: protocolFilter) { _, _ in page = 1 }
         .onChange(of: latencyFilter) { _, _ in page = 1 }
         .onChange(of: latencyAscending) { _, _ in page = 1 }
+        .onChange(of: proxy.latencyCompletionSerial) { _, _ in
+            guard let kind = proxy.lastCompletedLatencyTestKind else { return }
+            latencySortMetric = kind
+            latencyAscending = true
+            page = 1
+        }
         .onChange(of: pageSize) { _, _ in page = 1 }
         .onChange(of: proxy.localPort) { _, _ in copiedProxyURL = nil }
+        .onChange(of: proxy.nodeServerLocations) { _, _ in
+            if region != "全部" && !regions.contains(region) { region = "全部" }
+        }
         .sheet(item: $editor) { mode in editorSheet(mode) }
         .sheet(item: $renameTarget) { target in
             if let node = proxy.nodes.first(where: { $0.id == target.id }) {
@@ -296,13 +320,18 @@ struct HarborProxyWorkspaceView: View {
                         .lineLimit(1)
                     if proxy.running, let node = proxy.selectedNode,
                        let latency = proxy.probeResults[node.id]?.milliseconds {
-                        Text("\(latency) ms")
+                        Text("延迟 " + HarborProxyMeasurementLabel.measured(latency))
                             .font(.system(size: 10, weight: .medium))
                             .monospacedDigit()
                             .foregroundStyle(latencyColor(latency))
                             .padding(.horizontal, 8)
                             .frame(height: 21)
                             .background(latencyColor(latency).opacity(0.09), in: Capsule())
+                            .help(HarborProxyMeasurementLabel.explanation
+                                  + " · 检测于 "
+                                  + (proxy.probeResults[node.id]?.checkedAt.formatted(
+                                      date: .abbreviated, time: .shortened
+                                  ) ?? "未知"))
                     }
                 }
                 Text(proxyStateSubtitle)
@@ -407,7 +436,7 @@ struct HarborProxyWorkspaceView: View {
 
     private var subscriptionSidebar: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Text("订阅")
                     .font(.system(size: 13, weight: .semibold))
                 Text("\(proxy.subscriptions.count)")
@@ -423,6 +452,7 @@ struct HarborProxyWorkspaceView: View {
                 }
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
                 .help("新增订阅或节点")
+                .accessibilityLabel("新增订阅或节点链接")
                 Button {
                     if let groupID,
                        let item = proxy.subscriptions.first(where: { $0.id == groupID }) {
@@ -431,11 +461,14 @@ struct HarborProxyWorkspaceView: View {
                 } label: {
                     Image(systemName: "pencil")
                         .font(.system(size: 11, weight: .semibold))
-                        .frame(width: 20, height: 30)
+                        .frame(width: 28, height: 30)
                 }
                 .disabled(groupID == nil || proxy.busy || proxy.latencyTesting)
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-                .help("编辑选中订阅的名称与链接")
+                .help(groupID == nil ? "先在左侧选择要编辑的订阅"
+                      : (proxy.busy || proxy.latencyTesting
+                         ? "请等待当前代理操作完成" : "编辑选中订阅的名称与链接"))
+                .accessibilityLabel("编辑当前订阅")
                 Button {
                     if let groupID {
                         Task { await proxy.refreshSubscription(groupID) }
@@ -443,21 +476,25 @@ struct HarborProxyWorkspaceView: View {
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 11, weight: .semibold))
-                        .frame(width: 20, height: 30)
+                        .frame(width: 28, height: 30)
                 }
                 .disabled(groupID == nil || proxy.busy || proxy.latencyTesting)
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-                .help("更新选中订阅")
+                .help(groupID == nil ? "请先选择需要更新的订阅"
+                      : (proxy.busy || proxy.latencyTesting
+                         ? "请等待当前代理操作完成" : "更新选中订阅的节点"))
+                .accessibilityLabel("刷新当前订阅")
                 Button {
                     if let groupID { deletionTargetID = DeletionTarget(id: groupID) }
                 } label: {
                     Image(systemName: "trash")
                         .font(.system(size: 11.5, weight: .semibold))
-                        .frame(width: 20, height: 30)
+                        .frame(width: 28, height: 30)
                 }
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.red, prominence: .secondary))
                 .disabled(groupID == nil || proxy.busy || proxy.latencyTesting)
                 .help(groupID == nil ? "先选择需要删除的订阅" : "删除当前选中的订阅")
+                .accessibilityLabel("删除当前订阅")
             }
             .padding(.horizontal, 15)
             .padding(.top, 13)
@@ -536,6 +573,7 @@ struct HarborProxyWorkspaceView: View {
                 }
                 .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue, cornerRadius: 7))
                 .help("配置强制代理站点（默认 Gitee），可添加不允许直连的域名")
+                .accessibilityLabel("编辑强制代理站点")
             }
             .padding(.horizontal, 13)
             .padding(.vertical, 10)
@@ -708,23 +746,41 @@ struct HarborProxyWorkspaceView: View {
                     Label("停止 \(proxy.latencyCompleted)/\(proxy.latencyTotal)",
                           systemImage: "stop.circle")
                         .font(.system(size: 10.5, weight: .medium))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.orange, prominence: .secondary))
             } else {
-                Button {
-                    Task { await proxy.testLatency(visibleNodes.map(\.id)) }
-                } label: {
-                    Label("测速", systemImage: "speedometer")
-                        .font(.system(size: 10.5, weight: .medium))
+                HStack(spacing: 6) {
+                    Button {
+                        Task { await proxy.testTCPLatency(visibleNodes.map(\.id)) }
+                    } label: {
+                        Label("TCP 测速", systemImage: "dot.radiowaves.left.and.right")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+                    .disabled(visibleNodes.isEmpty || proxy.busy)
+                    .help("仅测试节点服务器端口的 TCP 握手，不代表代理可用")
+
+                    Button {
+                        Task { await proxy.testRealLatency(visibleNodes.map(\.id)) }
+                    } label: {
+                        Label("真实测速", systemImage: "speedometer")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .buttonStyle(HarborActionButtonStyle(tint: HarborColors.green, prominence: .secondary))
+                    .disabled(visibleNodes.isEmpty || proxy.busy || !proxy.coreInstalled)
+                    .help("通过独立 Xray 完成 HTTPS 请求；不改变当前节点或系统代理")
                 }
-                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-                .disabled(visibleNodes.isEmpty || !proxy.coreInstalled || proxy.busy)
-                .help("手动测速当前页节点，不更改当前系统代理")
             }
 
             if gridMode {
-                latencySortButton
-                    .frame(width: 80)
+                latencySortButton(for: latencySortMetric)
+                    .frame(width: 96)
             }
 
             HStack(spacing: 2) {
@@ -738,23 +794,32 @@ struct HarborProxyWorkspaceView: View {
         .frame(height: 40)
     }
 
-    private var latencySortButton: some View {
-        Button {
-            latencyAscending = !(latencyAscending ?? false)
+    private func latencySortButton(for kind: HarborProxyLatencyTestKind) -> some View {
+        let selected = latencySortMetric == kind && latencyAscending != nil
+        return Button {
+            if selected {
+                latencyAscending = !(latencyAscending ?? false)
+            } else {
+                latencySortMetric = kind
+                latencyAscending = true
+            }
             page = 1
         } label: {
             HStack(spacing: 3) {
-                Text("延迟")
-                Image(systemName: latencyAscending == nil ? "arrow.up.arrow.down"
+                Text(kind == .tcp ? "TCP 延迟" : "真实延迟")
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                Image(systemName: !selected ? "arrow.up.arrow.down"
                       : (latencyAscending == true ? "arrow.up" : "arrow.down"))
                     .font(.system(size: 9, weight: .semibold))
             }
-            .font(.system(size: 10.5, weight: latencyAscending == nil ? .medium : .semibold))
+            .font(.system(size: 10.5, weight: selected ? .semibold : .medium))
             .frame(height: 32, alignment: .leading)
             .contentShape(Rectangle())
         }
         .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-        .help("按已测速延迟排序，点击切换升序或降序；未测速的节点排在后面")
+        .help(kind == .tcp ? "按 TCP 握手延迟排序（不能证明代理可用）"
+              : "按真实 HTTPS 延迟排序；节点名称中的 ms 并非本机测试结果")
     }
 
     private func modeButton(_ symbol: String, selected: Bool,
@@ -768,11 +833,13 @@ struct HarborProxyWorkspaceView: View {
                             in: RoundedRectangle(cornerRadius: 6))
         }
         .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue, cornerRadius: 6))
+        .help(selected ? "当前显示" + (symbol == "list.bullet" ? "列表" : "卡片") : "切换为" + (symbol == "list.bullet" ? "列表" : "卡片") + "视图")
+        .accessibilityLabel((symbol == "list.bullet" ? "列表" : "卡片") + "视图")
     }
 
     /// Only node content scrolls. Controls and pagination stay in view at any
     /// supported window height; there is no outer page scrolling.
-    private var nodeTable: some View {
+    private func nodeTable(compact: Bool) -> some View {
         VStack(spacing: 0) {
             regionBar
             Rectangle().fill(HarborColors.cardBorder).frame(height: 1)
@@ -780,13 +847,57 @@ struct HarborProxyWorkspaceView: View {
             if !gridMode {
                 HStack(spacing: 10) {
                     Image(systemName: "circle").frame(width: 18).opacity(0)
-                    Text("节点名称").frame(maxWidth: .infinity, alignment: .leading)
-                    Text("地址").frame(width: 141, alignment: .leading)
-                    Text("类型").frame(width: 62, alignment: .leading)
-                    Text("地区").frame(width: 76, alignment: .leading)
-                    latencySortButton.frame(width: 68, alignment: .leading)
-                    Image(systemName: "speedometer").frame(width: 28)
+                    if compact {
+                        Text("节点名称")
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        HStack(spacing: 0) {
+                            Text("节点名称")
+                                .lineLimit(1)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Rectangle()
+                                .fill(Color.primary.opacity(0.12))
+                                .frame(width: 1, height: 20)
+                                .padding(.horizontal, 5)
+                                .contentShape(Rectangle().inset(by: -5))
+                                .gesture(
+                                    DragGesture(minimumDistance: 1)
+                                        .onChanged { value in
+                                            if nodeNameDragStart == nil {
+                                                nodeNameDragStart = nodeNameColumnWidth
+                                            }
+                                            nodeNameColumnWidth = min(400, max(150,
+                                                (nodeNameDragStart ?? nodeNameColumnWidth)
+                                                    + Double(value.translation.width)))
+                                        }
+                                        .onEnded { _ in nodeNameDragStart = nil }
+                                )
+                                .help("拖动调整节点名称列宽")
+                        }
+                        .frame(width: nodeNameColumnWidth, alignment: .leading)
+                        Text("地址")
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Text("地区").frame(width: 76, alignment: .leading)
+                    }
+                    if compact {
+                        Text("TCP / 真实")
+                            .lineLimit(1)
+                            .frame(width: 88, alignment: .leading)
+                    } else {
+                        latencySortButton(for: .tcp).frame(width: 68, alignment: .leading)
+                        latencySortButton(for: .real).frame(width: 96, alignment: .leading)
+                    }
+                    Image(systemName: "dot.radiowaves.left.and.right").frame(width: 26)
+                        .help("单节点 TCP 测速")
+                        .accessibilityLabel("TCP 测速")
+                    Image(systemName: "speedometer").frame(width: 26)
+                        .help("单节点真实测速")
+                        .accessibilityLabel("真实测速")
                     Image(systemName: "star").frame(width: 29)
+                        .help("收藏节点")
+                        .accessibilityLabel("收藏")
                 }
                 .font(.system(size: 10.5, weight: .medium))
                 .foregroundStyle(.secondary)
@@ -823,7 +934,7 @@ struct HarborProxyWorkspaceView: View {
                     .frame(maxWidth: .infinity, minHeight: available.size.height, alignment: .top)
                 } else {
                     LazyVStack(spacing: 2) {
-                        ForEach(visibleNodes) { node in row(node) }
+                        ForEach(visibleNodes) { node in row(node, compact: compact) }
                     }
                     .padding(.horizontal, 9)
                     .padding(.vertical, 5)
@@ -854,11 +965,12 @@ struct HarborProxyWorkspaceView: View {
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(HarborColors.cardBorder))
     }
 
-    private func row(_ node: HarborProxyNode) -> some View {
+    private func row(_ node: HarborProxyNode, compact: Bool) -> some View {
         let active = proxy.selectedID == node.id && proxy.running
         let connected = active && proxy.healthy
         let probe = proxy.probeResults[node.id]
         let delay = probe?.milliseconds
+        let tcpDelay = probe?.tcpMilliseconds
         let connecting = proxy.switchingNodeID == node.id
         return HStack(spacing: 10) {
             Button {
@@ -872,66 +984,134 @@ struct HarborProxyWorkspaceView: View {
                                          : ((active || connecting) ? HarborColors.orange
                                             : Color.primary.opacity(0.24)))
                         .frame(width: 18)
-                    Text(node.displayName)
-                        .font(.system(size: 11, weight: connected ? .semibold : .medium))
-                        .foregroundStyle(connected ? HarborColors.green : .primary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    if node.customName != nil {
-                        Image(systemName: "pencil")
-                            .font(.system(size: 8.5, weight: .medium))
+                    if compact {
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 4) {
+                                Text(node.displayName)
+                                    .font(.system(size: 11.5, weight: connected ? .semibold : .medium))
+                                    .foregroundStyle(connected ? HarborColors.green : .primary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                if node.customName != nil {
+                                    Image(systemName: "pencil")
+                                        .font(.system(size: 9))
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            HStack(spacing: 5) {
+                                Text(node.host)
+                                    .truncationMode(.middle)
+                                    .lineLimit(1)
+                                Text(regionFlag(node))
+                            }
+                            .font(.system(size: 10))
                             .foregroundStyle(.secondary)
-                            .help("这是自定义节点名称；右键可修改或恢复订阅名称")
-                    }
-                    Text(node.host)
-                        .font(.system(size: 9.5))
+                            .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        Text(node.displayName)
+                            .font(.system(size: 11, weight: connected ? .semibold : .medium))
+                            .foregroundStyle(connected ? HarborColors.green : .primary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(width: nodeNameColumnWidth, alignment: .leading)
+                        if node.customName != nil {
+                            Image(systemName: "pencil")
+                                .font(.system(size: 8.5, weight: .medium))
+                                .foregroundStyle(.secondary)
+                                .help("这是自定义节点名称；右键可修改或恢复订阅名称")
+                        }
+                        Text(node.host)
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        HStack(spacing: 5) {
+                            Text(regionFlag(node)).font(.system(size: 13))
+                            Text(location(of: node)).lineLimit(1)
+                                .help(regionHint(node))
+                        }
+                        .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .frame(width: 141, alignment: .leading)
-                    Text(node.protocolName.uppercased())
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(protocolColor(node.protocolName))
-                        .frame(width: 62, height: 24)
-                        .background(protocolColor(node.protocolName).opacity(0.085),
-                                    in: RoundedRectangle(cornerRadius: 6))
-                    HStack(spacing: 5) {
-                        Text(regionFlag(node)).font(.system(size: 13))
-                        Text(location(of: node)).lineLimit(1)
+                            .frame(width: 76, alignment: .leading)
                     }
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 76, alignment: .leading)
-                    Text(connected ? "已连接" : (connecting ? "切换中"
-                         : (proxy.latencyCurrentID == node.id ? "测速中"
-                            : delay.map { "\($0) ms" } ?? (probe == nil ? "未测" : "超时"))))
-                        .font(.system(size: 10.3, weight: connected || delay != nil ? .semibold : .regular))
+                    if compact {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("TCP " + (tcpDelay.map { "\($0)ms" }
+                                 ?? (proxy.latencyTestingIDs.contains(node.id)
+                                     && proxy.latencyTestKind == .tcp ? "测速中" : "--")))
+                                .foregroundStyle(tcpDelay.map(tcpLatencyColor) ?? Color.secondary)
+                            Text("真实 " + realLatencyText(
+                                delay: delay, probe: probe, connected: connected,
+                                connecting: connecting, nodeID: node.id))
+                                .foregroundStyle(realLatencyTextColor(
+                                    delay: delay, probe: probe, connected: connected,
+                                    connecting: connecting, nodeID: node.id))
+                        }
+                        .font(.system(size: 9.2, weight: .medium))
                         .monospacedDigit()
-                        .foregroundStyle(connected ? HarborColors.green
-                                         : (connecting ? HarborColors.orange
-                                            : delay.map(latencyColor) ?? Color.secondary))
-                        .frame(width: 68, alignment: .leading)
+                        .lineLimit(1)
+                        .frame(width: 88, alignment: .leading)
+                    } else {
+                        Text(tcpDelay.map { "\($0) ms" }
+                             ?? (proxy.latencyTestingIDs.contains(node.id)
+                                 && proxy.latencyTestKind == .tcp ? "测速中"
+                                 : (probe?.tcpTested == true ? "不可达" : "未测")))
+                            .font(.system(size: 10.1, weight: tcpDelay == nil ? .regular : .medium))
+                            .monospacedDigit()
+                            .foregroundStyle(tcpDelay.map(tcpLatencyColor) ?? Color.secondary)
+                            .lineLimit(1)
+                            .frame(width: 68, alignment: .leading)
+                        Text(realLatencyText(
+                            delay: delay, probe: probe, connected: connected,
+                            connecting: connecting, nodeID: node.id))
+                            .font(.system(size: 10.3, weight: connected || delay != nil ? .semibold : .regular))
+                            .monospacedDigit()
+                            .foregroundStyle(realLatencyTextColor(
+                                delay: delay, probe: probe, connected: connected,
+                                connecting: connecting, nodeID: node.id))
+                            .lineLimit(1)
+                            .frame(width: 96, alignment: .leading)
+                    }
                 }
-                .frame(height: 46)
+                .frame(height: compact ? 54 : 46)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("点击连接：\(node.displayName)；右键可重命名")
+            .help("点击连接：\(node.displayName)。延迟为经过该节点的真实 HTTPS 请求耗时，右键可以重命名")
+            .accessibilityLabel("连接节点：" + node.displayName)
 
             Button {
-                Task { await proxy.testLatency([node.id]) }
+                Task { await proxy.testTCPLatency([node.id]) }
             } label: {
-                Image(systemName: proxy.latencyCurrentID == node.id
-                      ? "hourglass" : "speedometer")
-                    .font(.system(size: 12))
-                    .foregroundStyle(proxy.latencyCurrentID == node.id
+                Image(systemName: proxy.latencyTestingIDs.contains(node.id)
+                      && proxy.latencyTestKind == .tcp ? "hourglass"
+                      : "dot.radiowaves.left.and.right")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(proxy.latencyTestingIDs.contains(node.id)
+                                     && proxy.latencyTestKind == .tcp
                                      ? HarborColors.orange : HarborColors.blue)
-                    .frame(width: 28, height: 30)
+                    .frame(width: 26, height: 30)
             }
-            .disabled(proxy.latencyTesting || !proxy.coreInstalled || proxy.busy)
+            .disabled(proxy.latencyTesting || proxy.busy)
             .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue, cornerRadius: 7))
-            .help("仅测试此节点的代理 HTTPS 延迟，不切换当前代理")
+            .help("TCP 测速：只测试服务器端口握手")
+            Button {
+                Task { await proxy.testRealLatency([node.id]) }
+            } label: {
+                Image(systemName: proxy.latencyTestingIDs.contains(node.id)
+                      && proxy.latencyTestKind == .real ? "hourglass" : "speedometer")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(proxy.latencyTestingIDs.contains(node.id)
+                                     && proxy.latencyTestKind == .real
+                                     ? HarborColors.orange : HarborColors.green)
+                    .frame(width: 26, height: 30)
+            }
+            .disabled(proxy.latencyTesting || proxy.busy || !proxy.coreInstalled)
+            .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.green, cornerRadius: 7))
+            .help("真实测速：通过独立 Xray 发出 HTTPS 请求")
             Button {
                 toggleFavorite(node.id)
             } label: {
@@ -978,7 +1158,9 @@ struct HarborProxyWorkspaceView: View {
         let active = proxy.selectedID == node.id && proxy.running
         let connected = active && proxy.healthy
         let connecting = proxy.switchingNodeID == node.id
-        let delay = proxy.probeResults[node.id]?.milliseconds
+        let probe = proxy.probeResults[node.id]
+        let delay = probe?.milliseconds
+        let tcpDelay = probe?.tcpMilliseconds
         return HStack(alignment: .center, spacing: 6) {
             Button {
                 Task { await proxy.activate(node.id) }
@@ -1020,18 +1202,21 @@ struct HarborProxyWorkspaceView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                     HStack(spacing: 8) {
-                        Text(node.protocolName.uppercased())
-                            .foregroundStyle(protocolColor(node.protocolName))
                         Text("\(regionFlag(node)) \(location(of: node))")
+                            .help(regionHint(node))
                         Spacer(minLength: 2)
-                        Text(delay.map { "\($0) ms" } ?? (proxy.probeResults[node.id] == nil ? "未测" : "超时"))
-                            .font(.system(size: 11, weight: delay == nil ? .regular : .semibold))
-                            .monospacedDigit()
-                            .foregroundStyle(delay.map(latencyColor) ?? Color.secondary)
-                            .padding(.horizontal, 5)
-                            .frame(height: 22)
-                            .background(delay.map { latencyColor($0).opacity(0.09) } ?? Color.clear,
-                                        in: RoundedRectangle(cornerRadius: 6))
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text(tcpDelay.map { "TCP \($0) ms" }
+                                 ?? (probe?.tcpTested == true ? "TCP 不可达" : "TCP 未测"))
+                                .lineLimit(1)
+                                .foregroundStyle(tcpDelay.map(tcpLatencyColor) ?? Color.secondary)
+                            Text(delay.map { "真实 \($0) ms" }
+                                 ?? (probe?.realTested == true ? "真实不可用" : "真实未测"))
+                                .lineLimit(1)
+                                .font(.system(size: 10.5, weight: delay == nil ? .regular : .semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(delay.map(latencyColor) ?? Color.secondary)
+                        }
                     }
                     .font(.system(size: 9.5))
                 }
@@ -1041,7 +1226,7 @@ struct HarborProxyWorkspaceView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            VStack(spacing: 4) {
+            VStack(spacing: 2) {
                 Button {
                     toggleFavorite(node.id)
                 } label: {
@@ -1051,15 +1236,28 @@ struct HarborProxyWorkspaceView: View {
                 }
                 .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.orange))
                 Button {
-                    Task { await proxy.testLatency([node.id]) }
+                    Task { await proxy.testTCPLatency([node.id]) }
                 } label: {
-                    Image(systemName: proxy.latencyCurrentID == node.id ? "hourglass" : "speedometer")
+                    Image(systemName: proxy.latencyTestingIDs.contains(node.id)
+                          && proxy.latencyTestKind == .tcp ? "hourglass"
+                          : "dot.radiowaves.left.and.right")
                         .foregroundStyle(HarborColors.blue)
-                        .frame(width: 30, height: 30)
+                        .frame(width: 27, height: 27)
                 }
-                .disabled(proxy.latencyTesting || !proxy.coreInstalled)
+                .disabled(proxy.latencyTesting || proxy.busy)
                 .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue, cornerRadius: 7))
-                .help("测速，不切换节点")
+                .help("TCP 测速：只测试服务器端口握手")
+                Button {
+                    Task { await proxy.testRealLatency([node.id]) }
+                } label: {
+                    Image(systemName: proxy.latencyTestingIDs.contains(node.id)
+                          && proxy.latencyTestKind == .real ? "hourglass" : "speedometer")
+                        .foregroundStyle(HarborColors.green)
+                        .frame(width: 27, height: 27)
+                }
+                .disabled(proxy.latencyTesting || proxy.busy || !proxy.coreInstalled)
+                .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.green, cornerRadius: 7))
+                .help("真实测速：通过独立 Xray 发出 HTTPS 请求")
             }
         }
         .padding(.trailing, 8)
@@ -1192,9 +1390,39 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func latencyColor(_ milliseconds: Int) -> Color {
+        if milliseconds < HarborProxyLatencyPolicy.goodUpperBoundMilliseconds {
+            return HarborColors.green
+        }
+        if milliseconds < HarborProxyLatencyPolicy.warningUpperBoundMilliseconds {
+            return HarborColors.orange
+        }
+        return HarborColors.red
+    }
+
+    private func tcpLatencyColor(_ milliseconds: Int) -> Color {
         if milliseconds < 200 { return HarborColors.green }
         if milliseconds < 500 { return HarborColors.orange }
         return HarborColors.red
+    }
+
+    private func realLatencyText(delay: Int?, probe: HarborProxyProbeResult?,
+                                 connected: Bool, connecting: Bool, nodeID: String) -> String {
+        if connecting { return "切换中" }
+        if proxy.latencyTestingIDs.contains(nodeID), proxy.latencyTestKind == .real {
+            return "测速中"
+        }
+        if let delay { return "\(delay) ms" }
+        return probe?.realTested == true ? "不可用" : "未测"
+    }
+
+    private func realLatencyTextColor(delay: Int?, probe: HarborProxyProbeResult?,
+                                      connected: Bool, connecting: Bool, nodeID: String) -> Color {
+        if connecting { return HarborColors.orange }
+        if proxy.latencyTestingIDs.contains(nodeID), proxy.latencyTestKind == .real {
+            return HarborColors.orange
+        }
+        if let delay { return latencyColor(delay) }
+        return probe?.realTested == true ? HarborColors.red : Color.secondary
     }
 
     private func regionEmoji(_ name: String) -> String {
@@ -1212,7 +1440,8 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func regionFlag(_ node: HarborProxyNode) -> String {
-        switch HarborProxyRegion.infer(from: node.name) {
+        if let location = proxy.serverLocation(for: node) { return location.flag }
+        return switch HarborProxyRegion.infer(from: node.name) {
         case .hongKong: "🇭🇰"
         case .unitedStates: "🇺🇸"
         case .japan: "🇯🇵"
@@ -1233,7 +1462,15 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func location(of node: HarborProxyNode) -> String {
-        HarborProxyRegion.infer(from: node.name).rawValue
+        proxy.serverLocation(for: node)?.countryName
+            ?? HarborProxyRegion.infer(from: node.name).rawValue
+    }
+
+    private func regionHint(_ node: HarborProxyNode) -> String {
+        if let location = proxy.serverLocation(for: node) {
+            return "节点服务器 IP：\(location.ip) · IP 归属地（不代表代理出口 IP）"
+        }
+        return "暂按节点名称显示地区，待服务器 IP 归属地识别"
     }
 
     // A centered, padded form with the same visual language as hosted-key setup.
@@ -1256,10 +1493,12 @@ struct HarborProxyWorkspaceView: View {
                 }
                 .buttonStyle(HarborInteractivePlainButtonStyle(
                     tint: Color.primary, cornerRadius: 9))
-                .help("关闭")
+                .help("关闭弹窗")
+                .accessibilityLabel("关闭弹窗")
+                .disabled(subscriptionSaving || portUpdating)
             }
             .frame(height: 34)
-            .padding(.bottom, 22)
+            .padding(.bottom, mode == .ports ? 9 : 22)
 
             if mode == .importChoice {
                 Text("选择添加方式")
@@ -1285,6 +1524,7 @@ struct HarborProxyWorkspaceView: View {
                     Text("订阅名称").font(.callout.weight(.semibold))
                     TextField("例如：我的订阅", text: $subscriptionName)
                         .textFieldStyle(.plain)
+                        .accessibilityLabel("订阅名称")
                         .padding(.horizontal, 12)
                         .frame(height: 44)
                         .background(Color(nsColor: .controlBackgroundColor),
@@ -1297,6 +1537,7 @@ struct HarborProxyWorkspaceView: View {
                     Text("HTTPS 订阅地址").font(.callout.weight(.semibold))
                     TextField("粘贴 https:// 开头的订阅链接", text: $subscriptionURL)
                         .textFieldStyle(.plain)
+                        .accessibilityLabel("HTTPS 订阅地址")
                         .padding(.horizontal, 12)
                         .frame(height: 44)
                         .background(Color(nsColor: .controlBackgroundColor),
@@ -1317,19 +1558,12 @@ struct HarborProxyWorkspaceView: View {
                     }
                 }
             } else if mode == .ports {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("HTTP 代理监听端口")
-                        .font(.system(size: 12, weight: .semibold))
-                    TextField("18080", text: $listenPortText)
+                VStack(alignment: .leading, spacing: 7) {
+                    TextField("HTTP 端口（例如 18080）", text: $listenPortText)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(size: 13, design: .monospaced))
-                    Text("SOCKS5 将自动使用下一端口。例如 HTTP 18080、SOCKS5 18081。")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                    Text("端口被占用时明确提示，不再自动切换。手动修改端口会安全重连，并在原本接管系统代理时同步更新 macOS 设置。")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(height: 38)
+                        .accessibilityLabel("HTTP 代理监听端口")
                     if let listenPortError {
                         Text(listenPortError)
                             .font(.system(size: 11))
@@ -1381,15 +1615,16 @@ struct HarborProxyWorkspaceView: View {
                 }
             }
 
-            Spacer(minLength: 18)
+            Spacer(minLength: mode == .ports ? 8 : 18)
             Rectangle()
                 .fill(HarborColors.cardBorder)
                 .frame(height: 1)
-                .padding(.bottom, 15)
+                .padding(.bottom, mode == .ports ? 8 : 15)
             HStack(spacing: 10) {
                 Spacer()
                 Button("取消") { editor = nil }
                     .keyboardShortcut(.cancelAction)
+                    .disabled(subscriptionSaving || portUpdating)
                     .buttonStyle(HarborActionButtonStyle(
                         tint: .secondary, prominence: .secondary))
                 if mode == .ports {
@@ -1478,9 +1713,14 @@ struct HarborProxyWorkspaceView: View {
                         }
                         editor = nil
                     } label: {
-                        Text(mode == .editSubscription
-                             ? (subscriptionSaving ? "正在更新节点…" : "保存订阅")
-                             : (mode == .subscription ? "添加订阅" : "导入节点"))
+                        HStack(spacing: 7) {
+                            if mode == .editSubscription && subscriptionSaving {
+                                ProgressView().controlSize(.small)
+                            }
+                            Text(mode == .editSubscription
+                                 ? (subscriptionSaving ? "正在更新节点…" : "保存订阅")
+                                 : (mode == .subscription ? "添加订阅" : "导入节点"))
+                        }
                     }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(HarborActionButtonStyle(
@@ -1494,11 +1734,16 @@ struct HarborProxyWorkspaceView: View {
             }
             .frame(height: 35)
         }
-        .padding(.horizontal, 27)
-        .padding(.top, 30)
-        .padding(.bottom, 26)
-        .frame(width: 500, height: mode == .importChoice ? 356 : (mode == .routing ? 440 : (mode == .ports ? 380 : (mode == .links ? 375 : 370))))
-        .onExitCommand { editor = nil }
+        .padding(.horizontal, mode == .ports ? 19 : 27)
+        .padding(.top, mode == .ports ? 15 : 30)
+        .padding(.bottom, mode == .ports ? 15 : 26)
+        .frame(width: mode == .ports ? 355 : 500)
+        .frame(minHeight: mode == .ports ? 0
+               : (mode == .importChoice ? 356
+                  : (mode == .routing ? 440 : (mode == .links ? 375 : 370))))
+        .onExitCommand {
+            if !subscriptionSaving && !portUpdating { editor = nil }
+        }
     }
 
     private func importOption(_ title: String, subtitle: String, symbol: String,

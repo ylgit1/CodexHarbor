@@ -5,6 +5,124 @@ import Testing
 
 @Suite("Independent network proxy")
 struct HarborNetworkProxyTests {
+    @Test("Workbench fits the minimum-height desktop window without clipping")
+    func compactDashboardLayout() {
+        let compact = HarborDashboardSizing.resolve(width: 805, height: 585)
+        #expect(compact.compact)
+        #expect(compact.requiredHeight <= 585)
+        #expect(compact.flowHeight >= 208)
+        #expect(compact.cardHeight >= 228)
+        let regular = HarborDashboardSizing.resolve(width: 1300, height: 900)
+        #expect(!regular.compact)
+        #expect(regular.cardHeight == 270)
+        #expect(regular.requiredHeight <= 900)
+    }
+
+    @Test("Compact node rows keep the node name readable at minimum window size")
+    func proxyTableAdaptsToWindow() {
+        #expect(HarborProxyTableSizing.usesCompactRows(workspaceWidth: 764))
+        #expect(HarborProxyTableSizing.usesCompactRows(workspaceWidth: 949))
+        #expect(!HarborProxyTableSizing.usesCompactRows(workspaceWidth: 950))
+        #expect(!HarborProxyTableSizing.usesCompactRows(workspaceWidth: 1080))
+    }
+
+    @Test("Real proxy delay has bounded concurrency and request timeouts")
+    func measuredProxyDurationLabel() {
+        #expect(HarborProxyMeasurementLabel.measured(197) == "197 ms")
+        #expect(HarborProxyMeasurementLabel.explanation.contains("HTTPS"))
+        #expect(HarborProxyMeasurementLabel.explanation.contains("代理可用性"))
+        #expect(HarborProxyLatencyPolicy.parallelCount == 4)
+        #expect(HarborProxyLatencyPolicy.connectTimeoutSeconds == 2)
+        #expect(HarborProxyLatencyPolicy.requestTimeoutSeconds == 5)
+        #expect(HarborProxyLatencyPolicy.listenerStartupTimeoutMilliseconds == 3_000)
+        #expect(HarborProxyLatencyPolicy.goodUpperBoundMilliseconds == 1_500)
+        #expect(HarborProxyLatencyPolicy.warningUpperBoundMilliseconds == 2_000)
+        let result = HarborProxyProbeResult(milliseconds: 1_650, tcpMilliseconds: 197)
+        #expect(result.milliseconds == 1_650)
+        #expect(result.tcpMilliseconds == 197)
+        #expect(result.succeeded)
+    }
+
+    @Test("TCP and HTTPS probes retain independent measured/failed/unmeasured states")
+    func independentProbeResults() {
+        let tcpOnly = HarborProxyProbeResult(
+            milliseconds: nil, tcpMilliseconds: 82,
+            realTested: false, tcpTested: true
+        )
+        #expect(tcpOnly.milliseconds == nil)
+        #expect(tcpOnly.tcpMilliseconds == 82)
+        #expect(!tcpOnly.realTested)
+        #expect(tcpOnly.tcpTested)
+
+        let realFailed = HarborProxyProbeResult(
+            milliseconds: nil, tcpMilliseconds: 82,
+            realTested: true, tcpTested: true
+        )
+        #expect(realFailed.realTested)
+        #expect(realFailed.tcpMilliseconds == 82)
+
+        let realOnly = HarborProxyProbeResult(
+            milliseconds: 110, realTested: true, tcpTested: false
+        )
+        #expect(realOnly.milliseconds == 110)
+        #expect(realOnly.tcpMilliseconds == nil)
+        #expect(!realOnly.tcpTested)
+    }
+
+    @Test("Server GeoIP cache stays valid only for the unchanged resolved IP")
+    func serverGeoIPCache() {
+        let stored = HarborProxyIPLocation(ip: "8.8.8.8", countryCode: "us")
+        #expect(stored.matches("8.8.8.8"))
+        #expect(!stored.matches("8.8.4.4"))
+        #expect(stored.countryCode == "US")
+        #expect(stored.countryName == "美国")
+        #expect(stored.flag == "🇺🇸")
+        #expect(HarborProxyIPLocation(ip: "1.1.1.1", countryCode: "AU").countryName != "其他")
+        let encoded = try? JSONEncoder().encode(stored)
+        #expect(encoded != nil)
+        #expect((try? JSONDecoder().decode(HarborProxyIPLocation.self, from: encoded!)) == stored)
+    }
+
+    @Test("Intentional proxy stop is not confused with an unexpected crash")
+    func unexpectedExitDecision() {
+        #expect(HarborProxyLivenessPolicy.shouldHandleUnexpectedExit(
+            running: true, intentionallyStopping: false,
+            processMatches: true, coreAlive: false
+        ))
+        #expect(!HarborProxyLivenessPolicy.shouldHandleUnexpectedExit(
+            running: true, intentionallyStopping: true,
+            processMatches: true, coreAlive: false
+        ))
+        #expect(!HarborProxyLivenessPolicy.shouldHandleUnexpectedExit(
+            running: true, intentionallyStopping: false,
+            processMatches: false, coreAlive: false
+        ))
+        #expect(!HarborProxyLivenessPolicy.shouldHandleUnexpectedExit(
+            running: true, intentionallyStopping: false,
+            processMatches: true, coreAlive: true
+        ))
+    }
+
+    @Test("Workbench readiness requires a recent successful active-profile check")
+    func workbenchReadiness() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        #expect(HarborConnectionReadiness.recentlyVerified(
+            health: .available("ok"), checkedAt: now.addingTimeInterval(-20), now: now
+        ))
+        #expect(!HarborConnectionReadiness.recentlyVerified(
+            health: .available("ok"), checkedAt: nil, now: now
+        ))
+        #expect(!HarborConnectionReadiness.recentlyVerified(
+            health: .available("ok"), checkedAt: now.addingTimeInterval(-901), now: now
+        ))
+        #expect(!HarborConnectionReadiness.recentlyVerified(
+            health: .unavailable("offline"), checkedAt: now, now: now
+        ))
+        #expect(!HarborConnectionReadiness.recentlyVerified(
+            health: .checking, checkedAt: now, now: now
+        ))
+    }
+
     @Test("Editing subscription retains ID and validates name and HTTPS URL")
     func editingSubscription() throws {
         let original = HarborProxySubscription(
@@ -205,6 +323,23 @@ struct HarborNetworkProxyTests {
         #expect((allRules["rules"] as? [[String: Any]])?.first?["outboundTag"] as? String == "proxy")
     }
 
+    @Test("Health verification domains always use proxy before regional direct routes")
+    func healthVerificationRouting() throws {
+        let node = HarborProxyNode(name: "test", protocolName: "vless",
+            host: "test.example.com", port: 443,
+            credential: "00000000-0000-0000-0000-000000000001")
+        let data = try HarborXrayConfig.make(
+            node: node, httpPort: 18080, ruleMode: true,
+            routeVerificationViaProxy: true
+        )
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let routing = try #require(json["routing"] as? [String: Any])
+        let rules = try #require(routing["rules"] as? [[String: Any]])
+        #expect(rules.first?["outboundTag"] as? String == "proxy")
+        #expect(rules.first?["domain"] as? [String] == HarborXrayConfig.verificationHosts)
+        #expect(rules.dropFirst().contains { $0["domain"] as? [String] == ["geosite:cn"] })
+    }
+
     @Test("Custom forced domains are validated and precede all direct routes")
     func forcedDomainConfiguration() throws {
         let node = HarborProxyNode(name: "fixture", protocolName: "vless",
@@ -256,7 +391,8 @@ struct HarborNetworkProxyTests {
             credential: "00000000-0000-0000-0000-000000000001",
             network: "ws", security: "tls", sni: "node.example.com",
             headerHost: "node.example.com", path: "/")
-        let config = try HarborXrayConfig.make(node: node, httpPort: 18080, ruleMode: true)
+        let config = try HarborXrayConfig.make(node: node, httpPort: 18080,
+                                              ruleMode: true, routeVerificationViaProxy: true)
         let destination = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString + ".json")
         defer { try? FileManager.default.removeItem(at: destination) }

@@ -12,7 +12,7 @@ private enum HarborAnalyticsRange: String, CaseIterable, Identifiable {
 private enum HarborAnalyticsMetric: String, CaseIterable, Identifiable {
     case requests = "请求数"
     case token = "Token"
-    case latency = "响应"
+    case latency = "耗时"
 
     var id: String { rawValue }
 }
@@ -28,6 +28,13 @@ struct HarborAnalyticsView: View {
             ScrollView {
                     VStack(alignment: .leading, spacing: 15) {
                     header
+                    if model.activityEvents.count >= ConnectionActivityStore.maximumRetainedEvents {
+                        Label("活动明细已达到本机保留上限（5,000 条）；更早记录可能已被截断，当前统计不代表完整历史。",
+                              systemImage: "exclamationmark.triangle")
+                            .font(.system(size: 11))
+                            .foregroundStyle(HarborColors.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     summaryCards
                     trendCard(height: max(290, 290 + (available.size.height - 760) * 0.68))
                     performanceCard
@@ -79,7 +86,7 @@ struct HarborAnalyticsView: View {
         return HStack(spacing: 10) {
             metricCard("请求数", value: requestCount.formatted(), icon: "paperplane.fill", color: HarborColors.blue)
             metricCard("Token", value: compactNumber(tokenCount), icon: "square.stack.3d.up.fill", color: HarborColors.purple)
-            metricCard("平均响应", value: durationText(averageDuration), icon: "clock.fill", color: HarborColors.orange)
+            metricCard("平均任务耗时", value: durationText(averageDuration), icon: "clock.fill", color: HarborColors.orange)
             metricCard(
                 "成功率",
                 value: requestCount > 0
@@ -120,7 +127,7 @@ struct HarborAnalyticsView: View {
                         .frame(width: 90, alignment: .trailing)
                     Text("成功率")
                         .frame(width: 90, alignment: .trailing)
-                    Text("平均响应")
+                    Text("平均任务耗时")
                         .frame(width: 110, alignment: .trailing)
                 }
                 .font(.system(size: 10, weight: .semibold))

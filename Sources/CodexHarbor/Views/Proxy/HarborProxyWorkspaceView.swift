@@ -15,7 +15,6 @@ struct HarborProxyWorkspaceView: View {
     @State private var latencyFilter = "全部"
     @State private var showUnavailable = false
     @State private var latencyAscending: Bool? = nil
-    @State private var latencySortMetric: HarborProxyLatencyTestKind = .real
     @State private var page = 1
     @State private var pageSize = 10
     @State private var gridMode = false
@@ -106,12 +105,8 @@ struct HarborProxyWorkspaceView: View {
         if let ascending = latencyAscending {
             let position = Dictionary(uniqueKeysWithValues: result.enumerated().map { ($0.element.id, $0.offset) })
             result.sort { a, b in
-                let x = latencySortMetric == .tcp
-                    ? proxy.probeResults[a.id]?.tcpMilliseconds
-                    : proxy.probeResults[a.id]?.milliseconds
-                let y = latencySortMetric == .tcp
-                    ? proxy.probeResults[b.id]?.tcpMilliseconds
-                    : proxy.probeResults[b.id]?.milliseconds
+                let x = proxy.probeResults[a.id]?.milliseconds
+                let y = proxy.probeResults[b.id]?.milliseconds
                 switch (x, y) {
                 case let (lhs?, rhs?) where lhs != rhs: return ascending ? lhs < rhs : lhs > rhs
                 case (_?, nil): return true
@@ -824,35 +819,21 @@ struct HarborProxyWorkspaceView: View {
                 }
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.orange, prominence: .secondary))
             } else {
-                HStack(spacing: 8) {
-                    Button {
-                        Task { await proxy.testTCPLatency(sourceGroupNodes.map(\.id)) }
-                    } label: {
-                        Label("TCP 测速", systemImage: "dot.radiowaves.left.and.right")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
-                    .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-                    .disabled(sourceGroupNodes.isEmpty || proxy.busy)
-                    .help("仅测试节点服务器端口的 TCP 握手，不代表代理可用")
-
-                    Button {
-                        Task { await proxy.testRealLatency(sourceGroupNodes.map(\.id)) }
-                    } label: {
-                        Label("真实测速", systemImage: "speedometer")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
-                    .buttonStyle(HarborActionButtonStyle(tint: HarborColors.green, prominence: .secondary))
-                    .disabled(sourceGroupNodes.isEmpty || proxy.busy || !proxy.coreInstalled)
-                    .help("通过独立 Xray 的 SOCKS5 代理请求测速地址；不改变当前节点或系统代理")
+                Button {
+                    Task { await proxy.testRealLatency(sourceGroupNodes.map(\.id)) }
+                } label: {
+                    Label("真实测速", systemImage: "speedometer")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.green, prominence: .secondary))
+                .disabled(sourceGroupNodes.isEmpty || proxy.busy || !proxy.coreInstalled)
+                .help("通过独立 Xray 的 SOCKS5 代理请求测速地址；不改变当前节点或系统代理")
             }
 
             if gridMode {
-                latencySortButton(for: latencySortMetric)
+                latencySortButton
                     .frame(width: 96)
             }
 
@@ -880,19 +861,18 @@ struct HarborProxyWorkspaceView: View {
         }
     }
 
-    private func latencySortButton(for kind: HarborProxyLatencyTestKind) -> some View {
-        let selected = latencySortMetric == kind && latencyAscending != nil
+    private var latencySortButton: some View {
+        let selected = latencyAscending != nil
         return Button {
-            if selected {
+            if latencyAscending != nil {
                 latencyAscending = !(latencyAscending ?? false)
             } else {
-                latencySortMetric = kind
                 latencyAscending = true
             }
             page = 1
         } label: {
             HStack(spacing: 3) {
-                Text(kind == .tcp ? "TCP 延迟" : "真实延迟")
+                Text("真实延迟")
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
                 Image(systemName: !selected ? "arrow.up.arrow.down"
@@ -904,8 +884,7 @@ struct HarborProxyWorkspaceView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-        .help(kind == .tcp ? "按 TCP 握手延迟排序（不能证明代理可用）"
-              : "按真实代理请求延迟排序；节点名称中的 ms 并非本机测试结果")
+        .help("按真实代理请求延迟排序；节点名称中的 ms 并非本机测试结果")
     }
 
     private func modeButton(_ symbol: String, selected: Bool,
@@ -971,16 +950,12 @@ struct HarborProxyWorkspaceView: View {
                         Text("地区").frame(width: 76, alignment: .leading)
                     }
                     if compact {
-                        Text("TCP / 真实")
+                        Text("真实延迟")
                             .lineLimit(1)
                             .frame(width: 88, alignment: .leading)
                     } else {
-                        latencySortButton(for: .tcp).frame(width: 88, alignment: .leading)
-                        latencySortButton(for: .real).frame(width: 102, alignment: .leading)
+                        latencySortButton.frame(width: 102, alignment: .leading)
                     }
-                    Image(systemName: "dot.radiowaves.left.and.right").frame(width: 26)
-                        .help("单节点 TCP 测速")
-                        .accessibilityLabel("TCP 测速")
                     Image(systemName: "speedometer").frame(width: 26)
                         .help("单节点真实测速")
                         .accessibilityLabel("真实测速")
@@ -1061,7 +1036,6 @@ struct HarborProxyWorkspaceView: View {
         let connected = active && proxy.healthy
         let probe = proxy.probeResults[node.id]
         let delay = probe?.milliseconds
-        let tcpDelay = probe?.tcpMilliseconds
         let connecting = proxy.switchingNodeID == node.id
         let previewed = previewNodeID == node.id
         let rowBackground: Color = connected ? HarborColors.green.opacity(0.105)
@@ -1146,33 +1120,17 @@ struct HarborProxyWorkspaceView: View {
                             .frame(width: 76, alignment: .leading)
                     }
                     if compact {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("TCP " + (tcpDelay.map { "\($0)ms" }
-                                 ?? (proxy.latencyTestingIDs.contains(node.id)
-                                     && proxy.latencyTestKind == .tcp ? "测速中"
-                                     : (probe?.tcpTested == true ? "不可达" : "未测"))))
-                                .foregroundStyle(tcpDelay.map(tcpLatencyColor) ?? Color.secondary)
-                            Text("真实 " + realLatencyText(
-                                delay: delay, probe: probe, connected: connected,
-                                connecting: connecting, nodeID: node.id))
-                                .foregroundStyle(realLatencyTextColor(
-                                    delay: delay, probe: probe, connected: connected,
-                                    connecting: connecting, nodeID: node.id))
-                        }
+                        Text(realLatencyText(
+                            delay: delay, probe: probe, connected: connected,
+                            connecting: connecting, nodeID: node.id))
                         .font(.system(size: 9.2, weight: .medium))
                         .monospacedDigit()
+                        .foregroundStyle(realLatencyTextColor(
+                            delay: delay, probe: probe, connected: connected,
+                            connecting: connecting, nodeID: node.id))
                         .lineLimit(1)
                         .frame(width: 88, alignment: .leading)
                     } else {
-                        Text(tcpDelay.map { "\($0) ms" }
-                             ?? (proxy.latencyTestingIDs.contains(node.id)
-                                 && proxy.latencyTestKind == .tcp ? "测速中"
-                                 : (probe?.tcpTested == true ? "不可达" : "未测")))
-                            .font(.system(size: 10.1, weight: tcpDelay == nil ? .regular : .medium))
-                            .monospacedDigit()
-                            .foregroundStyle(tcpDelay.map(tcpLatencyColor) ?? Color.secondary)
-                            .lineLimit(1)
-                            .frame(width: 88, alignment: .leading)
                         Text(realLatencyText(
                             delay: delay, probe: probe, connected: connected,
                             connecting: connecting, nodeID: node.id))
@@ -1200,28 +1158,12 @@ struct HarborProxyWorkspaceView: View {
             }
 
             Button {
-                Task { await proxy.testTCPLatency([node.id]) }
-            } label: {
-                Image(systemName: proxy.latencyTestingIDs.contains(node.id)
-                      && proxy.latencyTestKind == .tcp ? "hourglass"
-                      : "dot.radiowaves.left.and.right")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(proxy.latencyTestingIDs.contains(node.id)
-                                     && proxy.latencyTestKind == .tcp
-                                     ? HarborColors.orange : HarborColors.blue)
-                    .frame(width: 26, height: 30)
-            }
-            .disabled(proxy.latencyTesting || proxy.busy)
-            .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue, cornerRadius: 7))
-            .help("TCP 测速：只测试服务器端口握手")
-            Button {
                 Task { await proxy.testRealLatency([node.id]) }
             } label: {
                 Image(systemName: proxy.latencyTestingIDs.contains(node.id)
-                      && proxy.latencyTestKind == .real ? "hourglass" : "speedometer")
+                      ? "hourglass" : "speedometer")
                     .font(.system(size: 11.5))
                     .foregroundStyle(proxy.latencyTestingIDs.contains(node.id)
-                                     && proxy.latencyTestKind == .real
                                      ? HarborColors.orange : HarborColors.green)
                     .frame(width: 26, height: 30)
             }
@@ -1270,7 +1212,6 @@ struct HarborProxyWorkspaceView: View {
         let connecting = proxy.switchingNodeID == node.id
         let probe = proxy.probeResults[node.id]
         let delay = probe?.milliseconds
-        let tcpDelay = probe?.tcpMilliseconds
         let previewed = previewNodeID == node.id
         let cardBackground: Color = connected ? HarborColors.green.opacity(0.105)
             : ((active || connecting) ? HarborColors.orange.opacity(0.07)
@@ -1323,19 +1264,13 @@ struct HarborProxyWorkspaceView: View {
                         Text("\(regionFlag(node)) \(location(of: node))")
                             .help(regionHint(node))
                         Spacer(minLength: 2)
-                        VStack(alignment: .trailing, spacing: 2) {
-                            Text(tcpDelay.map { "TCP \($0) ms" }
-                                 ?? (probe?.tcpTested == true ? "TCP 不可达" : "TCP 未测"))
-                                .lineLimit(1)
-                                .foregroundStyle(tcpDelay.map(tcpLatencyColor) ?? Color.secondary)
-                            Text(delay.map { "真实 \($0) ms" }
-                                 ?? (probe?.realTested == true ? "真实不可用" : "真实未测"))
-                                .lineLimit(1)
-                                .font(.system(size: 10.5, weight: delay == nil ? .regular : .semibold))
-                                .monospacedDigit()
-                                .foregroundStyle(delay.map(latencyColor) ?? Color.secondary)
-                                .help(probe?.realFailureReason ?? "真实代理请求延迟")
-                        }
+                        Text(delay.map { "\($0) ms" }
+                             ?? (probe?.realTested == true ? "不可用" : "未测"))
+                            .lineLimit(1)
+                            .font(.system(size: 10.5, weight: delay == nil ? .regular : .semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(delay.map(latencyColor) ?? Color.secondary)
+                            .help(probe?.realFailureReason ?? "真实代理请求延迟")
                     }
                     .font(.system(size: 9.5))
                 }
@@ -1361,22 +1296,10 @@ struct HarborProxyWorkspaceView: View {
                 }
                 .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.orange))
                 Button {
-                    Task { await proxy.testTCPLatency([node.id]) }
-                } label: {
-                    Image(systemName: proxy.latencyTestingIDs.contains(node.id)
-                          && proxy.latencyTestKind == .tcp ? "hourglass"
-                          : "dot.radiowaves.left.and.right")
-                        .foregroundStyle(HarborColors.blue)
-                        .frame(width: 27, height: 27)
-                }
-                .disabled(proxy.latencyTesting || proxy.busy)
-                .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue, cornerRadius: 7))
-                .help("TCP 测速：只测试服务器端口握手")
-                Button {
                     Task { await proxy.testRealLatency([node.id]) }
                 } label: {
                     Image(systemName: proxy.latencyTestingIDs.contains(node.id)
-                          && proxy.latencyTestKind == .real ? "hourglass" : "speedometer")
+                          ? "hourglass" : "speedometer")
                         .foregroundStyle(HarborColors.green)
                         .frame(width: 27, height: 27)
                 }
@@ -1524,16 +1447,10 @@ struct HarborProxyWorkspaceView: View {
         return HarborColors.red
     }
 
-    private func tcpLatencyColor(_ milliseconds: Int) -> Color {
-        if milliseconds < 200 { return HarborColors.green }
-        if milliseconds < 500 { return HarborColors.orange }
-        return HarborColors.red
-    }
-
     private func realLatencyText(delay: Int?, probe: HarborProxyProbeResult?,
                                  connected: Bool, connecting: Bool, nodeID: String) -> String {
         if connecting { return "切换中" }
-        if proxy.latencyTestingIDs.contains(nodeID), proxy.latencyTestKind == .real {
+        if proxy.latencyTestingIDs.contains(nodeID) {
             return "测速中"
         }
         if let delay {
@@ -1545,7 +1462,7 @@ struct HarborProxyWorkspaceView: View {
     private func realLatencyTextColor(delay: Int?, probe: HarborProxyProbeResult?,
                                       connected: Bool, connecting: Bool, nodeID: String) -> Color {
         if connecting { return HarborColors.orange }
-        if proxy.latencyTestingIDs.contains(nodeID), proxy.latencyTestKind == .real {
+        if proxy.latencyTestingIDs.contains(nodeID) {
             return HarborColors.orange
         }
         if let delay { return latencyColor(delay) }

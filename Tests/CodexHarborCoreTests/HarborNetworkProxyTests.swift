@@ -39,14 +39,13 @@ struct HarborNetworkProxyTests {
         #expect(!HarborProxyRuntimeIdentity.matches(configuration: Data("{}".utf8), node: node))
     }
 
-    @Test("A TLS or upstream timeout does not erase successful TCP measurement")
+    @Test("A real-proxy failure retains its safe diagnostic reason")
     func failedRealProbeReason() {
         let result = HarborProxyProbeResult(
-            milliseconds: nil, tcpMilliseconds: 35, realTested: true,
-            tcpTested: true, realFailureReason: "HTTPS 超时（TLS / WebSocket / 上游网络）"
+            milliseconds: nil, realTested: true,
+            realFailureReason: "HTTPS 超时（TLS / WebSocket / 上游网络）"
         )
         #expect(!result.succeeded)
-        #expect(result.tcpMilliseconds == 35)
         #expect(result.realFailureReason?.contains("超时") == true)
     }
     @Test("Workbench fits the minimum-height desktop window without clipping")
@@ -76,16 +75,14 @@ struct HarborNetworkProxyTests {
         #expect(HarborProxyMeasurementLabel.explanation.contains("SOCKS5"))
         #expect(HarborProxyMeasurementLabel.explanation.contains("v2rayN"))
         #expect(HarborProxyLatencyPolicy.parallelCount == 4)
-        #expect(HarborProxyLatencyPolicy.connectTimeoutSeconds == 2)
         #expect(HarborProxyLatencyPolicy.requestTimeoutSeconds == 5)
         #expect(HarborProxyLatencyPolicy.realPingRequestCount == 2)
         #expect(HarborProxyLatencyPolicy.realPingPauseMilliseconds == 100)
         #expect(HarborProxyLatencyPolicy.listenerStartupTimeoutMilliseconds == 3_000)
         #expect(HarborProxyLatencyPolicy.goodUpperBoundMilliseconds == 1_500)
         #expect(HarborProxyLatencyPolicy.warningUpperBoundMilliseconds == 2_000)
-        let result = HarborProxyProbeResult(milliseconds: 1_650, tcpMilliseconds: 197)
+        let result = HarborProxyProbeResult(milliseconds: 1_650)
         #expect(result.milliseconds == 1_650)
-        #expect(result.tcpMilliseconds == 197)
         #expect(result.succeeded)
     }
 
@@ -133,39 +130,12 @@ struct HarborNetworkProxyTests {
         #expect(HarborProxyLatencyPolicy.realPingBatchSize == 1_000)
     }
 
-    @Test("TCP and HTTPS probes retain independent measured/failed/unmeasured states")
-    func independentProbeResults() {
-        let tcpOnly = HarborProxyProbeResult(
-            milliseconds: nil, tcpMilliseconds: 82,
-            realTested: false, tcpTested: true
-        )
-        #expect(tcpOnly.milliseconds == nil)
-        #expect(tcpOnly.tcpMilliseconds == 82)
-        #expect(!tcpOnly.realTested)
-        #expect(tcpOnly.tcpTested)
-
-        let realFailed = HarborProxyProbeResult(
-            milliseconds: nil, tcpMilliseconds: 82,
-            realTested: true, tcpTested: true
-        )
-        #expect(realFailed.realTested)
-        #expect(realFailed.tcpMilliseconds == 82)
-
-        let realOnly = HarborProxyProbeResult(
-            milliseconds: 110, realTested: true, tcpTested: false
-        )
-        #expect(realOnly.milliseconds == 110)
-        #expect(realOnly.tcpMilliseconds == nil)
-        #expect(!realOnly.tcpTested)
-    }
-
-    @Test("Failed real probes use bounded retry backoff without confusing TCP freshness")
+    @Test("Failed real probes use bounded retry backoff")
     func failedProbeRetryPolicy() {
         let now = Date(timeIntervalSince1970: 100_000)
         let firstFailure = HarborProxyProbeResult(
-            milliseconds: nil, tcpMilliseconds: 20, checkedAt: now,
-            realTested: true, tcpTested: true, realCheckedAt: now,
-            tcpCheckedAt: now.addingTimeInterval(300), consecutiveRealFailures: 1
+            milliseconds: nil, checkedAt: now,
+            realTested: true, realCheckedAt: now, consecutiveRealFailures: 1
         )
         #expect(!firstFailure.shouldRetryFailure(now: now.addingTimeInterval(599)))
         #expect(firstFailure.shouldRetryFailure(now: now.addingTimeInterval(600)))

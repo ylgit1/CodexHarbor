@@ -462,42 +462,6 @@ enum HarborNodeLatencyTester {
         portLock.unlock()
     }
 
-    /// Fast server-port reachability only. This intentionally does not claim
-    /// that credentials, TLS, the proxy protocol, or internet egress work.
-    static func measureTCP(node: HarborProxyNode,
-                           cancellation: HarborLatencyCancellation) async -> Int? {
-        await Task.detached(priority: .utility) {
-            guard !cancellation.isCancelled,
-                  !node.host.isEmpty,
-                  (1...65_535).contains(node.port) else { return nil }
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
-            // macOS nc expects IPv6 literals without URL-style square brackets.
-            // Force AF_INET6 for literal IPv6; DNS hostnames stay dual-stack.
-            let socketHost = HarborIPAddress.socketHost(node.host)
-            let ipv6 = HarborIPAddress.normalizedLiteral(socketHost)?.contains(":") == true
-            process.arguments = (ipv6 ? ["-6"] : []) + [
-                "-G", String(HarborProxyLatencyPolicy.connectTimeoutSeconds),
-                "-w", String(HarborProxyLatencyPolicy.connectTimeoutSeconds),
-                "-z", socketHost, String(node.port)
-            ]
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            guard let token = cancellation.observe({
-                if process.isRunning { process.terminate() }
-            }) else { return nil }
-            defer { cancellation.removeObserver(token) }
-            let started = ContinuousClock.now
-            do { try process.run() } catch { return nil }
-            if cancellation.isCancelled, process.isRunning { process.terminate() }
-            process.waitUntilExit()
-            guard process.terminationStatus == 0, !cancellation.isCancelled else { return nil }
-            let duration = started.duration(to: .now).components
-            return max(1, Int(duration.seconds * 1_000
-                + duration.attoseconds / 1_000_000_000_000_000))
-        }.value
-    }
-
     static func measure(node: HarborProxyNode, root: URL, ruleMode: Bool,
                         forcedProxyDomains: [String] = HarborProxyDomainRules.defaults,
                         cancellation: HarborLatencyCancellation) async -> HarborNodeDelayReport {

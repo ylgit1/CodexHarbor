@@ -42,7 +42,6 @@ public enum HarborProxyRegion: String, CaseIterable, Sendable {
 public enum HarborProxyLatencyPolicy {
     public static let parallelCount = 4
     public static let realPingBatchSize = 1_000
-    public static let connectTimeoutSeconds = 2
     // v2rayN ConnectionHandler.GetRealPingTime uses Global.LocalFetch (5s)
     // for two requests to the configured SpeedPingTestUrl.
     public static let requestTimeoutSeconds = 5
@@ -92,30 +91,20 @@ public enum HarborProxyRealPingTarget {
 
 public struct HarborProxyProbeResult: Codable, Sendable, Equatable {
     public var milliseconds: Int?
-    public var tcpMilliseconds: Int?
     public var checkedAt: Date
-    /// A TCP-only probe must never mark HTTPS as failed (or vice versa).
     public var realTested: Bool
-    public var tcpTested: Bool
     public var realFailureReason: String?
-    /// Separate timestamps keep a fresh TCP probe from making an old real
-    /// proxy result look current. Optional fields preserve existing state.
     public var realCheckedAt: Date?
-    public var tcpCheckedAt: Date?
     public var consecutiveRealFailures: Int?
     public var succeeded: Bool { milliseconds != nil }
-    public init(milliseconds: Int?, tcpMilliseconds: Int? = nil, checkedAt: Date = .now,
-                realTested: Bool? = nil, tcpTested: Bool? = nil,
-                realFailureReason: String? = nil, realCheckedAt: Date? = nil,
-                tcpCheckedAt: Date? = nil, consecutiveRealFailures: Int? = nil) {
+    public init(milliseconds: Int?, checkedAt: Date = .now,
+                realTested: Bool? = nil, realFailureReason: String? = nil,
+                realCheckedAt: Date? = nil, consecutiveRealFailures: Int? = nil) {
         self.milliseconds = milliseconds
-        self.tcpMilliseconds = tcpMilliseconds
         self.checkedAt = checkedAt
         self.realTested = realTested ?? (milliseconds != nil)
-        self.tcpTested = tcpTested ?? (tcpMilliseconds != nil)
         self.realFailureReason = realFailureReason
         self.realCheckedAt = realCheckedAt ?? (self.realTested ? checkedAt : nil)
-        self.tcpCheckedAt = tcpCheckedAt ?? (self.tcpTested ? checkedAt : nil)
         self.consecutiveRealFailures = consecutiveRealFailures
     }
 

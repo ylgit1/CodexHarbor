@@ -191,11 +191,6 @@ private final class HarborSystemProxyChangeMonitor: @unchecked Sendable {
     }
 }
 
-enum HarborProxyLatencyTestKind: Sendable {
-    case tcp
-    case real
-}
-
 @MainActor
 final class HarborProxyManager: ObservableObject {
     static let shared = HarborProxyManager()
@@ -221,13 +216,10 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var probeResults: [String: HarborProxyProbeResult] = [:]
     @Published private(set) var nodeServerLocations: [String: HarborProxyIPLocation] = [:]
     @Published private(set) var nodeExitLocations: [String: HarborProxyExitLocation] = [:]
-    @Published private(set) var lastCompletedLatencyTestKind: HarborProxyLatencyTestKind?
-    @Published private(set) var latencyCompletionSerial = 0
     @Published private(set) var latencyTesting = false
     @Published private(set) var installingCore = false
     @Published private(set) var latencyCurrentID: String?
     @Published private(set) var latencyTestingIDs: Set<String> = []
-    @Published private(set) var latencyTestKind: HarborProxyLatencyTestKind?
     @Published private(set) var latencyCompleted = 0
     @Published private(set) var latencyTotal = 0
     private var latencyCancellationRequested = false
@@ -591,9 +583,7 @@ final class HarborProxyManager: ObservableObject {
         for node in oldResults {
             guard let previous = probeResults[node.id] else { continue }
             probeResults[node.id] = HarborProxyProbeResult(
-                milliseconds: nil, tcpMilliseconds: previous.tcpMilliseconds,
-                checkedAt: previous.checkedAt, realTested: false,
-                tcpTested: previous.tcpTested
+                milliseconds: nil, checkedAt: previous.checkedAt, realTested: false
             )
         }
         persist()
@@ -928,7 +918,7 @@ final class HarborProxyManager: ObservableObject {
                 busy = false
                 if !testIDs.isEmpty {
                     await testLatency(
-                        Array(testIDs), kind: .real,
+                        Array(testIDs),
                         finalization: .init(
                             subscriptionID: id,
                             newNodeIDs: testIDs.subtracting(update.previousNodeIDs),
@@ -1041,7 +1031,7 @@ final class HarborProxyManager: ObservableObject {
             busy = false
             if !testIDs.isEmpty {
                 await testLatency(
-                    Array(testIDs), kind: .real,
+                    Array(testIDs),
                     finalization: .init(subscriptionID: id,
                                         newNodeIDs: testIDs.subtracting(update.previousNodeIDs),
                                         initialImport: update.previousNodeIDs.isEmpty)
@@ -1484,10 +1474,6 @@ final class HarborProxyManager: ObservableObject {
             : "内核已启动，当前节点对 v2rayN 真实测速地址的请求未通过"
     }
 
-    func testTCPLatency(_ ids: [String]) async {
-        await testLatency(ids, kind: .tcp)
-    }
-
     func testRealLatency(_ ids: [String]) async {
         let requested = Set(ids)
         let requestedNodes = nodes.filter { requested.contains($0.id) }
@@ -1504,7 +1490,7 @@ final class HarborProxyManager: ObservableObject {
         } else {
             finalization = nil
         }
-        await testLatency(ids, kind: .real, finalization: finalization)
+        await testLatency(ids, finalization: finalization)
     }
 
     private func proxyResultIsUntested(_ id: String) -> Bool {
@@ -1536,13 +1522,10 @@ final class HarborProxyManager: ObservableObject {
 
     private func testLatency(
         _ ids: [String],
-        kind: HarborProxyLatencyTestKind,
         finalization: SubscriptionProbeFinalization? = nil
     ) async {
-        guard !latencyTesting, !busy, kind == .tcp || coreInstalled else {
-            if kind == .real && !coreInstalled {
-                detail = "内置 Xray 不完整，暂时无法进行真实测速"
-            }
+        guard !latencyTesting, !busy, coreInstalled else {
+            if !coreInstalled { detail = "内置 Xray 不完整，暂时无法进行真实测速" }
             return
         }
         let uniqueIDs = Array(NSOrderedSet(array: ids)) as? [String] ?? ids
@@ -1550,7 +1533,6 @@ final class HarborProxyManager: ObservableObject {
         guard !targets.isEmpty else { return }
 
         latencyTesting = true
-        latencyTestKind = kind
         latencyCancellationRequested = false
         let cancellation = HarborLatencyCancellation()
         latencyCancellation = cancellation
@@ -1561,17 +1543,14 @@ final class HarborProxyManager: ObservableObject {
             latencyTesting = false
             latencyCurrentID = nil
             latencyTestingIDs = []
-            latencyTestKind = nil
             latencyCancellationRequested = false
             latencyCancellation = nil
         }
         let latencyRoot = root
         let latencyRuleMode = routingRules
         let latencyForcedDomains = forcedProxyDomains
-        let sharedRealBatch = kind == .real
-            ? await HarborNodeLatencyTester.startRealBatch(
-                nodes: targets, root: latencyRoot, cancellation: cancellation)
-            : nil
+        let sharedRealBatch = await HarborNodeLatencyTester.startRealBatch(
+            nodes: targets, root: latencyRoot, cancellation: cancellation)
         let batchSize = sharedRealBatch == nil
             ? HarborProxyLatencyPolicy.parallelCount
             : min(targets.count, HarborProxyLatencyPolicy.realPingBatchSize)
@@ -1583,12 +1562,6 @@ final class HarborProxyManager: ObservableObject {
             await withTaskGroup(of: (String, Int?, String?).self) { group in
                 for node in batch {
                     group.addTask {
-                        if kind == .tcp {
-                            let milliseconds = await HarborNodeLatencyTester.measureTCP(
-                                node: node, cancellation: cancellation
-                            )
-                            return (node.id, milliseconds, nil)
-                        }
                         let report: HarborNodeDelayReport
                         if let sharedRealBatch {
                             report = await sharedRealBatch.measure(node: node)
@@ -1607,36 +1580,30 @@ final class HarborProxyManager: ObservableObject {
                     guard !latencyCancellationRequested, !Task.isCancelled else { continue }
                     let previous = probeResults[id]
                     let checkedAt = Date.now
-                    let failures = kind == .real
-                        ? (result == nil ? (previous?.consecutiveRealFailures ?? 0) + 1 : 0)
-                        : previous?.consecutiveRealFailures
+                    let failures = result == nil
+                        ? (previous?.consecutiveRealFailures ?? 0) + 1 : 0
                     probeResults[id] = HarborProxyProbeResult(
-                        milliseconds: kind == .real ? result : previous?.milliseconds,
-                        tcpMilliseconds: kind == .tcp ? result : previous?.tcpMilliseconds,
+                        milliseconds: result,
                         checkedAt: checkedAt,
-                        realTested: kind == .real || previous?.realTested == true,
-                        tcpTested: kind == .tcp || previous?.tcpTested == true,
-                        realFailureReason: kind == .real ? failure : previous?.realFailureReason,
-                        realCheckedAt: kind == .real ? checkedAt : previous?.effectiveRealCheckedAt,
-                        tcpCheckedAt: kind == .tcp ? checkedAt : previous?.tcpCheckedAt,
+                        realTested: true,
+                        realFailureReason: failure,
+                        realCheckedAt: checkedAt,
                         consecutiveRealFailures: failures
                     )
-                    if kind == .real {
-                        let errorCategory = result == nil ? "failed" : "success"
-                        // Fixed categories only: no raw Xray stderr, address or secrets.
-                        let category: String
-                        switch failure {
-                        case nil: category = "ok"
-                        case let reason? where reason.contains("超时"): category = "timeout"
-                        case let reason? where reason.contains("TLS"): category = "tls"
-                        case let reason? where reason.contains("DNS"): category = "dns"
-                        case let reason? where reason.contains("连接"): category = "connect"
-                        case let reason? where reason.contains("监听"): category = "listener"
-                        default: category = "other"
-                        }
-                        proxyAudit("real_probe_\(errorCategory)", nodeID: id,
-                                   note: "reason=\(category)")
+                    let errorCategory = result == nil ? "failed" : "success"
+                    // Fixed categories only: no raw Xray stderr, address or secrets.
+                    let category: String
+                    switch failure {
+                    case nil: category = "ok"
+                    case let reason? where reason.contains("超时"): category = "timeout"
+                    case let reason? where reason.contains("TLS"): category = "tls"
+                    case let reason? where reason.contains("DNS"): category = "dns"
+                    case let reason? where reason.contains("连接"): category = "connect"
+                    case let reason? where reason.contains("监听"): category = "listener"
+                    default: category = "other"
                     }
+                    proxyAudit("real_probe_\(errorCategory)", nodeID: id,
+                               note: "reason=\(category)")
                     if result != nil { succeeded += 1 }
                     latencyTestingIDs.remove(id)
                     latencyCompleted += 1
@@ -1646,27 +1613,22 @@ final class HarborProxyManager: ObservableObject {
         if let sharedRealBatch {
             await Task.detached(priority: .utility) { sharedRealBatch.close() }.value
         }
-        let label = kind == .tcp ? "TCP 测速" : "真实测速"
-        proxyAudit(kind == .tcp ? "tcp_probe_batch_done" : "real_probe_batch_done",
+        proxyAudit("real_probe_batch_done",
                    note: "tested=\(latencyCompleted) successes=\(succeeded)")
         if !latencyCancellationRequested && !Task.isCancelled {
-            lastCompletedLatencyTestKind = kind
-            latencyCompletionSerial += 1
-            if kind == .real, let finalization {
+            if let finalization {
                 finalizeSubscriptionProbes(finalization)
             }
-            if kind == .real {
-                for id in Set(targets.map(\.subscriptionID)).filter({ !$0.isEmpty }) {
-                    refreshAutomaticNames(for: id)
-                }
-                enqueueExitGeoRefresh(for: targets)
+            for id in Set(targets.map(\.subscriptionID)).filter({ !$0.isEmpty }) {
+                refreshAutomaticNames(for: id)
             }
+            enqueueExitGeoRefresh(for: targets)
             persist()
         }
         detail = latencyCancellationRequested || Task.isCancelled
             ? "已停止测速，完成 \(latencyCompleted)/\(latencyTotal) 个节点"
-            : "\(label)完成：可用 \(succeeded)，不可用 \(latencyCompleted - succeeded)"
-        if kind == .real, targets.count == 1,
+            : "真实测速完成：可用 \(succeeded)，不可用 \(latencyCompleted - succeeded)"
+        if targets.count == 1,
            let reason = probeResults[targets[0].id]?.realFailureReason,
            !latencyCancellationRequested {
             detail += " · " + reason

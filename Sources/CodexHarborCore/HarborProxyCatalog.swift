@@ -204,6 +204,11 @@ public struct HarborProxyIPLocation: Codable, Equatable, Sendable {
         }
     }
 
+    /// Unknown lookup results must never be recycled as resolved GeoIP data.
+    public var verifiedCountryCode: String? {
+        countryCode == "ZZ" ? nil : countryCode
+    }
+
     public var displayRegion: String {
         countryCode == "ZZ" ? HarborProxyAutomaticName.unresolvedRegion : countryName
     }
@@ -219,7 +224,7 @@ public struct HarborProxyIPLocation: Codable, Equatable, Sendable {
     }
 
     public func matches(_ resolvedIP: String) -> Bool {
-        ip == resolvedIP && countryCode.count == 2
+        HarborIPAddress.equivalent(ip, resolvedIP) && countryCode.count == 2
     }
 }
 

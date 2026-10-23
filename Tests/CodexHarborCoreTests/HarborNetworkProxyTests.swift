@@ -173,6 +173,33 @@ struct HarborNetworkProxyTests {
         #expect((try? JSONDecoder().decode(HarborProxyIPLocation.self, from: encoded!)) == stored)
     }
 
+    @Test("IPv6 normalization handles brackets, compression and equivalent GeoIP responses")
+    func normalizedIPv6ServerAddress() {
+        let literal = "2400:cb00:2049:2fac:7a0:eb35:352c:78a5"
+        #expect(HarborIPAddress.normalizedLiteral("[\(literal)]") == literal)
+        #expect(HarborIPAddress.socketHost("[\(literal)]") == literal)
+        #expect(HarborIPAddress.normalizedLiteral("2001:0DB8:0000:0000:0000:0000:0000:0001") == "2001:db8::1")
+        #expect(HarborIPAddress.equivalent("[2001:db8::1]", "2001:0db8:0:0:0:0:0:1"))
+        #expect(!HarborIPAddress.equivalent("2001:db8::1", "2001:db8::2"))
+        #expect(!HarborIPAddress.equivalent("1.1.1.1", "::ffff:1.1.1.1"))
+        #expect(HarborIPAddress.socketHost("node.example.com") == "node.example.com")
+        #expect(HarborIPAddress.normalizedLiteral("not-an-ip") == nil)
+        #expect(HarborIPAddress.normalizedLiteral("[not-an-ip]") == nil)
+        #expect(HarborIPAddress.equivalent("[172.64.155.175]", "172.64.155.175"))
+    }
+
+    @Test("An unknown GeoIP country never counts as a reusable result")
+    func unknownGeoIPCannotBeReused() {
+        let unresolved = HarborProxyIPLocation(ip: "2606:4700::1", countryCode: "ZZ")
+        #expect(unresolved.matches("[2606:4700:0:0:0:0:0:1]"))
+        #expect(unresolved.verifiedCountryCode == nil)
+        #expect(unresolved.displayRegion == HarborProxyAutomaticName.unresolvedRegion)
+        let verified = HarborProxyIPLocation(ip: "2606:4700:0:0:0:0:0:1", countryCode: "US")
+        #expect(verified.matches("[2606:4700::1]"))
+        #expect(verified.verifiedCountryCode == "US")
+        #expect(!verified.matches("2606:4700::2"))
+    }
+
     @Test("Intentional proxy stop is not confused with an unexpected crash")
     func unexpectedExitDecision() {
         #expect(HarborProxyLivenessPolicy.shouldHandleUnexpectedExit(

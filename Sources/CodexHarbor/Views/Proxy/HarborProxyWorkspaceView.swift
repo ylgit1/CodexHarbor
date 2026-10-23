@@ -1123,7 +1123,8 @@ struct HarborProxyWorkspaceView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("TCP " + (tcpDelay.map { "\($0)ms" }
                                  ?? (proxy.latencyTestingIDs.contains(node.id)
-                                     && proxy.latencyTestKind == .tcp ? "测速中" : "--")))
+                                     && proxy.latencyTestKind == .tcp ? "测速中"
+                                     : (probe?.tcpTested == true ? "不可达" : "未测"))))
                                 .foregroundStyle(tcpDelay.map(tcpLatencyColor) ?? Color.secondary)
                             Text("真实 " + realLatencyText(
                                 delay: delay, probe: probe, connected: connected,

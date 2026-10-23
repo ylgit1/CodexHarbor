@@ -1,3 +1,4 @@
+import CodexHarborCore
 import Foundation
 import Darwin
 
@@ -13,8 +14,13 @@ enum HarborNodeGeoIPResolver {
 
     static func resolvedIP(for host: String) async -> String? {
         await Task.detached(priority: .utility) {
-            let name = host.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = HarborIPAddress.socketHost(host)
             guard !name.isEmpty, name.utf8.count < 254 else { return nil as String? }
+            // A literal IPv6 address (including URL-style [brackets]) needs
+            // no DNS lookup and must not be passed to getaddrinfo with brackets.
+            if let literal = HarborIPAddress.normalizedLiteral(name) {
+                return isPublic(literal) ? literal : nil
+            }
             var hints = addrinfo()
             hints.ai_family = AF_UNSPEC
             hints.ai_socktype = SOCK_STREAM
@@ -51,8 +57,9 @@ enum HarborNodeGeoIPResolver {
     static func countryCode(for ip: String, proxyPort: Int? = nil) async -> String? {
         // Only the public IP is sent to the geolocation provider; node labels,
         // subscriptions, credentials and DNS host names are never transmitted.
-        guard isPublic(ip),
-              let encoded = ip.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+        guard let canonicalIP = HarborIPAddress.normalizedLiteral(ip),
+              isPublic(canonicalIP),
+              let encoded = canonicalIP.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
               let url = URL(string: "https://ipwho.is/\(encoded)?fields=success,ip,country_code") else {
             return nil
         }
@@ -73,17 +80,20 @@ enum HarborNodeGeoIPResolver {
               (response as? HTTPURLResponse)?.statusCode == 200,
               data.count < 16_384,
               let result = try? JSONDecoder().decode(Response.self, from: data),
-              result.success, result.ip == ip,
+              result.success,
+              let returnedIP = result.ip,
+              HarborIPAddress.equivalent(returnedIP, canonicalIP),
               let code = result.country_code?.uppercased(),
-              code.count == 2, code.allSatisfy({ $0.isASCII && $0.isLetter }) else {
+              code.count == 2, code.utf8.allSatisfy({ (65...90).contains($0) }) else {
             return nil
         }
         return code
     }
 
     static func isPublic(_ ip: String) -> Bool {
+        guard let normalized = HarborIPAddress.normalizedLiteral(ip) else { return false }
         var v4 = in_addr()
-        if inet_pton(AF_INET, ip, &v4) == 1 {
+        if inet_pton(AF_INET, normalized, &v4) == 1 {
             let bits = UInt32(bigEndian: v4.s_addr)
             let a = (bits >> 24) & 0xff
             let b = (bits >> 16) & 0xff
@@ -95,7 +105,7 @@ enum HarborNodeGeoIPResolver {
                 && !(a == 198 && (b == 18 || b == 19))
             }
         var v6 = in6_addr()
-        if inet_pton(AF_INET6, ip, &v6) == 1 {
+        if inet_pton(AF_INET6, normalized, &v6) == 1 {
             let bytes = withUnsafeBytes(of: &v6) { Array($0) }
             // Unspecified, loopback, unique-local, multicast and link-local.
             return !(bytes.prefix(15).allSatisfy { $0 == 0 })

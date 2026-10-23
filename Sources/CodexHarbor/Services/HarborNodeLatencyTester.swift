@@ -464,10 +464,14 @@ enum HarborNodeLatencyTester {
                   (1...65_535).contains(node.port) else { return nil }
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
-            process.arguments = [
+            // macOS nc expects IPv6 literals without URL-style square brackets.
+            // Force AF_INET6 for literal IPv6; DNS hostnames stay dual-stack.
+            let socketHost = HarborIPAddress.socketHost(node.host)
+            let ipv6 = HarborIPAddress.normalizedLiteral(socketHost)?.contains(":") == true
+            process.arguments = (ipv6 ? ["-6"] : []) + [
                 "-G", String(HarborProxyLatencyPolicy.connectTimeoutSeconds),
                 "-w", String(HarborProxyLatencyPolicy.connectTimeoutSeconds),
-                "-z", node.host, String(node.port)
+                "-z", socketHost, String(node.port)
             ]
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice

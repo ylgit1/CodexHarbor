@@ -604,7 +604,9 @@ final class HarborProxyManager: ObservableObject {
         guard configurationLoaded else { return }
         let hosts = Array(Set(nodes.map { $0.host.lowercased() }.filter { !$0.isEmpty })).sorted()
         geoRefreshTask = Task(priority: .utility) { [weak self] in
-            var consecutiveFailures = 0
+            // Multiple subscription aliases can resolve to one IP. Never
+            // repeat an unsuccessful provider lookup within the same refresh.
+            var failedIPs = Set<String>()
             for host in hosts {
                 guard !Task.isCancelled, let self else { return }
                 guard let resolvedIP = await HarborNodeGeoIPResolver.resolvedIP(for: host),
@@ -621,22 +623,26 @@ final class HarborProxyManager: ObservableObject {
                     }
                     self.persist()
                 }
+                // resolveServerIPs stores "ZZ" until a GeoIP request succeeds.
+                // Reusing that placeholder here would permanently skip the
+                // provider for every node sharing the same server IP.
                 let reused = self.nodeServerLocations.values.first {
-                    $0.matches(resolvedIP)
-                }?.countryCode
+                    $0.matches(resolvedIP) && $0.verifiedCountryCode != nil
+                }?.verifiedCountryCode
                 let countryCode: String?
                 if let reused {
                     countryCode = reused
                 } else {
+                    // One failed address must not prevent later IPv6/IPv4
+                    // servers from being resolved. A failed shared IP is
+                    // attempted only once per pass, without caching "ZZ".
+                    if failedIPs.contains(resolvedIP) { continue }
                     countryCode = await HarborNodeGeoIPResolver.countryCode(
                         for: resolvedIP,
                         proxyPort: self.running && self.healthy ? self.localPort : nil
                     )
-                    // A provider outage should not trigger hundreds of timeouts.
-                    if countryCode == nil { consecutiveFailures += 1 }
-                    else { consecutiveFailures = 0 }
-                    if consecutiveFailures >= 2 { return }
-                    // Respect free provider limits; never fan out requests.
+                    if countryCode == nil { failedIPs.insert(resolvedIP) }
+                    // Respect free-provider request limits; no fan-out or timer.
                     try? await Task.sleep(for: .milliseconds(1100))
                 }
                 guard !Task.isCancelled,
@@ -1070,9 +1076,11 @@ final class HarborProxyManager: ObservableObject {
                 guard let ip else { continue }
                 resolved[host] = ip
                 let previous = nodeServerLocations[host]
-                let countryCode = previous?.matches(ip) == true
-                    ? previous?.countryCode
-                    : nodeServerLocations.values.first(where: { $0.matches(ip) })?.countryCode
+                let countryCode = (previous?.matches(ip) == true
+                    ? previous?.verifiedCountryCode : nil)
+                    ?? nodeServerLocations.values.first(where: {
+                        $0.matches(ip) && $0.verifiedCountryCode != nil
+                    })?.verifiedCountryCode
                 nodeServerLocations[host] = HarborProxyIPLocation(
                     ip: ip, countryCode: countryCode ?? "ZZ"
                 )

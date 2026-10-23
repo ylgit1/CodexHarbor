@@ -1,17 +1,15 @@
 # Codex Harbor installers
 
-Current release: `v0.1.5` (Apple Silicon / arm64)
+Current release: `v0.1.13` (Apple Silicon / arm64)
 
-- Versioned installer: `v0.1.5/Codex-Harbor-v0.1.5-arm64.dmg`
+- Versioned installer: `v0.1.13/Codex-Harbor-v0.1.13-arm64.dmg`
 - Latest installer: `latest/Codex-Harbor-arm64.dmg`
-- SHA-256: `6e4835c1144e91d801b5ea7c051adf15ebeae203671770083bf22e0e7592747c`
+- SHA-256: `27dfddac870ca910fe5e1032291acccfa4dc79cc89f17f52c2235f5fd59352b6`
 
 Download:
-- Gitee (large raw files require Gitee login):
-  https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg
-- Public no-login mirror:
-  https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.5/Codex-Harbor-v0.1.5-arm64.dmg
+- GitHub Release: https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.13/Codex-Harbor-v0.1.13-arm64.dmg
+- GitHub latest branch: https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg
+- Gitee (only after its separate push succeeds): https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg
 
-The DMG includes a signed Codex Harbor app, an Applications shortcut for
-drag-and-drop installation, and bundled Xray, geoip.dat and geosite.dat.
-Requires Apple Silicon and macOS 14 or newer.
+The DMG includes Codex Harbor and bundled Xray / GeoIP / GeoSite.
+Requires macOS 14+ on Apple Silicon. Local self-signed code signing is not Apple notarization.

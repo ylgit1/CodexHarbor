@@ -13,6 +13,7 @@ struct HarborProxyWorkspaceView: View {
     @State private var region = "全部"
     @State private var protocolFilter = "全部"
     @State private var latencyFilter = "全部"
+    @State private var showUnavailable = false
     @State private var latencyAscending: Bool? = nil
     @State private var latencySortMetric: HarborProxyLatencyTestKind = .real
     @State private var page = 1
@@ -64,14 +65,22 @@ struct HarborProxyWorkspaceView: View {
         }
     }
 
-    /// Once a subscription node has a real-test result, failed profiles stay
-    /// persisted but disappear from the default list. Untested profiles stay
-    /// visible until the first complete real-ping pass finishes.
+    /// A single transient failure remains visible. Repeated failures are kept
+    /// in an explicit recoverable view instead of disappearing permanently.
     private var groupNodes: [HarborProxyNode] {
         sourceGroupNodes.filter { node in
             guard let result = proxy.probeResults[node.id], result.realTested else { return true }
-            return result.succeeded
+            return result.succeeded || (result.consecutiveRealFailures ?? 1) < 2
+                || showUnavailable
         }
+    }
+
+    private var unavailableCount: Int {
+        sourceGroupNodes.filter {
+            guard let result = proxy.probeResults[$0.id] else { return false }
+            return result.realTested && !result.succeeded
+                && (result.consecutiveRealFailures ?? 1) >= 2
+        }.count
     }
 
     private var shownNodes: [HarborProxyNode] {
@@ -362,7 +371,7 @@ struct HarborProxyWorkspaceView: View {
                             .background(latencyColor(latency).opacity(0.09), in: Capsule())
                             .help(HarborProxyMeasurementLabel.explanation
                                   + " · 检测于 "
-                                  + (proxy.probeResults[node.id]?.checkedAt.formatted(
+                                  + (proxy.probeResults[node.id]?.effectiveRealCheckedAt?.formatted(
                                       date: .abbreviated, time: .shortened
                                   ) ?? "未知"))
                     }
@@ -845,6 +854,20 @@ struct HarborProxyWorkspaceView: View {
             if gridMode {
                 latencySortButton(for: latencySortMetric)
                     .frame(width: 96)
+            }
+
+            if unavailableCount > 0 {
+                Button {
+                    showUnavailable.toggle()
+                    page = 1
+                } label: {
+                    Label("不可用 \(unavailableCount)",
+                          systemImage: showUnavailable ? "eye.slash" : "eye")
+                        .font(.system(size: 10.5, weight: .medium))
+                }
+                .buttonStyle(HarborActionButtonStyle(
+                    tint: HarborColors.orange, prominence: .secondary))
+                .help(showUnavailable ? "隐藏连续测速失败的节点" : "显示连续测速失败的节点")
             }
 
             HStack(spacing: 2) {
@@ -1513,7 +1536,9 @@ struct HarborProxyWorkspaceView: View {
         if proxy.latencyTestingIDs.contains(nodeID), proxy.latencyTestKind == .real {
             return "测速中"
         }
-        if let delay { return "\(delay) ms" }
+        if let delay {
+            return "\(delay) ms" + (probe?.isStale() == true ? " · 旧" : "")
+        }
         return probe?.realTested == true ? "不可用" : "未测"
     }
 
@@ -1550,6 +1575,7 @@ struct HarborProxyWorkspaceView: View {
         region = "全部"
         protocolFilter = "全部"
         latencyFilter = "全部"
+        showUnavailable = false
     }
 
     private func location(of node: HarborProxyNode) -> String {

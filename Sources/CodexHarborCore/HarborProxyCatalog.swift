@@ -51,6 +51,16 @@ public enum HarborProxyLatencyPolicy {
     public static let listenerStartupTimeoutMilliseconds = 3_000
     public static let goodUpperBoundMilliseconds = 1_500
     public static let warningUpperBoundMilliseconds = 2_000
+    public static let activeHealthCheckInterval: TimeInterval = 5 * 60
+    public static let staleRealResultInterval: TimeInterval = 24 * 60 * 60
+    public static let failedRetryIntervals: [TimeInterval] = [10 * 60, 60 * 60, 6 * 60 * 60, 24 * 60 * 60]
+}
+
+public enum HarborProxyGeoIPPolicy {
+    public static let serverDNSCacheInterval: TimeInterval = 6 * 60 * 60
+    public static let exitRefreshInterval: TimeInterval = 7 * 24 * 60 * 60
+    public static let exitFailureRetryInterval: TimeInterval = 60 * 60
+    public static let countryCacheInterval: TimeInterval = 30 * 24 * 60 * 60
 }
 
 public enum HarborProxyMeasurementLabel {
@@ -88,16 +98,41 @@ public struct HarborProxyProbeResult: Codable, Sendable, Equatable {
     public var realTested: Bool
     public var tcpTested: Bool
     public var realFailureReason: String?
+    /// Separate timestamps keep a fresh TCP probe from making an old real
+    /// proxy result look current. Optional fields preserve existing state.
+    public var realCheckedAt: Date?
+    public var tcpCheckedAt: Date?
+    public var consecutiveRealFailures: Int?
     public var succeeded: Bool { milliseconds != nil }
     public init(milliseconds: Int?, tcpMilliseconds: Int? = nil, checkedAt: Date = .now,
                 realTested: Bool? = nil, tcpTested: Bool? = nil,
-                realFailureReason: String? = nil) {
+                realFailureReason: String? = nil, realCheckedAt: Date? = nil,
+                tcpCheckedAt: Date? = nil, consecutiveRealFailures: Int? = nil) {
         self.milliseconds = milliseconds
         self.tcpMilliseconds = tcpMilliseconds
         self.checkedAt = checkedAt
         self.realTested = realTested ?? (milliseconds != nil)
         self.tcpTested = tcpTested ?? (tcpMilliseconds != nil)
         self.realFailureReason = realFailureReason
+        self.realCheckedAt = realCheckedAt ?? (self.realTested ? checkedAt : nil)
+        self.tcpCheckedAt = tcpCheckedAt ?? (self.tcpTested ? checkedAt : nil)
+        self.consecutiveRealFailures = consecutiveRealFailures
+    }
+
+    public var effectiveRealCheckedAt: Date? {
+        realCheckedAt ?? (realTested ? checkedAt : nil)
+    }
+
+    public func shouldRetryFailure(now: Date = .now) -> Bool {
+        guard realTested, !succeeded, let checked = effectiveRealCheckedAt else { return false }
+        let failures = max(1, consecutiveRealFailures ?? 1)
+        let index = min(failures - 1, HarborProxyLatencyPolicy.failedRetryIntervals.count - 1)
+        return now.timeIntervalSince(checked) >= HarborProxyLatencyPolicy.failedRetryIntervals[index]
+    }
+
+    public func isStale(now: Date = .now) -> Bool {
+        guard let checked = effectiveRealCheckedAt else { return true }
+        return now.timeIntervalSince(checked) >= HarborProxyLatencyPolicy.staleRealResultInterval
     }
 }
 
@@ -139,14 +174,8 @@ public enum HarborProxySubscriptionRefreshPolicy {
 public enum HarborProxyAutomaticName {
     public static let unresolvedRegion = "待识别"
 
-    public static func speedTier(milliseconds: Int) -> String {
-        if milliseconds < HarborProxyLatencyPolicy.goodUpperBoundMilliseconds { return "高速" }
-        if milliseconds < HarborProxyLatencyPolicy.warningUpperBoundMilliseconds { return "中速" }
-        return "低速"
-    }
-
-    public static func make(region: String, milliseconds: Int, sequence: Int) -> String {
-        "\(region)-\(speedTier(milliseconds: milliseconds))-可用-\(String(format: "%03d", sequence))"
+    public static func make(region: String, protocolName: String, sequence: Int) -> String {
+        "\(region)-\(protocolName.uppercased())-\(String(format: "%03d", sequence))"
     }
 
     public static func sequence(from name: String?) -> Int? {
@@ -159,27 +188,32 @@ public enum HarborProxyAutomaticName {
     /// automatic name. Never infer it from a provider's node remark.
     public static func refreshed(
         _ nodes: [HarborProxyNode],
-        results: [String: HarborProxyProbeResult],
+        results _: [String: HarborProxyProbeResult],
         locations: [String: HarborProxyIPLocation],
         exitLocationsByNodeID: [String: HarborProxyIPLocation] = [:]
     ) -> [HarborProxyNode] {
-        var sequences: [String: Int] = [:]
+        var usedSequences = Set<Int>()
+        var sequencesByID: [String: Int] = [:]
+        var nextSequence = (nodes.compactMap { sequence(from: $0.automaticName) }.max() ?? 0) + 1
+        for node in nodes {
+            guard let sequence = sequence(from: node.automaticName),
+                  usedSequences.insert(sequence).inserted else { continue }
+            sequencesByID[node.id] = sequence
+        }
+        for node in nodes where sequencesByID[node.id] == nil {
+            while usedSequences.contains(nextSequence) { nextSequence += 1 }
+            sequencesByID[node.id] = nextSequence
+            usedSequences.insert(nextSequence)
+            nextSequence += 1
+        }
         return nodes.map { original in
             var node = original
-            guard !node.subscriptionID.isEmpty,
-                  let result = results[node.id], result.realTested else { return node }
-            node.customName = nil
-            guard let milliseconds = result.milliseconds else {
-                node.automaticName = nil
-                return node
-            }
+            guard !node.subscriptionID.isEmpty else { return node }
             let region = (exitLocationsByNodeID[node.id]
                 ?? locations[node.host.lowercased()])?.displayRegion ?? unresolvedRegion
-            let base = "\(region)-\(speedTier(milliseconds: milliseconds))-可用"
-            let sequence = sequences[base, default: 0] + 1
-            sequences[base] = sequence
             node.automaticName = make(
-                region: region, milliseconds: milliseconds, sequence: sequence
+                region: region, protocolName: node.protocolName,
+                sequence: sequencesByID[node.id] ?? nextSequence
             )
             return node
         }
@@ -192,23 +226,36 @@ public struct HarborProxyExitLocation: Codable, Equatable, Sendable {
     public let location: HarborProxyIPLocation
     public let endpointSignature: String
     public let observedAt: Date
+    public let resolvedServerIP: String?
 
     public init(location: HarborProxyIPLocation, endpointSignature: String,
-                observedAt: Date = .now) {
+                observedAt: Date = .now, resolvedServerIP: String? = nil) {
         self.location = location
         self.endpointSignature = endpointSignature
         self.observedAt = observedAt
+        self.resolvedServerIP = resolvedServerIP
     }
 
-    public func verifiedLocation(for node: HarborProxyNode, now: Date = .now)
+    public func verifiedLocation(for node: HarborProxyNode, resolvedServerIP currentIP: String? = nil,
+                                 now: Date = .now)
         -> HarborProxyIPLocation? {
         guard !endpointSignature.isEmpty,
               endpointSignature == node.endpointSignature,
-              location.verifiedCountryCode != nil,
-              (0...86_400).contains(now.timeIntervalSince(observedAt)) else {
+              location.verifiedCountryCode != nil else {
             return nil
         }
+        if let resolvedServerIP, let currentIP,
+           !HarborIPAddress.equivalent(resolvedServerIP, currentIP) { return nil }
         return location
+    }
+
+    public func needsRefresh(for node: HarborProxyNode, resolvedServerIP currentIP: String? = nil,
+                             now: Date = .now) -> Bool {
+        guard verifiedLocation(for: node, resolvedServerIP: currentIP, now: now) != nil else {
+            return true
+        }
+        return resolvedServerIP == nil
+            || now.timeIntervalSince(observedAt) >= HarborProxyGeoIPPolicy.exitRefreshInterval
     }
 }
 
@@ -216,10 +263,12 @@ public struct HarborProxyExitLocation: Codable, Equatable, Sendable {
 public struct HarborProxyIPLocation: Codable, Equatable, Sendable {
     public var ip: String
     public var countryCode: String
+    public var locatedAt: Date?
 
-    public init(ip: String, countryCode: String) {
+    public init(ip: String, countryCode: String, locatedAt: Date? = .now) {
         self.ip = ip
         self.countryCode = countryCode.uppercased()
+        self.locatedAt = locatedAt
     }
 
     public var countryName: String {
@@ -253,6 +302,11 @@ public struct HarborProxyIPLocation: Codable, Equatable, Sendable {
 
     public func matches(_ resolvedIP: String) -> Bool {
         HarborIPAddress.equivalent(ip, resolvedIP) && countryCode.count == 2
+    }
+
+    public func countryIsFresh(now: Date = .now) -> Bool {
+        guard verifiedCountryCode != nil, let locatedAt else { return false }
+        return now.timeIntervalSince(locatedAt) < HarborProxyGeoIPPolicy.countryCacheInterval
     }
 }
 

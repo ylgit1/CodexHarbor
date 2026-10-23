@@ -18,6 +18,7 @@ private struct HarborProxyState: Codable, Equatable, Sendable {
     var autoManageSystemProxy: Bool?
     // Optional for backwards-compatible decoding of encrypted existing state.
     var nodeServerLocations: [String: HarborProxyIPLocation]?
+    var nodeServerResolvedAt: [String: Date]?
     // Per-node observed exit, never indexed by shared server IP.
     var nodeExitLocations: [String: HarborProxyExitLocation]?
     // Optional so older encrypted state remains decodable after latency
@@ -247,6 +248,11 @@ final class HarborProxyManager: ObservableObject {
     private var persistenceGeneration = 0
     private var persistenceTask: Task<Void, Never>?
     private var geoRefreshTask: Task<Void, Never>?
+    private var exitGeoTask: Task<Void, Never>?
+    private var exitGeoPendingIDs = Set<String>()
+    private var exitGeoAttemptedAt: [String: Date] = [:]
+    private var nodeServerResolvedAt: [String: Date] = [:]
+    private var lastActiveHealthCheckAt: Date?
     private var configurationLoaded = false
     private var child: Process?
     private var adoptedPID: Int32?
@@ -406,7 +412,11 @@ final class HarborProxyManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.refreshSystemProxyState(synchronizeOwnership: true) }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.refreshSystemProxyState(synchronizeOwnership: true)
+                await self.retryDueFailedNodes()
+            }
         }
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
@@ -417,6 +427,7 @@ final class HarborProxyManager: ObservableObject {
                 guard let self else { return }
                 self.refreshSystemProxyState(synchronizeOwnership: true)
                 await self.reconcileXrayLiveness()
+                await self.retryDueFailedNodes()
             }
         }
     }
@@ -459,6 +470,7 @@ final class HarborProxyManager: ObservableObject {
                 store = state
                 nodes = state.nodes
                 nodeServerLocations = state.nodeServerLocations ?? [:]
+                nodeServerResolvedAt = state.nodeServerResolvedAt ?? [:]
                 nodeExitLocations = state.nodeExitLocations ?? [:]
                 probeResults = state.probeResults ?? [:]
                 subscriptions = state.subscriptions
@@ -538,6 +550,7 @@ final class HarborProxyManager: ObservableObject {
             bootstrapped = true
             scheduleGeoIPRefresh()
             scheduleLegacyRealPingRetest()
+            Task { [weak self] in await self?.retryDueFailedNodes() }
             return
         }
         await cleanupOrphan()
@@ -559,6 +572,7 @@ final class HarborProxyManager: ObservableObject {
         }
         scheduleGeoIPRefresh()
         scheduleLegacyRealPingRetest()
+        Task { [weak self] in await self?.retryDueFailedNodes() }
     }
 
     /// Rebuild old cached availability and order once after switching the
@@ -596,11 +610,13 @@ final class HarborProxyManager: ObservableObject {
         }
     }
 
-    /// Prefer a recent exit IP observed through this exact node's isolated
-    /// SOCKS outbound. A changed endpoint, missing location or expired probe
-    /// falls back to the existing server-IP geography.
+    /// Prefer the last exit IP observed through this exact node's isolated
+    /// SOCKS outbound. Stale data remains visible while it refreshes in the
+    /// background; changed endpoints and server IPs invalidate it immediately.
     func exitLocation(for node: HarborProxyNode) -> HarborProxyIPLocation? {
-        nodeExitLocations[node.id]?.verifiedLocation(for: node)
+        nodeExitLocations[node.id]?.verifiedLocation(
+            for: node, resolvedServerIP: nodeServerLocations[node.host.lowercased()]?.ip
+        )
     }
 
     func serverLocation(for node: HarborProxyNode) -> HarborProxyIPLocation? {
@@ -618,15 +634,23 @@ final class HarborProxyManager: ObservableObject {
             // Multiple subscription aliases can resolve to one IP. Never
             // repeat an unsuccessful provider lookup within the same refresh.
             var failedIPs = Set<String>()
+            var resolvedTimestampChanged = false
             for host in hosts {
                 guard !Task.isCancelled, let self else { return }
+                if let checked = self.nodeServerResolvedAt[host],
+                   Date().timeIntervalSince(checked) < HarborProxyGeoIPPolicy.serverDNSCacheInterval {
+                    continue
+                }
                 guard let resolvedIP = await HarborNodeGeoIPResolver.resolvedIP(for: host),
                       !Task.isCancelled else { continue }
+                self.nodeServerResolvedAt[host] = .now
+                resolvedTimestampChanged = true
                 if let existing = self.nodeServerLocations[host],
-                   existing.matches(resolvedIP), existing.countryCode != "ZZ" { continue }
+                   existing.matches(resolvedIP), existing.countryIsFresh() { continue }
                 // A changed IP makes the old country invalid even if the
                 // geolocation service is temporarily unreachable.
-                if self.nodeServerLocations[host] != nil {
+                if let existing = self.nodeServerLocations[host],
+                   !existing.matches(resolvedIP) {
                     self.nodeServerLocations.removeValue(forKey: host)
                     for id in Set(self.nodes.filter { $0.host.lowercased() == host }
                         .map(\.subscriptionID)).filter({ !$0.isEmpty }) {
@@ -638,7 +662,7 @@ final class HarborProxyManager: ObservableObject {
                 // Reusing that placeholder here would permanently skip the
                 // provider for every node sharing the same server IP.
                 let reused = self.nodeServerLocations.values.first {
-                    $0.matches(resolvedIP) && $0.verifiedCountryCode != nil
+                    $0.matches(resolvedIP) && $0.countryIsFresh()
                 }?.verifiedCountryCode
                 let countryCode: String?
                 if let reused {
@@ -668,6 +692,7 @@ final class HarborProxyManager: ObservableObject {
                 }
                 self.persist()
             }
+            if resolvedTimestampChanged { self?.persist() }
         }
     }
 
@@ -675,6 +700,7 @@ final class HarborProxyManager: ObservableObject {
         guard configurationLoaded else { return }
         store.nodes = nodes
         store.nodeServerLocations = nodeServerLocations
+        store.nodeServerResolvedAt = nodeServerResolvedAt
         store.nodeExitLocations = nodeExitLocations
         store.probeResults = probeResults
         store.subscriptions = subscriptions
@@ -884,13 +910,17 @@ final class HarborProxyManager: ObservableObject {
                 let currentIPs = await resolveServerIPs(for: id)
                 refreshAutomaticNames(for: id)
                 let refreshed = nodes.filter { $0.subscriptionID == id }
-                let testIDs = HarborProxySubscriptionRefreshPolicy.nodesRequiringProbe(
+                let changedIDs = HarborProxySubscriptionRefreshPolicy.nodesRequiringProbe(
                     previousNodeIDs: update.previousNodeIDs,
                     refreshedNodes: refreshed,
                     previousResolvedIPs: previousIPs,
                     currentResolvedIPs: currentIPs
                 )
-                for nodeID in testIDs { probeResults.removeValue(forKey: nodeID) }
+                let retryIDs = Set(refreshed.compactMap { node in
+                    self.probeResults[node.id]?.shouldRetryFailure() == true ? node.id : nil
+                })
+                let testIDs = changedIDs.union(retryIDs)
+                for nodeID in changedIDs { probeResults.removeValue(forKey: nodeID) }
                 // Both values are committed only after a successful download.
                 subscriptions[index] = updated
                 scheduleGeoIPRefresh()
@@ -994,13 +1024,18 @@ final class HarborProxyManager: ObservableObject {
             let update = applySubscriptionNodes(incoming, id: id)
             let currentIPs = await resolveServerIPs(for: id)
             refreshAutomaticNames(for: id)
-            let testIDs = HarborProxySubscriptionRefreshPolicy.nodesRequiringProbe(
+            let changedIDs = HarborProxySubscriptionRefreshPolicy.nodesRequiringProbe(
                 previousNodeIDs: update.previousNodeIDs,
                 refreshedNodes: nodes.filter { $0.subscriptionID == id },
                 previousResolvedIPs: previousIPs,
                 currentResolvedIPs: currentIPs
             )
-            for nodeID in testIDs { probeResults.removeValue(forKey: nodeID) }
+            let retryIDs = Set(nodes.compactMap { node in
+                node.subscriptionID == id && probeResults[node.id]?.shouldRetryFailure() == true
+                    ? node.id : nil
+            })
+            let testIDs = changedIDs.union(retryIDs)
+            for nodeID in changedIDs { probeResults.removeValue(forKey: nodeID) }
             scheduleGeoIPRefresh()
             persist()
             busy = false
@@ -1073,7 +1108,9 @@ final class HarborProxyManager: ObservableObject {
         probeResults = probeResults.filter { validIDs.contains($0.key) }
         nodeExitLocations = nodeExitLocations.filter { id, observation in
             validIDs.contains(id) && merged.nodes.contains { node in
-                node.id == id && observation.verifiedLocation(for: node) != nil
+                node.id == id && observation.verifiedLocation(
+                    for: node, resolvedServerIP: nodeServerLocations[node.host.lowercased()]?.ip
+                ) != nil
             }
         }
         subscriptionUpdatedAt[id] = .now
@@ -1095,14 +1132,16 @@ final class HarborProxyManager: ObservableObject {
             for await (host, ip) in group {
                 guard let ip else { continue }
                 resolved[host] = ip
+                nodeServerResolvedAt[host] = .now
                 let previous = nodeServerLocations[host]
-                let countryCode = (previous?.matches(ip) == true
-                    ? previous?.verifiedCountryCode : nil)
+                let sameIP = previous?.matches(ip) == true
+                let countryCode = (sameIP ? previous?.verifiedCountryCode : nil)
                     ?? nodeServerLocations.values.first(where: {
-                        $0.matches(ip) && $0.verifiedCountryCode != nil
+                        $0.matches(ip) && $0.countryIsFresh()
                     })?.verifiedCountryCode
                 nodeServerLocations[host] = HarborProxyIPLocation(
-                    ip: ip, countryCode: countryCode ?? "ZZ"
+                    ip: ip, countryCode: countryCode ?? "ZZ",
+                    locatedAt: sameIP ? previous?.locatedAt : .now
                 )
             }
         }
@@ -1396,6 +1435,7 @@ final class HarborProxyManager: ObservableObject {
         systemProxyInteractive: Bool
     ) async {
         let reachable = await HarborNodeLatencyTester.checkActiveSOCKS(port: port + 1)
+        lastActiveHealthCheckAt = .now
         guard generation == connectionGeneration,
               running, localPort == port else { return }
         guard coreProcessAlive else {
@@ -1419,6 +1459,7 @@ final class HarborProxyManager: ObservableObject {
         if reachable {
             status = "已连接"
             detail = "HTTP 127.0.0.1:\(port) · SOCKS5 \(port + 1)"
+            if let activeNode { enqueueExitGeoRefresh(for: [activeNode]) }
             if autoManageSystemProxy && !systemManaged {
                 enableSystemProxy(interactive: systemProxyInteractive)
             }
@@ -1468,6 +1509,17 @@ final class HarborProxyManager: ObservableObject {
 
     private func proxyResultIsUntested(_ id: String) -> Bool {
         probeResults[id]?.realTested != true
+    }
+
+    /// Failed results expire quickly and are retried when the app becomes
+    /// active or wakes. Successful nodes are never swept on a timer.
+    private func retryDueFailedNodes() async {
+        guard bootstrapped, !busy, !latencyTesting, coreInstalled else { return }
+        let due = nodes.compactMap { node in
+            probeResults[node.id]?.shouldRetryFailure() == true ? node.id : nil
+        }
+        guard !due.isEmpty else { return }
+        await testRealLatency(due)
     }
 
     /// Retained for existing callers: latency without an explicit kind means
@@ -1554,12 +1606,20 @@ final class HarborProxyManager: ObservableObject {
                 for await (id, result, failure) in group {
                     guard !latencyCancellationRequested, !Task.isCancelled else { continue }
                     let previous = probeResults[id]
+                    let checkedAt = Date.now
+                    let failures = kind == .real
+                        ? (result == nil ? (previous?.consecutiveRealFailures ?? 0) + 1 : 0)
+                        : previous?.consecutiveRealFailures
                     probeResults[id] = HarborProxyProbeResult(
                         milliseconds: kind == .real ? result : previous?.milliseconds,
                         tcpMilliseconds: kind == .tcp ? result : previous?.tcpMilliseconds,
+                        checkedAt: checkedAt,
                         realTested: kind == .real || previous?.realTested == true,
                         tcpTested: kind == .tcp || previous?.tcpTested == true,
-                        realFailureReason: kind == .real ? failure : previous?.realFailureReason
+                        realFailureReason: kind == .real ? failure : previous?.realFailureReason,
+                        realCheckedAt: kind == .real ? checkedAt : previous?.effectiveRealCheckedAt,
+                        tcpCheckedAt: kind == .tcp ? checkedAt : previous?.tcpCheckedAt,
+                        consecutiveRealFailures: failures
                     )
                     if kind == .real {
                         let errorCategory = result == nil ? "failed" : "success"
@@ -1583,37 +1643,6 @@ final class HarborProxyManager: ObservableObject {
                 }
             }
         }
-        if let sharedRealBatch, kind == .real,
-           !latencyCancellationRequested && !Task.isCancelled {
-            // GeoIP is intentionally separate from latency timing. Reuse
-            // each node's forced-proxy SOCKS inbound and query sequentially
-            // to avoid public API bursts. A failed observation is not cached.
-            var locations = nodeExitLocations
-            var requests = 0
-            for target in targets {
-                guard !latencyCancellationRequested, !Task.isCancelled else { break }
-                guard probeResults[target.id]?.milliseconds != nil,
-                      let current = nodes.first(where: { $0.id == target.id }),
-                      current.endpointSignature == target.endpointSignature else { continue }
-                if locations[target.id]?.verifiedLocation(for: current) != nil { continue }
-                if requests > 0 {
-                    try? await Task.sleep(for: .milliseconds(1100))
-                }
-                guard !latencyCancellationRequested, !Task.isCancelled else { break }
-                requests += 1
-                if let observed = await sharedRealBatch.exitLocation(node: target),
-                   !latencyCancellationRequested, !Task.isCancelled,
-                   let latest = nodes.first(where: { $0.id == target.id }),
-                   latest.endpointSignature == target.endpointSignature {
-                    locations[target.id] = HarborProxyExitLocation(
-                        location: observed, endpointSignature: target.endpointSignature
-                    )
-                }
-            }
-            if !latencyCancellationRequested && !Task.isCancelled {
-                nodeExitLocations = locations
-            }
-        }
         if let sharedRealBatch {
             await Task.detached(priority: .utility) { sharedRealBatch.close() }.value
         }
@@ -1626,8 +1655,11 @@ final class HarborProxyManager: ObservableObject {
             if kind == .real, let finalization {
                 finalizeSubscriptionProbes(finalization)
             }
-            for id in Set(targets.map(\.subscriptionID)).filter({ !$0.isEmpty }) {
-                refreshAutomaticNames(for: id)
+            if kind == .real {
+                for id in Set(targets.map(\.subscriptionID)).filter({ !$0.isEmpty }) {
+                    refreshAutomaticNames(for: id)
+                }
+                enqueueExitGeoRefresh(for: targets)
             }
             persist()
         }
@@ -1639,6 +1671,81 @@ final class HarborProxyManager: ObservableObject {
            !latencyCancellationRequested {
             detail += " · " + reason
         }
+    }
+
+    /// Exit discovery has its own queue and Xray process. A speed-test batch is
+    /// always closed before this starts, so repeated tests cannot restart or
+    /// extend region work already in flight.
+    private func enqueueExitGeoRefresh(for candidates: [HarborProxyNode]) {
+        let now = Date.now
+        for candidate in candidates {
+            guard let current = nodes.first(where: { $0.id == candidate.id }),
+                  current.endpointSignature == candidate.endpointSignature,
+                  probeResults[current.id]?.milliseconds != nil
+                    || (activeNodeID == current.id && healthy) else { continue }
+            let serverIP = nodeServerLocations[current.host.lowercased()]?.ip
+            if let cached = nodeExitLocations[current.id],
+               !cached.needsRefresh(for: current, resolvedServerIP: serverIP) { continue }
+            if let attempted = exitGeoAttemptedAt[current.id],
+               now.timeIntervalSince(attempted) < HarborProxyGeoIPPolicy.exitFailureRetryInterval {
+                continue
+            }
+            exitGeoPendingIDs.insert(current.id)
+        }
+        guard !exitGeoPendingIDs.isEmpty, exitGeoTask == nil, coreInstalled else { return }
+        exitGeoTask = Task(priority: .utility) { [weak self] in
+            await self?.runExitGeoQueue()
+        }
+    }
+
+    private func runExitGeoQueue() async {
+        while !Task.isCancelled, !exitGeoPendingIDs.isEmpty {
+            let ids = exitGeoPendingIDs
+            exitGeoPendingIDs.subtract(ids)
+            let candidates = nodes.filter { ids.contains($0.id) }
+            let now = Date.now
+            let due = candidates.filter { node in
+                let serverIP = nodeServerLocations[node.host.lowercased()]?.ip
+                let needsRefresh = nodeExitLocations[node.id]?.needsRefresh(
+                    for: node, resolvedServerIP: serverIP
+                ) ?? true
+                let retryAllowed = exitGeoAttemptedAt[node.id].map {
+                    now.timeIntervalSince($0) >= HarborProxyGeoIPPolicy.exitFailureRetryInterval
+                } ?? true
+                return needsRefresh && retryAllowed
+            }
+            guard !due.isEmpty else { continue }
+            for node in due { exitGeoAttemptedAt[node.id] = now }
+            let cancellation = HarborLatencyCancellation()
+            guard let batch = await HarborNodeLatencyTester.startRealBatch(
+                nodes: due, root: root, cancellation: cancellation
+            ) else { continue }
+            var requests = 0
+            for target in due {
+                guard !Task.isCancelled else { break }
+                if requests > 0 {
+                    do { try await Task.sleep(for: .milliseconds(1100)) }
+                    catch { break }
+                }
+                guard !Task.isCancelled else { break }
+                requests += 1
+                guard let observed = await batch.exitLocation(node: target),
+                      !Task.isCancelled,
+                      let latest = nodes.first(where: { $0.id == target.id }),
+                      latest.endpointSignature == target.endpointSignature else { continue }
+                nodeExitLocations[target.id] = HarborProxyExitLocation(
+                    location: observed, endpointSignature: target.endpointSignature,
+                    resolvedServerIP: nodeServerLocations[latest.host.lowercased()]?.ip
+                )
+                if !latest.subscriptionID.isEmpty {
+                    refreshAutomaticNames(for: latest.subscriptionID)
+                }
+                persist()
+            }
+            if Task.isCancelled { cancellation.cancel() }
+            await Task.detached(priority: .utility) { batch.close() }.value
+        }
+        exitGeoTask = nil
     }
 
     private func finalizeSubscriptionProbes(_ finalization: SubscriptionProbeFinalization) {
@@ -1749,6 +1856,16 @@ final class HarborProxyManager: ObservableObject {
                 catch { return }
                 guard let self, !Task.isCancelled else { return }
                 await self.reconcileXrayLiveness()
+                if self.running,
+                   Date().timeIntervalSince(self.lastActiveHealthCheckAt ?? .distantPast)
+                    >= HarborProxyLatencyPolicy.activeHealthCheckInterval {
+                    self.checkingConnectivity = true
+                    await self.finishHealthCheck(
+                        port: self.configuredHTTPPort,
+                        generation: self.connectionGeneration,
+                        systemProxyInteractive: false
+                    )
+                }
                 self.trimRuntimeErrorLogIfNeeded()
             }
         }

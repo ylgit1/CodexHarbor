@@ -159,6 +159,25 @@ struct HarborNetworkProxyTests {
         #expect(!realOnly.tcpTested)
     }
 
+    @Test("Failed real probes use bounded retry backoff without confusing TCP freshness")
+    func failedProbeRetryPolicy() {
+        let now = Date(timeIntervalSince1970: 100_000)
+        let firstFailure = HarborProxyProbeResult(
+            milliseconds: nil, tcpMilliseconds: 20, checkedAt: now,
+            realTested: true, tcpTested: true, realCheckedAt: now,
+            tcpCheckedAt: now.addingTimeInterval(300), consecutiveRealFailures: 1
+        )
+        #expect(!firstFailure.shouldRetryFailure(now: now.addingTimeInterval(599)))
+        #expect(firstFailure.shouldRetryFailure(now: now.addingTimeInterval(600)))
+        #expect(firstFailure.effectiveRealCheckedAt == now)
+        let repeated = HarborProxyProbeResult(
+            milliseconds: nil, checkedAt: now, realTested: true,
+            consecutiveRealFailures: 4
+        )
+        #expect(!repeated.shouldRetryFailure(now: now.addingTimeInterval(86_399)))
+        #expect(repeated.shouldRetryFailure(now: now.addingTimeInterval(86_400)))
+    }
+
     @Test("Server GeoIP cache stays valid only for the unchanged resolved IP")
     func serverGeoIPCache() {
         let stored = HarborProxyIPLocation(ip: "8.8.8.8", countryCode: "us")
@@ -196,7 +215,9 @@ struct HarborNetworkProxyTests {
         #expect(changed.endpointSignature != node.endpointSignature)
         #expect(observation.verifiedLocation(for: changed, now: now) == nil)
         #expect(observation.verifiedLocation(for: node,
-            now: now.addingTimeInterval(86_401)) == nil)
+            now: now.addingTimeInterval(86_401))?.countryCode == "SG")
+        #expect(observation.needsRefresh(for: node,
+            now: now.addingTimeInterval(HarborProxyGeoIPPolicy.exitRefreshInterval + 1)))
         let invalid = HarborProxyExitLocation(
             location: HarborProxyIPLocation(ip: "104.28.156.124", countryCode: "ZZ"),
             endpointSignature: node.endpointSignature, observedAt: now
@@ -382,7 +403,7 @@ struct HarborNetworkProxyTests {
         #expect(requiringProbe == ["first", "new"])
     }
 
-    @Test("Initial real delay order and automatic names put the fastest usable node first")
+    @Test("Initial real delay order is fast-first and automatic names use fixed metadata")
     func initialLatencyOrderAndNaming() {
         let slow = HarborProxyNode(id: "slow", name: "slow", protocolName: "vless",
             host: "slow.example.com", port: 443, credential: "slow")
@@ -398,10 +419,10 @@ struct HarborNetworkProxyTests {
         #expect(HarborProxySubscriptionRefreshPolicy.initialLatencyOrder(
             [slow, failed, fast], results: results
         ).map(\.id) == ["fast", "slow", "failed"])
-        #expect(HarborProxyAutomaticName.make(region: "美国", milliseconds: 596, sequence: 1)
-                == "美国-高速-可用-001")
-        #expect(HarborProxyAutomaticName.make(region: "新加坡", milliseconds: 1_740, sequence: 1)
-                == "新加坡-中速-可用-001")
+        #expect(HarborProxyAutomaticName.make(region: "美国", protocolName: "vless", sequence: 1)
+                == "美国-VLESS-001")
+        #expect(HarborProxyAutomaticName.make(region: "新加坡", protocolName: "trojan", sequence: 2)
+                == "新加坡-TROJAN-002")
         #expect(HarborProxyAutomaticName.sequence(from: "美国-高速-可用-017") == 17)
     }
 
@@ -424,14 +445,15 @@ struct HarborNetworkProxyTests {
         let renamed = HarborProxyAutomaticName.refreshed(
             [first, second], results: results, locations: locations
         )
-        #expect(renamed.map(\.displayName) == ["美国-高速-可用-001", "美国-高速-可用-002"])
-        #expect(renamed.allSatisfy { $0.customName == nil })
+        #expect(renamed.map(\.automaticName) == ["美国-VLESS-001", "美国-VLESS-002"])
+        #expect(renamed[0].displayName == "新加坡-高速-可用-001")
+        #expect(renamed[0].customName == "新加坡-高速-可用-001")
         #expect(renamed.map(\.name) == ["SIN-SG-old", "NRT-JP-original"])
 
         let unknown = HarborProxyAutomaticName.refreshed(
             [first], results: results, locations: [:]
         )
-        #expect(unknown[0].displayName == "待识别-高速-可用-001")
+        #expect(unknown[0].automaticName == "待识别-VLESS-001")
         #expect(HarborProxyIPLocation(ip: first.host, countryCode: "ZZ").flag == "🌐")
     }
 

@@ -164,6 +164,9 @@ struct HarborProxyWorkspaceView: View {
         .onChange(of: proxy.nodeServerLocations) { _, _ in
             if region != "全部" && !regions.contains(region) { region = "全部" }
         }
+        .onChange(of: proxy.nodeExitLocations) { _, _ in
+            if region != "全部" && !regions.contains(region) { region = "全部" }
+        }
         .sheet(item: $editor) { mode in editorSheet(mode) }
         .sheet(item: $renameTarget) { target in
             if let node = proxy.nodes.first(where: { $0.id == target.id }) {
@@ -1555,13 +1558,16 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func regionHint(_ node: HarborProxyNode) -> String {
+        if let exit = proxy.exitLocation(for: node) {
+            return "真实代理出口 IP：\(exit.ip) · 优先显示出口地区"
+        }
         if let location = proxy.serverLocation(for: node) {
             if location.countryCode == "ZZ" {
                 return "节点服务器 IP：\(location.ip) · 正在识别归属地"
             }
-            return "节点服务器 IP：\(location.ip) · IP 归属地（不代表代理出口 IP）"
+            return "节点服务器 IP：\(location.ip) · 出口未确认，使用服务器地区"
         }
-        return "正在识别节点服务器 IP 归属地；不使用供应商的节点名称推断"
+        return "出口 IP 尚未确认；真实测速将尝试识别，失败时使用服务器 IP 地区"
     }
 
     // A centered, padded form with the same visual language as hosted-key setup.

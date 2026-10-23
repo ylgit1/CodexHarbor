@@ -173,6 +173,60 @@ struct HarborNetworkProxyTests {
         #expect((try? JSONDecoder().decode(HarborProxyIPLocation.self, from: encoded!)) == stored)
     }
 
+    @Test("Observed exit country has a stable per-outbound identity and expiry")
+    func exitLocationIsNodeBound() throws {
+        let node = HarborProxyNode(name: "A", protocolName: "vless",
+            host: "172.64.155.175", port: 443, credential: "first")
+        var renamed = node
+        renamed.id = "renumbered"
+        renamed.name = "renamed"
+        renamed.customName = "user alias"
+        renamed.automaticName = "地区-高速-可用"
+        #expect(renamed.endpointSignature == node.endpointSignature)
+
+        let observation = HarborProxyExitLocation(
+            location: HarborProxyIPLocation(ip: "104.28.156.124", countryCode: "SG"),
+            endpointSignature: node.endpointSignature,
+            observedAt: Date(timeIntervalSince1970: 100_000)
+        )
+        let now = Date(timeIntervalSince1970: 100_050)
+        #expect(observation.verifiedLocation(for: renamed, now: now)?.countryCode == "SG")
+        var changed = node
+        changed.credential = "different"
+        #expect(changed.endpointSignature != node.endpointSignature)
+        #expect(observation.verifiedLocation(for: changed, now: now) == nil)
+        #expect(observation.verifiedLocation(for: node,
+            now: now.addingTimeInterval(86_401)) == nil)
+        let invalid = HarborProxyExitLocation(
+            location: HarborProxyIPLocation(ip: "104.28.156.124", countryCode: "ZZ"),
+            endpointSignature: node.endpointSignature, observedAt: now
+        )
+        #expect(invalid.verifiedLocation(for: node, now: now) == nil)
+        let encoded = try JSONEncoder().encode(observation)
+        #expect(try JSONDecoder().decode(HarborProxyExitLocation.self,
+            from: encoded) == observation)
+    }
+
+    @Test("Automatic names use each node's observed exit over shared server geography")
+    func exitRegionOverridesServerWithoutCrossNodeLeakage() {
+        let first = HarborProxyNode(name: "first", protocolName: "vless",
+            host: "172.64.155.175", port: 443, credential: "first", subscriptionID: "sub")
+        let second = HarborProxyNode(name: "second", protocolName: "vless",
+            host: "172.64.155.175", port: 443, credential: "second", subscriptionID: "sub")
+        let results = [
+            first.id: HarborProxyProbeResult(milliseconds: 100, realTested: true),
+            second.id: HarborProxyProbeResult(milliseconds: 100, realTested: true)
+        ]
+        let names = HarborProxyAutomaticName.refreshed([first, second],
+            results: results,
+            locations: ["172.64.155.175": HarborProxyIPLocation(
+                ip: "172.64.155.175", countryCode: "US")],
+            exitLocationsByNodeID: [first.id: HarborProxyIPLocation(
+                ip: "104.28.156.124", countryCode: "SG")])
+        #expect(names[0].automaticName?.hasPrefix("新加坡-") == true)
+        #expect(names[1].automaticName?.hasPrefix("美国-") == true)
+    }
+
     @Test("IPv6 normalization handles brackets, compression and equivalent GeoIP responses")
     func normalizedIPv6ServerAddress() {
         let literal = "2400:cb00:2049:2fac:7a0:eb35:352c:78a5"

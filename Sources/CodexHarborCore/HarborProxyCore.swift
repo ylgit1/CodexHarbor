@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import SQLite3
 
@@ -117,6 +118,20 @@ public struct HarborProxyNode: Codable, Identifiable, Sendable, Hashable {
     }
     public var label: String { "\(protocolName.uppercased()) · \(host):\(port)" }
     public var displayName: String { customName ?? automaticName ?? name }
+
+    /// Stable, opaque key for the actual remote outbound configuration. Never
+    /// use a node ID alone: a subscription may retain IDs while replacing the
+    /// server, credentials or transport. Display names do not affect the key.
+    public var endpointSignature: String {
+        var endpoint = self
+        endpoint.id = ""
+        endpoint.name = ""
+        endpoint.customName = nil
+        endpoint.automaticName = nil
+        endpoint.subscriptionID = ""
+        guard let data = try? JSONEncoder().encode(endpoint) else { return "" }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 /// User-assigned node names stay separate from provider remarks, so a

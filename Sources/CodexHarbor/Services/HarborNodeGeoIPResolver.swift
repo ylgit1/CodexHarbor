@@ -90,6 +90,42 @@ enum HarborNodeGeoIPResolver {
         return code
     }
 
+    /// Query the IP actually observed by the geolocation provider via an
+    /// isolated Xray SOCKS inbound. Callers must use a forced-proxy outbound,
+    /// never the macOS system proxy or a direct-route runtime listener.
+    static func exitLocation(socksPort: Int) async -> HarborProxyIPLocation? {
+        guard (1...65_535).contains(socksPort), !Task.isCancelled,
+              let url = URL(string: "https://ipwho.is/?fields=success,ip,country_code") else {
+            return nil
+        }
+        let config = URLSessionConfiguration.ephemeral
+        config.connectionProxyDictionary = [
+            "SOCKSEnable": 1,
+            "SOCKSProxy": "127.0.0.1",
+            "SOCKSPort": socksPort
+        ]
+        config.timeoutIntervalForRequest = 6
+        config.timeoutIntervalForResource = 6
+        config.waitsForConnectivity = false
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+        request.timeoutInterval = 6
+        guard let (data, response) = try? await session.data(for: request),
+              !Task.isCancelled,
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              data.count < 4_096,
+              let result = try? JSONDecoder().decode(Response.self, from: data),
+              result.success, let observedIP = result.ip,
+              let canonical = HarborIPAddress.normalizedLiteral(observedIP),
+              isPublic(canonical),
+              let code = result.country_code?.uppercased(),
+              code.count == 2,
+              code.utf8.allSatisfy({ (65...90).contains($0) }),
+              code != "ZZ" else { return nil }
+        return HarborProxyIPLocation(ip: canonical, countryCode: code)
+    }
+
     static func isPublic(_ ip: String) -> Bool {
         guard let normalized = HarborIPAddress.normalizedLiteral(ip) else { return false }
         var v4 = in_addr()

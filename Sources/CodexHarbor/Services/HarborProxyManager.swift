@@ -18,6 +18,8 @@ private struct HarborProxyState: Codable, Equatable, Sendable {
     var autoManageSystemProxy: Bool?
     // Optional for backwards-compatible decoding of encrypted existing state.
     var nodeServerLocations: [String: HarborProxyIPLocation]?
+    // Per-node observed exit, never indexed by shared server IP.
+    var nodeExitLocations: [String: HarborProxyExitLocation]?
     // Optional so older encrypted state remains decodable after latency
     // results become durable.
     var probeResults: [String: HarborProxyProbeResult]?
@@ -217,6 +219,7 @@ final class HarborProxyManager: ObservableObject {
     private var autoManageSystemProxy = true
     @Published private(set) var probeResults: [String: HarborProxyProbeResult] = [:]
     @Published private(set) var nodeServerLocations: [String: HarborProxyIPLocation] = [:]
+    @Published private(set) var nodeExitLocations: [String: HarborProxyExitLocation] = [:]
     @Published private(set) var lastCompletedLatencyTestKind: HarborProxyLatencyTestKind?
     @Published private(set) var latencyCompletionSerial = 0
     @Published private(set) var latencyTesting = false
@@ -456,6 +459,7 @@ final class HarborProxyManager: ObservableObject {
                 store = state
                 nodes = state.nodes
                 nodeServerLocations = state.nodeServerLocations ?? [:]
+                nodeExitLocations = state.nodeExitLocations ?? [:]
                 probeResults = state.probeResults ?? [:]
                 subscriptions = state.subscriptions
                 selectedID = state.selectedID
@@ -592,8 +596,15 @@ final class HarborProxyManager: ObservableObject {
         }
     }
 
+    /// Prefer a recent exit IP observed through this exact node's isolated
+    /// SOCKS outbound. A changed endpoint, missing location or expired probe
+    /// falls back to the existing server-IP geography.
+    func exitLocation(for node: HarborProxyNode) -> HarborProxyIPLocation? {
+        nodeExitLocations[node.id]?.verifiedLocation(for: node)
+    }
+
     func serverLocation(for node: HarborProxyNode) -> HarborProxyIPLocation? {
-        nodeServerLocations[node.host.lowercased()]
+        exitLocation(for: node) ?? nodeServerLocations[node.host.lowercased()]
     }
 
     /// Resolve DNS once at startup and whenever subscription contents change.
@@ -664,6 +675,7 @@ final class HarborProxyManager: ObservableObject {
         guard configurationLoaded else { return }
         store.nodes = nodes
         store.nodeServerLocations = nodeServerLocations
+        store.nodeExitLocations = nodeExitLocations
         store.probeResults = probeResults
         store.subscriptions = subscriptions
         store.selectedID = selectedID
@@ -954,7 +966,10 @@ final class HarborProxyManager: ObservableObject {
         let removedIDs = Set(matching.map(\.id))
         nodes.removeAll { removedIDs.contains($0.id) }
         scheduleGeoIPRefresh()
-        for nodeID in removedIDs { probeResults.removeValue(forKey: nodeID) }
+        for nodeID in removedIDs {
+            probeResults.removeValue(forKey: nodeID)
+            nodeExitLocations.removeValue(forKey: nodeID)
+        }
         subscriptionUpdatedAt.removeValue(forKey: id)
         if let selectedID, removedIDs.contains(selectedID) {
             self.selectedID = nodes.first?.id
@@ -1056,6 +1071,11 @@ final class HarborProxyManager: ObservableObject {
         selectedID = merged.selectedID
         scheduleGeoIPRefresh()
         probeResults = probeResults.filter { validIDs.contains($0.key) }
+        nodeExitLocations = nodeExitLocations.filter { id, observation in
+            validIDs.contains(id) && merged.nodes.contains { node in
+                node.id == id && observation.verifiedLocation(for: node) != nil
+            }
+        }
         subscriptionUpdatedAt[id] = .now
         return SubscriptionNodeUpdate(
             count: incoming.count,
@@ -1563,6 +1583,37 @@ final class HarborProxyManager: ObservableObject {
                 }
             }
         }
+        if let sharedRealBatch, kind == .real,
+           !latencyCancellationRequested && !Task.isCancelled {
+            // GeoIP is intentionally separate from latency timing. Reuse
+            // each node's forced-proxy SOCKS inbound and query sequentially
+            // to avoid public API bursts. A failed observation is not cached.
+            var locations = nodeExitLocations
+            var requests = 0
+            for target in targets {
+                guard !latencyCancellationRequested, !Task.isCancelled else { break }
+                guard probeResults[target.id]?.milliseconds != nil,
+                      let current = nodes.first(where: { $0.id == target.id }),
+                      current.endpointSignature == target.endpointSignature else { continue }
+                if locations[target.id]?.verifiedLocation(for: current) != nil { continue }
+                if requests > 0 {
+                    try? await Task.sleep(for: .milliseconds(1100))
+                }
+                guard !latencyCancellationRequested, !Task.isCancelled else { break }
+                requests += 1
+                if let observed = await sharedRealBatch.exitLocation(node: target),
+                   !latencyCancellationRequested, !Task.isCancelled,
+                   let latest = nodes.first(where: { $0.id == target.id }),
+                   latest.endpointSignature == target.endpointSignature {
+                    locations[target.id] = HarborProxyExitLocation(
+                        location: observed, endpointSignature: target.endpointSignature
+                    )
+                }
+            }
+            if !latencyCancellationRequested && !Task.isCancelled {
+                nodeExitLocations = locations
+            }
+        }
         if let sharedRealBatch {
             await Task.detached(priority: .utility) { sharedRealBatch.close() }.value
         }
@@ -1613,8 +1664,12 @@ final class HarborProxyManager: ObservableObject {
     @discardableResult
     private func refreshAutomaticNames(for subscriptionID: String) -> Bool {
         let group = nodes.filter { $0.subscriptionID == subscriptionID }
+        let exits = Dictionary(uniqueKeysWithValues: group.compactMap { node in
+            exitLocation(for: node).map { (node.id, $0) }
+        })
         let renamed = HarborProxyAutomaticName.refreshed(
-            group, results: probeResults, locations: nodeServerLocations
+            group, results: probeResults, locations: nodeServerLocations,
+            exitLocationsByNodeID: exits
         )
         guard group != renamed else { return false }
         var iterator = renamed.makeIterator()

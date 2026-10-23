@@ -160,7 +160,8 @@ public enum HarborProxyAutomaticName {
     public static func refreshed(
         _ nodes: [HarborProxyNode],
         results: [String: HarborProxyProbeResult],
-        locations: [String: HarborProxyIPLocation]
+        locations: [String: HarborProxyIPLocation],
+        exitLocationsByNodeID: [String: HarborProxyIPLocation] = [:]
     ) -> [HarborProxyNode] {
         var sequences: [String: Int] = [:]
         return nodes.map { original in
@@ -172,7 +173,8 @@ public enum HarborProxyAutomaticName {
                 node.automaticName = nil
                 return node
             }
-            let region = locations[node.host.lowercased()]?.displayRegion ?? unresolvedRegion
+            let region = (exitLocationsByNodeID[node.id]
+                ?? locations[node.host.lowercased()])?.displayRegion ?? unresolvedRegion
             let base = "\(region)-\(speedTier(milliseconds: milliseconds))-可用"
             let sequence = sequences[base, default: 0] + 1
             sequences[base] = sequence
@@ -181,6 +183,32 @@ public enum HarborProxyAutomaticName {
             )
             return node
         }
+    }
+}
+
+/// Observed through this node's isolated Xray SOCKS outbound, not by querying
+/// the server IP or the user's system-wide proxy. Persist only nonsecret data.
+public struct HarborProxyExitLocation: Codable, Equatable, Sendable {
+    public let location: HarborProxyIPLocation
+    public let endpointSignature: String
+    public let observedAt: Date
+
+    public init(location: HarborProxyIPLocation, endpointSignature: String,
+                observedAt: Date = .now) {
+        self.location = location
+        self.endpointSignature = endpointSignature
+        self.observedAt = observedAt
+    }
+
+    public func verifiedLocation(for node: HarborProxyNode, now: Date = .now)
+        -> HarborProxyIPLocation? {
+        guard !endpointSignature.isEmpty,
+              endpointSignature == node.endpointSignature,
+              location.verifiedCountryCode != nil,
+              (0...86_400).contains(now.timeIntervalSince(observedAt)) else {
+            return nil
+        }
+        return location
     }
 }
 

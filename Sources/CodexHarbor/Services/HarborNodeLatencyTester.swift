@@ -315,6 +315,14 @@ final class HarborRealDelayBatch: @unchecked Sendable {
         HarborNodeLatencyTester.releasePortRange(basePort, count: portsByNodeID.count)
     }
 
+    /// The batch configuration routes every SOCKS inbound exclusively through
+    /// its corresponding node. These ports are not macOS system proxy ports.
+    func exitLocation(node: HarborProxyNode) async -> HarborProxyIPLocation? {
+        guard let port = portsByNodeID[node.id],
+              !cancellation.isCancelled, engine.isRunning else { return nil }
+        return await HarborNodeGeoIPResolver.exitLocation(socksPort: port)
+    }
+
     func measure(node: HarborProxyNode) async -> HarborNodeDelayReport {
         guard let port = portsByNodeID[node.id], !cancellation.isCancelled else {
             return .failed("测试已取消")

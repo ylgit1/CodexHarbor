@@ -61,17 +61,20 @@ struct CommandSessionTests {
         let fixture = try await CommandSessionFixture()
         defer { fixture.cleanup() }
 
+        // CI runs many Swift tests in parallel. Keep the child alive well
+        // beyond the deadline so a heavily scheduled watchdog can still
+        // terminate it, rather than observing its natural exit first.
         let started = try await fixture.manager.start(
             workspaceID: fixture.workspaceID,
             executable: "sleep",
-            arguments: ["5"],
+            arguments: ["30"],
             timeoutSeconds: 1,
             approvalGranted: true
         )
         let terminal = try await waitForTerminal(
             manager: fixture.manager,
             commandID: started.commandID,
-            attempts: 30
+            attempts: 100
         )
         #expect(terminal.state == .timedOut)
     }

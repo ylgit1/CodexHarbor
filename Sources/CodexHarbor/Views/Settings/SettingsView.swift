@@ -10,7 +10,7 @@ struct HarborSettingsView: View {
     var body: some View {
         GeometryReader { available in
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                LazyVStack(alignment: .leading, spacing: 16) {
                     Text("设置")
                         .font(.system(size: 22, weight: .bold, design: .rounded))
                     if available.size.width >= 1120 {

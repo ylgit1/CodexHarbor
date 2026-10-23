@@ -77,7 +77,7 @@ struct HarborNetworkProxyTests {
         #expect(HarborProxyMeasurementLabel.explanation.contains("v2rayN"))
         #expect(HarborProxyLatencyPolicy.parallelCount == 4)
         #expect(HarborProxyLatencyPolicy.connectTimeoutSeconds == 2)
-        #expect(HarborProxyLatencyPolicy.requestTimeoutSeconds == 10)
+        #expect(HarborProxyLatencyPolicy.requestTimeoutSeconds == 5)
         #expect(HarborProxyLatencyPolicy.realPingRequestCount == 2)
         #expect(HarborProxyLatencyPolicy.realPingPauseMilliseconds == 100)
         #expect(HarborProxyLatencyPolicy.listenerStartupTimeoutMilliseconds == 3_000)
@@ -512,6 +512,14 @@ struct HarborNetworkProxyTests {
         let rules = try #require(routing["rules"] as? [[String: Any]])
         #expect(rules.first?["outboundTag"] as? String == "proxy")
         #expect(rules.first?["domain"] as? [String] == HarborXrayConfig.verificationHosts)
+        #expect(HarborXrayConfig.verificationHosts == ["full:www.msftconnecttest.com"])
+        let custom = try HarborXrayConfig.make(
+            node: node, httpPort: 18080, ruleMode: true,
+            routeVerificationViaProxy: true, verificationHost: "www.example.com")
+        let customJSON = try #require(JSONSerialization.jsonObject(with: custom) as? [String: Any])
+        let customRouting = try #require(customJSON["routing"] as? [String: Any])
+        let customRules = try #require(customRouting["rules"] as? [[String: Any]])
+        #expect(customRules.first?["domain"] as? [String] == ["full:www.example.com"])
         #expect(rules.dropFirst().contains { $0["domain"] as? [String] == ["geosite:cn"] })
     }
 

@@ -43,7 +43,9 @@ public enum HarborProxyLatencyPolicy {
     public static let parallelCount = 4
     public static let realPingBatchSize = 1_000
     public static let connectTimeoutSeconds = 2
-    public static let requestTimeoutSeconds = 10
+    // v2rayN ConnectionHandler.GetRealPingTime uses Global.LocalFetch (5s)
+    // for two requests to the configured SpeedPingTestUrl.
+    public static let requestTimeoutSeconds = 5
     public static let realPingRequestCount = 2
     public static let realPingPauseMilliseconds = 100
     public static let listenerStartupTimeoutMilliseconds = 3_000

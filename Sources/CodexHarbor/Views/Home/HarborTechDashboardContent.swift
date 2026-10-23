@@ -136,7 +136,7 @@ struct HarborTechDashboardContent: View {
             )
             let gap = CGFloat(sizing.gap)
             ScrollView {
-                VStack(alignment: .leading, spacing: gap) {
+                LazyVStack(alignment: .leading, spacing: gap) {
                     pageHeader(compact: sizing.compact)
                     pathPanel(compact: sizing.compact)
                         .frame(height: CGFloat(sizing.flowHeight))

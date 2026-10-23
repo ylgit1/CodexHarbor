@@ -291,7 +291,10 @@ struct HarborInteractiveTrendChart: View {
         let relativeX = locationX - plotFrame.minX
         let plotWidth = max(plotFrame.width, 1)
         let raw = Int(round((relativeX / plotWidth) * CGFloat(max(labels.count - 1, 0))))
-        selectedIndex = min(max(raw, 0), labels.count - 1)
+        let next = min(max(raw, 0), labels.count - 1)
+        // Continuous mouse updates need not invalidate Charts for each pixel
+        // when the hovered data point has not changed.
+        if selectedIndex != next { selectedIndex = next }
     }
 
     private func selectionX(index: Int, plotFrame: CGRect) -> CGFloat {

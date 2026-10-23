@@ -1263,7 +1263,8 @@ final class HarborProxyManager: ObservableObject {
             let port = try choosePort()
             let config = try HarborXrayConfig.make(node: node, httpPort: port, ruleMode: routingRules,
                                                   forcedProxyDomains: forcedProxyDomains,
-                                                  routeVerificationViaProxy: true)
+                                                  routeVerificationViaProxy: true,
+                                                  verificationHost: HarborNodeLatencyTester.realPingURL().host)
             let file = root.appendingPathComponent("runtime-\(UUID().uuidString).json")
             try config.write(to: file, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
@@ -1358,14 +1359,15 @@ final class HarborProxyManager: ObservableObject {
         }
     }
 
-    /// Complete outbound verification in the background for ordinary node
-    /// starts. Only the still-current Xray generation may publish the result.
+    /// Same readiness criterion as v2rayN real ping: the running node's SOCKS
+    /// inbound successfully requests the configured SpeedPingTestUrl twice.
+    /// Do not reject a working node for unrelated Google/Cloudflare failures.
     private func finishHealthCheck(
         port: Int,
         generation: UInt64,
         systemProxyInteractive: Bool
     ) async {
-        let reachable = await probe(port: port)
+        let reachable = await HarborNodeLatencyTester.checkActiveSOCKS(port: port + 1)
         guard generation == connectionGeneration,
               running, localPort == port else { return }
         guard coreProcessAlive else {
@@ -1384,7 +1386,8 @@ final class HarborProxyManager: ObservableObject {
         }
         checkingConnectivity = false
         healthy = reachable
-        proxyAudit(reachable ? "health_success" : "health_failed", nodeID: activeNodeID)
+        proxyAudit(reachable ? "health_success" : "health_failed",
+                   nodeID: activeNodeID, note: "method=v2rayn_realping_socks")
         if reachable {
             status = "已连接"
             detail = "HTTP 127.0.0.1:\(port) · SOCKS5 \(port + 1)"
@@ -1392,52 +1395,24 @@ final class HarborProxyManager: ObservableObject {
                 enableSystemProxy(interactive: systemProxyInteractive)
             }
         } else {
-            status = "内核已启动 · 网络检测失败"
-            detail = "本地 HTTP/SOCKS5 端口已就绪，但外网检测失败；可以直接切换其他节点"
+            // Inbound identity and node selection remain committed; a probe
+            // failure does not mean the Xray outbound changed to another node.
+            status = "节点已切换 · 真实测速未通过"
+            detail = "当前 SOCKS5 节点对 v2rayN 配置测速地址的请求未通过；运行节点未被回退"
         }
     }
 
     func verify() async {
         guard running, let port = localPort, !busy else { return }
         busy = true; defer { busy = false }
-        let reachable = await probe(port: port)
+        let reachable = await HarborNodeLatencyTester.checkActiveSOCKS(port: port + 1)
         healthy = reachable && activeNodeID != nil && runningConfigMatches(activeNodeID!, path: configPath)
-        proxyAudit(healthy ? "manual_verify_success" : "manual_verify_failed", nodeID: activeNodeID)
-        status = healthy ? "已连接" : "连接异常"
-        detail = healthy ? "当前节点可访问外网" : "内核运行中，但测试目标不可达；可尝试切换节点"
-    }
-
-    private func probe(port: Int) async -> Bool {
-        // Both hosts are explicitly routed to the remote proxy outbound in
-        // HarborXrayConfig, even when the user has enabled regional direct rules.
-        // A successful direct request must never make a broken proxy look healthy.
-        async let gstatic = probeAddress("https://www.gstatic.com/generate_204", port: port)
-        async let cloudflare = probeAddress("https://www.cloudflare.com/cdn-cgi/trace", port: port)
-        let fallbackResults = await [gstatic, cloudflare]
-        // The proxy-health HTTPS result is intentionally separate from the
-        // Active-connection health stays separate from user-triggered real
-        // delay results so a background check never changes the list value.
-        return fallbackResults.contains { $0 != nil }
-    }
-
-    private func probeAddress(_ address: String, port: Int) async -> Int? {
-        if Task.isCancelled { return nil }
-        let started = ContinuousClock.now
-        let succeeded = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-            proc.arguments = ["-q", "--silent", "--fail", "--noproxy", "", "--proxy",
-                              "http://127.0.0.1:\(port)", "--connect-timeout", "2",
-                              "--max-time", "4", "--output", "/dev/null", address]
-            proc.standardError = FileHandle.nullDevice
-            proc.standardOutput = FileHandle.nullDevice
-            proc.terminationHandler = { p in continuation.resume(returning: p.terminationStatus == 0) }
-            do { try proc.run() } catch { continuation.resume(returning: false) }
-        }
-        guard succeeded, !Task.isCancelled else { return nil }
-        let duration = started.duration(to: .now).components
-        return max(1, Int(duration.seconds * 1_000
-            + duration.attoseconds / 1_000_000_000_000_000))
+        proxyAudit(healthy ? "manual_verify_success" : "manual_verify_failed",
+                   nodeID: activeNodeID, note: "method=v2rayn_realping_socks")
+        status = healthy ? "已连接" : "节点已切换 · 真实测速未通过"
+        detail = healthy
+            ? "当前节点通过 v2rayN 真实测速地址验证"
+            : "内核已启动，当前节点对 v2rayN 真实测速地址的请求未通过"
     }
 
     func testTCPLatency(_ ids: [String]) async {

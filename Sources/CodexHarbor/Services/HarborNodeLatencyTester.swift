@@ -378,11 +378,53 @@ enum HarborNodeLatencyTester {
     private static let portLock = NSLock()
     private nonisolated(unsafe) static var reservedPorts: Set<Int> = []
 
-    fileprivate static func realPingURL() -> URL {
+    static func realPingURL() -> URL {
         let path = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/v2rayN/guiConfigs/guiNConfig.json")
         let data = try? Data(contentsOf: path)
         return HarborProxyRealPingTarget.resolve(v2rayNConfigurationData: data)
+    }
+
+    /// Active-node real ping follows v2rayN's ConnectionHandler exactly:
+    /// one configured SpeedPingTestUrl, two GETs, 100 ms gap, 5s shared budget.
+    /// Measure through the running Xray SOCKS listener, never through system
+    /// proxy settings or a direct route. Do not add fallback probe sites.
+    static func checkActiveSOCKS(port: Int) async -> Bool {
+        guard (1...65_535).contains(port), !Task.isCancelled else { return false }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.connectionProxyDictionary = [
+            kCFNetworkProxiesSOCKSEnable as String: 1,
+            kCFNetworkProxiesSOCKSProxy as String: "127.0.0.1",
+            kCFNetworkProxiesSOCKSPort as String: port
+        ]
+        configuration.timeoutIntervalForRequest = TimeInterval(HarborProxyLatencyPolicy.requestTimeoutSeconds)
+        configuration.timeoutIntervalForResource = TimeInterval(HarborProxyLatencyPolicy.requestTimeoutSeconds)
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let url = realPingURL()
+        let deadline = ContinuousClock.now.advanced(
+            by: .seconds(HarborProxyLatencyPolicy.requestTimeoutSeconds))
+        for _ in 0..<HarborProxyLatencyPolicy.realPingRequestCount {
+            guard !Task.isCancelled else { return false }
+            let remaining = ContinuousClock.now.duration(to: deadline)
+            guard remaining > .zero else { return false }
+            var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+            request.timeoutInterval = remaining.timeInterval
+            do {
+                // HttpClient.GetAsync does not require 2xx; URLSession likewise
+                // only needs a completed HTTP response.
+                _ = try await session.data(for: request)
+            } catch {
+                return false
+            }
+            do {
+                try await Task.sleep(for: .milliseconds(
+                    HarborProxyLatencyPolicy.realPingPauseMilliseconds))
+            } catch {
+                return false
+            }
+        }
+        return !Task.isCancelled
     }
 
     static func startRealBatch(nodes: [HarborProxyNode], root: URL,

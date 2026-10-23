@@ -26,7 +26,7 @@ struct HarborAnalyticsView: View {
     var body: some View {
         GeometryReader { available in
             ScrollView {
-                    VStack(alignment: .leading, spacing: 15) {
+                    LazyVStack(alignment: .leading, spacing: 15) {
                     header
                     if model.activityEvents.count >= ConnectionActivityStore.maximumRetainedEvents {
                         Label("活动明细已达到本机保留上限（5,000 条）；更早记录可能已被截断，当前统计不代表完整历史。",

@@ -19,7 +19,7 @@ struct HarborConnectionManagementView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            LazyVStack(alignment: .leading, spacing: 16) {
                 HStack {
                     Text("Codex 连接")
                         .font(.system(size: 22, weight: .bold, design: .rounded))
@@ -60,7 +60,7 @@ struct HarborConnectionManagementView: View {
     }
 
     private var catalog: some View {
-        VStack(spacing: 0) {
+        LazyVStack(spacing: 0) {
             if isEmpty && filter != .all {
                 VStack(spacing: 9) {
                     Image(systemName: "point.3.connected.trianglepath.dotted")

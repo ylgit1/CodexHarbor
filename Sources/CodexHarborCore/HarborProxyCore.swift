@@ -476,7 +476,9 @@ public enum HarborXrayConfig {
     /// Endpoints used solely to verify the actual remote proxy route.
     /// Keep them ahead of regional direct rules; otherwise a 200 response can
     /// be mistaken for proof that the remote Xray outbound works.
-    public static let verificationHosts = ["full:www.gstatic.com", "full:www.cloudflare.com"]
+    // Exactly the selected v2rayN SpeedPingTestUrl target on this Mac.
+    // The active connection must never bypass its proxy via regional rules.
+    public static let verificationHosts = ["full:www.msftconnecttest.com"]
 
     /// v2rayN's real-ping batch uses one mixed SOCKS/HTTP inbound per node,
     /// routes each inbound to its matching outbound, and starts one Xray.
@@ -520,7 +522,8 @@ public enum HarborXrayConfig {
     public static func make(node: HarborProxyNode, httpPort: Int, ruleMode: Bool,
                             forcedProxyDomains: [String] = HarborProxyDomainRules.defaults,
                             routeVerificationViaProxy: Bool = false,
-                            routeAllViaProxy: Bool = false) throws -> Data {
+                            routeAllViaProxy: Bool = false,
+                            verificationHost: String? = nil) throws -> Data {
         guard (1024...65534).contains(httpPort), (1...65535).contains(node.port),
               !node.host.isEmpty, !node.credential.isEmpty else {
             throw HarborProxyError.invalid("代理节点无效")
@@ -568,7 +571,8 @@ public enum HarborXrayConfig {
         let forced = try HarborProxyDomainRules.normalized(forcedProxyDomains)
         var rules: [[String: Any]] = []
         if routeVerificationViaProxy && !routeAllViaProxy {
-            rules.append(["type": "field", "domain": verificationHosts,
+            let destinations = verificationHost.map { ["full:\($0)"] } ?? verificationHosts
+            rules.append(["type": "field", "domain": destinations,
                           "outboundTag": "proxy"])
         }
         if !forced.isEmpty && !routeAllViaProxy {

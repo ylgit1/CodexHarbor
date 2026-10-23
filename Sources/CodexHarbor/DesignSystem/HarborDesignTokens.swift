@@ -45,7 +45,6 @@ struct HarborCard<Content: View>: View {
     @ViewBuilder var content: Content
 
     @State private var hovering = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         content
@@ -78,18 +77,13 @@ struct HarborCard<Content: View>: View {
                         lineWidth: 1
                     )
             )
-            .shadow(
-                color: .black.opacity(interactive && hovering ? 0.075 : 0.025),
-                radius: interactive && hovering ? 14 : 8,
-                y: interactive && hovering ? 6 : 2
-            )
-            .offset(y: interactive && hovering && !reduceMotion ? -1.5 : 0)
-            .scaleEffect(interactive && hovering && !reduceMotion ? 1.003 : 1)
-            .animation(
-                reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.18),
-                value: hovering
-            )
-            .onHover { hovering = interactive && $0 }
+            // Stable geometry while a card passes beneath the mouse on scroll:
+            // no hover scaling, shifting, animated shadows or layout changes.
+            .shadow(color: .black.opacity(0.025), radius: 7, y: 2)
+            .onHover { isOver in
+                let next = interactive && isOver
+                if hovering != next { hovering = next }
+            }
     }
 }
 

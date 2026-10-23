@@ -20,7 +20,7 @@ struct HarborLocalAccessView: View {
     var body: some View {
         ZStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                LazyVStack(alignment: .leading, spacing: 16) {
                     headerSection
                     connectionPathCard
                     allowedRootsSection

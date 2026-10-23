@@ -82,6 +82,7 @@ public struct HarborProxyNode: Codable, Identifiable, Sendable, Hashable {
     public var id: String
     public var name: String
     public var customName: String?
+    public var automaticName: String?
     public var protocolName: String
     public var host: String
     public var port: Int
@@ -99,12 +100,14 @@ public struct HarborProxyNode: Codable, Identifiable, Sendable, Hashable {
     public var alterID: Int
     public var subscriptionID: String
     public init(id: String = UUID().uuidString, name: String, customName: String? = nil,
+                automaticName: String? = nil,
                 protocolName: String, host: String,
                 port: Int, credential: String, encryption: String = "none", network: String = "tcp",
                 security: String = "none", sni: String = "", headerHost: String = "", path: String = "",
                 fingerprint: String = "", publicKey: String = "", shortID: String = "",
                 flow: String = "", alterID: Int = 0, subscriptionID: String = "") {
         self.id = id; self.name = name; self.customName = customName
+        self.automaticName = automaticName
         self.protocolName = protocolName; self.host = host
         self.port = port; self.credential = credential; self.encryption = encryption
         self.network = network; self.security = security; self.sni = sni
@@ -113,7 +116,7 @@ public struct HarborProxyNode: Codable, Identifiable, Sendable, Hashable {
         self.alterID = alterID; self.subscriptionID = subscriptionID
     }
     public var label: String { "\(protocolName.uppercased()) · \(host):\(port)" }
-    public var displayName: String { customName ?? name }
+    public var displayName: String { customName ?? automaticName ?? name }
 }
 
 /// User-assigned node names stay separate from provider remarks, so a
@@ -218,6 +221,7 @@ public enum HarborProxySubscriptionReconciler {
         value.id = ""
         value.name = ""
         value.customName = nil
+        value.automaticName = nil
         value.subscriptionID = ""
         return value
     }
@@ -245,9 +249,19 @@ public enum HarborProxySubscriptionReconciler {
                 previousByEndpoint[key] = matches
                 node.id = previous.id
                 node.customName = previous.customName
+                node.automaticName = previous.automaticName
             }
             refreshed.append(node)
         }
+
+        // A provider may reorder every item on each refresh. Keep the first
+        // measured order for profiles whose complete connection identity did
+        // not change, then append genuinely new profiles in provider order.
+        let refreshedByID = Dictionary(uniqueKeysWithValues: refreshed.map { ($0.id, $0) })
+        let stableIDs = previous.compactMap { refreshedByID[$0.id]?.id }
+        let stableIDSet = Set(stableIDs)
+        refreshed = stableIDs.compactMap { refreshedByID[$0] }
+            + refreshed.filter { !stableIDSet.contains($0.id) }
 
         var other = current.filter { $0.subscriptionID != subscriptionID }
         var chosen = selectedID
@@ -464,9 +478,49 @@ public enum HarborXrayConfig {
     /// be mistaken for proof that the remote Xray outbound works.
     public static let verificationHosts = ["full:www.gstatic.com", "full:www.cloudflare.com"]
 
+    /// v2rayN's real-ping batch uses one mixed SOCKS/HTTP inbound per node,
+    /// routes each inbound to its matching outbound, and starts one Xray.
+    public static func makeRealPingBatch(nodes: [HarborProxyNode], basePort: Int) throws -> Data {
+        guard !nodes.isEmpty, nodes.count <= 1_000,
+              (1024...65_535).contains(basePort),
+              basePort + nodes.count - 1 <= 65_534 else {
+            throw HarborProxyError.invalid("测速节点或端口无效")
+        }
+        var inbounds: [[String: Any]] = []
+        var outbounds: [[String: Any]] = []
+        var rules: [[String: Any]] = []
+        for (index, node) in nodes.enumerated() {
+            let port = basePort + index
+            let single = try make(node: node, httpPort: port,
+                                  ruleMode: false, forcedProxyDomains: [],
+                                  routeAllViaProxy: true)
+            guard let json = try JSONSerialization.jsonObject(with: single) as? [String: Any],
+                  let configured = json["outbounds"] as? [[String: Any]],
+                  var outbound = configured.first else {
+                throw HarborProxyError.invalid("测速节点配置无效")
+            }
+            let inboundTag = "mixed\(port)"
+            let outboundTag = "proxy\(port)"
+            outbound["tag"] = outboundTag
+            inbounds.append(["listen": "127.0.0.1", "port": port,
+                             "protocol": "mixed", "tag": inboundTag])
+            outbounds.append(outbound)
+            rules.append(["type": "field", "inboundTag": [inboundTag],
+                          "outboundTag": outboundTag])
+        }
+        let configuration: [String: Any] = [
+            "log": ["loglevel": "warning"],
+            "inbounds": inbounds,
+            "outbounds": outbounds,
+            "routing": ["domainStrategy": "IPIfNonMatch", "rules": rules]
+        ]
+        return try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys])
+    }
+
     public static func make(node: HarborProxyNode, httpPort: Int, ruleMode: Bool,
                             forcedProxyDomains: [String] = HarborProxyDomainRules.defaults,
-                            routeVerificationViaProxy: Bool = false) throws -> Data {
+                            routeVerificationViaProxy: Bool = false,
+                            routeAllViaProxy: Bool = false) throws -> Data {
         guard (1024...65534).contains(httpPort), (1...65535).contains(node.port),
               !node.host.isEmpty, !node.credential.isEmpty else {
             throw HarborProxyError.invalid("代理节点无效")
@@ -513,18 +567,20 @@ public enum HarborXrayConfig {
         }
         let forced = try HarborProxyDomainRules.normalized(forcedProxyDomains)
         var rules: [[String: Any]] = []
-        if routeVerificationViaProxy {
+        if routeVerificationViaProxy && !routeAllViaProxy {
             rules.append(["type": "field", "domain": verificationHosts,
                           "outboundTag": "proxy"])
         }
-        if !forced.isEmpty {
+        if !forced.isEmpty && !routeAllViaProxy {
             // First-match-wins: Gitee/custom sites must not be swallowed by geosite:cn
             // or resolve to a Chinese IP and fall through to geoip:cn.
             rules.append(["type": "field", "domain": forced.map { "domain:\($0)" },
                           "outboundTag": "proxy"])
         }
-        rules.append(["type": "field", "ip": ["geoip:private"], "outboundTag": "direct"])
-        if ruleMode {
+        if !routeAllViaProxy {
+            rules.append(["type": "field", "ip": ["geoip:private"], "outboundTag": "direct"])
+        }
+        if ruleMode && !routeAllViaProxy {
             rules += [
                 ["type": "field", "domain": ["geosite:cn"], "outboundTag": "direct"],
                 ["type": "field", "ip": ["geoip:cn"], "outboundTag": "direct"]

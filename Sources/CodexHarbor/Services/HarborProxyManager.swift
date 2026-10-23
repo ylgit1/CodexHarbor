@@ -18,6 +18,12 @@ private struct HarborProxyState: Codable, Equatable, Sendable {
     var autoManageSystemProxy: Bool?
     // Optional for backwards-compatible decoding of encrypted existing state.
     var nodeServerLocations: [String: HarborProxyIPLocation]?
+    // Optional so older encrypted state remains decodable after latency
+    // results become durable.
+    var probeResults: [String: HarborProxyProbeResult]?
+    // A probe made with the former HTTPS/curl method cannot be compared with
+    // v2rayN-style SOCKS real-ping results.
+    var realPingMethodVersion: Int?
 }
 @MainActor
 private struct HarborProxyProcessRecord: Codable {
@@ -450,6 +456,7 @@ final class HarborProxyManager: ObservableObject {
                 store = state
                 nodes = state.nodes
                 nodeServerLocations = state.nodeServerLocations ?? [:]
+                probeResults = state.probeResults ?? [:]
                 subscriptions = state.subscriptions
                 selectedID = state.selectedID
                 routingRules = state.routingRules
@@ -461,6 +468,11 @@ final class HarborProxyManager: ObservableObject {
                     state.forcedProxyDomains ?? HarborProxyDomainRules.defaults
                 )) ?? HarborProxyDomainRules.defaults
                 configurationLoaded = true
+                var namesChanged = false
+                for subscription in subscriptions {
+                    namesChanged = refreshAutomaticNames(for: subscription.id) || namesChanged
+                }
+                if namesChanged { persist() }
             } catch {
                 detail = "代理配置载入失败：" + error.localizedDescription
                 configurationLoaded = true
@@ -521,6 +533,7 @@ final class HarborProxyManager: ObservableObject {
             startupTrace("adopted-existing-xray")
             bootstrapped = true
             scheduleGeoIPRefresh()
+            scheduleLegacyRealPingRetest()
             return
         }
         await cleanupOrphan()
@@ -541,6 +554,42 @@ final class HarborProxyManager: ObservableObject {
             await queueActivation(lastID, restart: false, userInitiated: false)
         }
         scheduleGeoIPRefresh()
+        scheduleLegacyRealPingRetest()
+    }
+
+    /// Rebuild old cached availability and order once after switching the
+    /// measurement method. Later subscription updates still retain results for
+    /// unchanged nodes exactly as before.
+    private func scheduleLegacyRealPingRetest() {
+        guard store.realPingMethodVersion != 2, coreInstalled else { return }
+        let groups = subscriptions.map(\.id)
+        let subscriptionIDs = Set(groups)
+        let oldResults = nodes.filter { subscriptionIDs.contains($0.subscriptionID) }
+        guard oldResults.contains(where: { probeResults[$0.id]?.realTested == true }) else {
+            store.realPingMethodVersion = 2
+            persist()
+            return
+        }
+        for node in oldResults {
+            guard let previous = probeResults[node.id] else { continue }
+            probeResults[node.id] = HarborProxyProbeResult(
+                milliseconds: nil, tcpMilliseconds: previous.tcpMilliseconds,
+                checkedAt: previous.checkedAt, realTested: false,
+                tcpTested: previous.tcpTested
+            )
+        }
+        persist()
+        Task { [weak self] in
+            guard let self else { return }
+            for subscriptionID in groups {
+                let ids = self.nodes.filter { $0.subscriptionID == subscriptionID }.map(\.id)
+                guard !ids.isEmpty else { continue }
+                await self.testRealLatency(ids)
+                guard ids.allSatisfy({ self.probeResults[$0]?.realTested == true }) else { return }
+            }
+            self.store.realPingMethodVersion = 2
+            self.persist()
+        }
     }
 
     func serverLocation(for node: HarborProxyNode) -> HarborProxyIPLocation? {
@@ -561,11 +610,15 @@ final class HarborProxyManager: ObservableObject {
                 guard let resolvedIP = await HarborNodeGeoIPResolver.resolvedIP(for: host),
                       !Task.isCancelled else { continue }
                 if let existing = self.nodeServerLocations[host],
-                   existing.matches(resolvedIP) { continue }
+                   existing.matches(resolvedIP), existing.countryCode != "ZZ" { continue }
                 // A changed IP makes the old country invalid even if the
                 // geolocation service is temporarily unreachable.
                 if self.nodeServerLocations[host] != nil {
                     self.nodeServerLocations.removeValue(forKey: host)
+                    for id in Set(self.nodes.filter { $0.host.lowercased() == host }
+                        .map(\.subscriptionID)).filter({ !$0.isEmpty }) {
+                        self.refreshAutomaticNames(for: id)
+                    }
                     self.persist()
                 }
                 let reused = self.nodeServerLocations.values.first {
@@ -592,6 +645,10 @@ final class HarborProxyManager: ObservableObject {
                 self.nodeServerLocations[host] = HarborProxyIPLocation(
                     ip: resolvedIP, countryCode: countryCode
                 )
+                for id in Set(self.nodes.filter { $0.host.lowercased() == host }
+                    .map(\.subscriptionID)).filter({ !$0.isEmpty }) {
+                    self.refreshAutomaticNames(for: id)
+                }
                 self.persist()
             }
         }
@@ -601,6 +658,7 @@ final class HarborProxyManager: ObservableObject {
         guard configurationLoaded else { return }
         store.nodes = nodes
         store.nodeServerLocations = nodeServerLocations
+        store.probeResults = probeResults
         store.subscriptions = subscriptions
         store.selectedID = selectedID
         store.routingRules = routingRules
@@ -795,19 +853,48 @@ final class HarborProxyManager: ObservableObject {
             }
             busy = true
             detail = "正在获取新订阅并校验节点…"
-            defer { busy = false }
             do {
+                let previousIPs = Dictionary(uniqueKeysWithValues: nodes
+                    .filter { $0.subscriptionID == id }
+                    .compactMap { node in
+                        nodeServerLocations[node.host.lowercased()].map {
+                            (node.host.lowercased(), $0.ip)
+                        }
+                    })
                 let incoming = try await downloadSubscriptionNodes(from: sourceURL, id: id)
                 let update = applySubscriptionNodes(incoming, id: id)
+                let currentIPs = await resolveServerIPs(for: id)
+                refreshAutomaticNames(for: id)
+                let refreshed = nodes.filter { $0.subscriptionID == id }
+                let testIDs = HarborProxySubscriptionRefreshPolicy.nodesRequiringProbe(
+                    previousNodeIDs: update.previousNodeIDs,
+                    refreshedNodes: refreshed,
+                    previousResolvedIPs: previousIPs,
+                    currentResolvedIPs: currentIPs
+                )
+                for nodeID in testIDs { probeResults.removeValue(forKey: nodeID) }
                 // Both values are committed only after a successful download.
                 subscriptions[index] = updated
+                scheduleGeoIPRefresh()
                 persist()
-                detail = "订阅「\(updated.name)」已保存并更新 \(update.count) 个节点" +
+                busy = false
+                if !testIDs.isEmpty {
+                    await testLatency(
+                        Array(testIDs), kind: .real,
+                        finalization: .init(
+                            subscriptionID: id,
+                            newNodeIDs: testIDs.subtracting(update.previousNodeIDs),
+                            initialImport: update.previousNodeIDs.isEmpty
+                        )
+                    )
+                }
+                detail = "订阅「\(updated.name)」已保存并更新 \(update.count) 个节点；新增或 IP 变化 \(testIDs.count) 个" +
                     (update.retainedActive
                         ? "；原连接保持运行，请手动选择新节点"
                         : "；不会自动切换当前连接")
                 return true
             } catch {
+                busy = false
                 detail = "新链接更新失败，原链接和节点均已保留：" + error.localizedDescription
                 return false
             }
@@ -841,7 +928,9 @@ final class HarborProxyManager: ObservableObject {
               nodes[index].customName != nil else { return }
         nodes[index].customName = nil
         persist()
-        detail = "已恢复订阅名称「\(nodes[index].name)」"
+        detail = nodes[index].automaticName == nil
+            ? "已恢复订阅名称「\(nodes[index].name)」"
+            : "已恢复自动名称「\(nodes[index].displayName)」"
     }
     @discardableResult
     func removeSubscription(_ id: String) -> Bool {
@@ -870,19 +959,44 @@ final class HarborProxyManager: ObservableObject {
     }
 
     func refreshSubscription(_ id: String) async {
-        guard !busy, let subscription = subscriptions.first(where: { $0.id == id }),
+        guard !busy, !latencyTesting,
+              let subscription = subscriptions.first(where: { $0.id == id }),
               let url = URL(string: subscription.url) else { return }
         busy = true
-        defer { busy = false }
         do {
+            let previousIPs = Dictionary(uniqueKeysWithValues: nodes
+                .filter { $0.subscriptionID == id }
+                .compactMap { node in
+                    nodeServerLocations[node.host.lowercased()].map { (node.host.lowercased(), $0.ip) }
+                })
             let incoming = try await downloadSubscriptionNodes(from: url, id: id)
             let update = applySubscriptionNodes(incoming, id: id)
+            let currentIPs = await resolveServerIPs(for: id)
+            refreshAutomaticNames(for: id)
+            let testIDs = HarborProxySubscriptionRefreshPolicy.nodesRequiringProbe(
+                previousNodeIDs: update.previousNodeIDs,
+                refreshedNodes: nodes.filter { $0.subscriptionID == id },
+                previousResolvedIPs: previousIPs,
+                currentResolvedIPs: currentIPs
+            )
+            for nodeID in testIDs { probeResults.removeValue(forKey: nodeID) }
+            scheduleGeoIPRefresh()
             persist()
-            detail = "订阅更新完成：\(update.count) 个节点" +
-                (update.retainedActive
-                    ? "；原连接仍在运行，请手动选择最新节点"
-                    : "")
-        } catch { detail = "更新失败，已保留原节点：" + error.localizedDescription }
+            busy = false
+            if !testIDs.isEmpty {
+                await testLatency(
+                    Array(testIDs), kind: .real,
+                    finalization: .init(subscriptionID: id,
+                                        newNodeIDs: testIDs.subtracting(update.previousNodeIDs),
+                                        initialImport: update.previousNodeIDs.isEmpty)
+                )
+            }
+            detail = "订阅更新完成：\(update.count) 个节点；新增或 IP 变化 \(testIDs.count) 个" +
+                (update.retainedActive ? "；原连接仍在运行，请手动选择最新节点" : "")
+        } catch {
+            busy = false
+            detail = "更新失败，已保留原节点：" + error.localizedDescription
+        }
     }
 
     /// Both refresh and changed-URL edits use the same validation and parsing.
@@ -918,9 +1032,15 @@ final class HarborProxyManager: ObservableObject {
     /// No Xray restart is performed. Preserve matching profile IDs, aliases
     /// and favorites; retain an active endpoint removed by the provider until
     /// the user explicitly connects to a new profile.
-    @discardableResult
+    private struct SubscriptionNodeUpdate {
+        let count: Int
+        let retainedActive: Bool
+        let previousNodeIDs: Set<String>
+    }
+
     private func applySubscriptionNodes(_ incoming: [HarborProxyNode], id: String)
-        -> (count: Int, retainedActive: Bool) {
+        -> SubscriptionNodeUpdate {
+        let previousNodeIDs = Set(nodes.filter { $0.subscriptionID == id }.map(\.id))
         let merged = HarborProxySubscriptionReconciler.replace(
             current: nodes, incoming: incoming, subscriptionID: id,
             selectedID: selectedID, keepActiveConnection: running
@@ -931,7 +1051,34 @@ final class HarborProxyManager: ObservableObject {
         scheduleGeoIPRefresh()
         probeResults = probeResults.filter { validIDs.contains($0.key) }
         subscriptionUpdatedAt[id] = .now
-        return (incoming.count, merged.retainedActiveNode)
+        return SubscriptionNodeUpdate(
+            count: incoming.count,
+            retainedActive: merged.retainedActiveNode,
+            previousNodeIDs: previousNodeIDs
+        )
+    }
+
+    private func resolveServerIPs(for subscriptionID: String) async -> [String: String] {
+        let hosts = Array(Set(nodes.filter { $0.subscriptionID == subscriptionID }
+            .map { $0.host.lowercased() })).filter { !$0.isEmpty }
+        var resolved: [String: String] = [:]
+        await withTaskGroup(of: (String, String?).self) { group in
+            for host in hosts {
+                group.addTask { (host, await HarborNodeGeoIPResolver.resolvedIP(for: host)) }
+            }
+            for await (host, ip) in group {
+                guard let ip else { continue }
+                resolved[host] = ip
+                let previous = nodeServerLocations[host]
+                let countryCode = previous?.matches(ip) == true
+                    ? previous?.countryCode
+                    : nodeServerLocations.values.first(where: { $0.matches(ip) })?.countryCode
+                nodeServerLocations[host] = HarborProxyIPLocation(
+                    ip: ip, countryCode: countryCode ?? "ZZ"
+                )
+            }
+        }
+        return resolved
     }
 
     /// Explicit refresh of the selected node (also used when routing changes).
@@ -1059,9 +1206,9 @@ final class HarborProxyManager: ObservableObject {
 
     /// The visible 'clear proxy' action never silently deletes another
     /// application's system settings or node/subscription configurations.
-    func clearProxy() async {
+    func clearProxy(interactive: Bool = false) async {
         if running || HarborSystemProxy.hasBackup {
-            if await stop() {
+            if await stop(interactive: interactive) {
                 autoManageSystemProxy = false
                 persist()
             }
@@ -1298,7 +1445,26 @@ final class HarborProxyManager: ObservableObject {
     }
 
     func testRealLatency(_ ids: [String]) async {
-        await testLatency(ids, kind: .real)
+        let requested = Set(ids)
+        let requestedNodes = nodes.filter { requested.contains($0.id) }
+        let subscriptionIDs = Set(requestedNodes.map(\.subscriptionID).filter { !$0.isEmpty })
+        let finalization: SubscriptionProbeFinalization?
+        if subscriptionIDs.count == 1, let subscriptionID = subscriptionIDs.first {
+            let group = nodes.filter { $0.subscriptionID == subscriptionID }
+            let isFirstCompleteTest = Set(group.map(\.id)) == requested
+                && group.allSatisfy { proxyResultIsUntested($0.id) }
+            finalization = isFirstCompleteTest
+                ? .init(subscriptionID: subscriptionID,
+                        newNodeIDs: requested, initialImport: true)
+                : nil
+        } else {
+            finalization = nil
+        }
+        await testLatency(ids, kind: .real, finalization: finalization)
+    }
+
+    private func proxyResultIsUntested(_ id: String) -> Bool {
+        probeResults[id]?.realTested != true
     }
 
     /// Retained for existing callers: latency without an explicit kind means
@@ -1307,7 +1473,17 @@ final class HarborProxyManager: ObservableObject {
         await testRealLatency(ids)
     }
 
-    private func testLatency(_ ids: [String], kind: HarborProxyLatencyTestKind) async {
+    private struct SubscriptionProbeFinalization {
+        let subscriptionID: String
+        let newNodeIDs: Set<String>
+        let initialImport: Bool
+    }
+
+    private func testLatency(
+        _ ids: [String],
+        kind: HarborProxyLatencyTestKind,
+        finalization: SubscriptionProbeFinalization? = nil
+    ) async {
         guard !latencyTesting, !busy, kind == .tcp || coreInstalled else {
             if kind == .real && !coreInstalled {
                 detail = "内置 Xray 不完整，暂时无法进行真实测速"
@@ -1334,10 +1510,16 @@ final class HarborProxyManager: ObservableObject {
             latencyCancellationRequested = false
             latencyCancellation = nil
         }
-        let batchSize = HarborProxyLatencyPolicy.parallelCount
         let latencyRoot = root
         let latencyRuleMode = routingRules
         let latencyForcedDomains = forcedProxyDomains
+        let sharedRealBatch = kind == .real
+            ? await HarborNodeLatencyTester.startRealBatch(
+                nodes: targets, root: latencyRoot, cancellation: cancellation)
+            : nil
+        let batchSize = sharedRealBatch == nil
+            ? HarborProxyLatencyPolicy.parallelCount
+            : min(targets.count, HarborProxyLatencyPolicy.realPingBatchSize)
         for offset in stride(from: 0, to: targets.count, by: batchSize) {
             if latencyCancellationRequested || Task.isCancelled { break }
             let batch = Array(targets[offset..<min(offset + batchSize, targets.count)])
@@ -1352,12 +1534,17 @@ final class HarborProxyManager: ObservableObject {
                             )
                             return (node.id, milliseconds, nil)
                         }
-                        let report = await HarborNodeLatencyTester.measure(
-                            node: node, root: latencyRoot,
-                            ruleMode: latencyRuleMode,
-                            forcedProxyDomains: latencyForcedDomains,
-                            cancellation: cancellation
-                        )
+                        let report: HarborNodeDelayReport
+                        if let sharedRealBatch {
+                            report = await sharedRealBatch.measure(node: node)
+                        } else {
+                            report = await HarborNodeLatencyTester.measure(
+                                node: node, root: latencyRoot,
+                                ruleMode: latencyRuleMode,
+                                forcedProxyDomains: latencyForcedDomains,
+                                cancellation: cancellation
+                            )
+                        }
                         return (node.id, report.milliseconds, report.failure)
                     }
                 }
@@ -1393,12 +1580,22 @@ final class HarborProxyManager: ObservableObject {
                 }
             }
         }
+        if let sharedRealBatch {
+            await Task.detached(priority: .utility) { sharedRealBatch.close() }.value
+        }
         let label = kind == .tcp ? "TCP 测速" : "真实测速"
         proxyAudit(kind == .tcp ? "tcp_probe_batch_done" : "real_probe_batch_done",
                    note: "tested=\(latencyCompleted) successes=\(succeeded)")
         if !latencyCancellationRequested && !Task.isCancelled {
             lastCompletedLatencyTestKind = kind
             latencyCompletionSerial += 1
+            if kind == .real, let finalization {
+                finalizeSubscriptionProbes(finalization)
+            }
+            for id in Set(targets.map(\.subscriptionID)).filter({ !$0.isEmpty }) {
+                refreshAutomaticNames(for: id)
+            }
+            persist()
         }
         detail = latencyCancellationRequested || Task.isCancelled
             ? "已停止测速，完成 \(latencyCompleted)/\(latencyTotal) 个节点"
@@ -1408,6 +1605,40 @@ final class HarborProxyManager: ObservableObject {
            !latencyCancellationRequested {
             detail += " · " + reason
         }
+    }
+
+    private func finalizeSubscriptionProbes(_ finalization: SubscriptionProbeFinalization) {
+        var group = nodes.filter { $0.subscriptionID == finalization.subscriptionID }
+        if finalization.initialImport {
+            group = HarborProxySubscriptionRefreshPolicy.initialLatencyOrder(
+                group, results: probeResults
+            )
+        } else if !finalization.newNodeIDs.isEmpty {
+            let existing = group.filter { !finalization.newNodeIDs.contains($0.id) }
+            let additions = HarborProxySubscriptionRefreshPolicy.initialLatencyOrder(
+                group.filter { finalization.newNodeIDs.contains($0.id) }, results: probeResults
+            )
+            group = existing + additions
+        }
+
+        var iterator = group.makeIterator()
+        nodes = nodes.map { node in
+            node.subscriptionID == finalization.subscriptionID ? (iterator.next() ?? node) : node
+        }
+    }
+
+    @discardableResult
+    private func refreshAutomaticNames(for subscriptionID: String) -> Bool {
+        let group = nodes.filter { $0.subscriptionID == subscriptionID }
+        let renamed = HarborProxyAutomaticName.refreshed(
+            group, results: probeResults, locations: nodeServerLocations
+        )
+        guard group != renamed else { return false }
+        var iterator = renamed.makeIterator()
+        nodes = nodes.map { node in
+            node.subscriptionID == subscriptionID ? (iterator.next() ?? node) : node
+        }
+        return true
     }
 
     func cancelLatencyTests() {

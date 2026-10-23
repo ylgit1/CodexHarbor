@@ -1,4 +1,5 @@
 import CodexHarborCore
+import CFNetwork
 import Darwin
 import Foundation
 
@@ -59,12 +60,11 @@ struct HarborNodeDelayReport: Sendable {
     }
 }
 
-/// One v2rayN-style real-delay attempt. The temporary Xray and curl process
-/// are isolated from the active proxy and can both be stopped immediately.
+/// One v2rayN-style real-delay attempt, isolated from the active proxy.
 private final class HarborRealDelayAttempt: @unchecked Sendable {
     private let lock = NSLock()
     private var engine: Process?
-    private var request: Process?
+    private var request: URLSessionTask?
     private var cancelled = false
 
     func cancel() {
@@ -73,7 +73,7 @@ private final class HarborRealDelayAttempt: @unchecked Sendable {
         let engine = engine
         let request = request
         lock.unlock()
-        if request?.isRunning == true { request?.terminate() }
+        request?.cancel()
         if engine?.isRunning == true { engine?.terminate() }
     }
 
@@ -90,6 +90,7 @@ private final class HarborRealDelayAttempt: @unchecked Sendable {
         }
         defer { cancellation.removeObserver(token) }
 
+        let target = HarborNodeLatencyTester.realPingURL()
         let xray = root.appendingPathComponent("xray")
         let configPath = root.appendingPathComponent("probe-\(UUID().uuidString).json")
         guard FileManager.default.isExecutableFile(atPath: xray.path),
@@ -98,7 +99,7 @@ private final class HarborRealDelayAttempt: @unchecked Sendable {
                 httpPort: port,
                 ruleMode: ruleMode,
                 forcedProxyDomains: forcedProxyDomains,
-                routeVerificationViaProxy: true
+                routeAllViaProxy: true
               ),
               (try? data.write(to: configPath, options: .atomic)) != nil else {
             return .failed("节点配置无效或 Xray 不可用")
@@ -112,16 +113,16 @@ private final class HarborRealDelayAttempt: @unchecked Sendable {
         engine.arguments = ["run", "-config", configPath.path]
         engine.standardOutput = FileHandle.nullDevice
         engine.standardError = FileHandle.nullDevice
-        guard install(engine, asRequest: false) else { return .failed("测试已取消") }
+        guard install(engine) else { return .failed("测试已取消") }
         do { try engine.run() } catch {
-            clear(engine, asRequest: false)
+            clear(engine)
             return .failed("Xray 启动失败")
         }
         if isCancelled, engine.isRunning { engine.terminate() }
         defer {
             if engine.isRunning { engine.terminate() }
             engine.waitUntilExit()
-            clear(engine, asRequest: false)
+            clear(engine)
         }
 
         guard HarborNodeLatencyTester.waitUntilListening(
@@ -130,59 +131,52 @@ private final class HarborRealDelayAttempt: @unchecked Sendable {
             cancellation: cancellation
         ) else { return .failed(isCancelled ? "测试已取消" : "Xray 本地监听启动失败") }
         guard !isCancelled else { return .failed("测试已取消") }
-        var lastError = "HTTPS 请求失败"
-
-        for address in [
-            "https://www.gstatic.com/generate_204",
-            "https://www.cloudflare.com/cdn-cgi/trace"
-        ] {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.connectionProxyDictionary = [
+            kCFNetworkProxiesSOCKSEnable as String: 1,
+            kCFNetworkProxiesSOCKSProxy as String: "127.0.0.1",
+            kCFNetworkProxiesSOCKSPort as String: port + 1
+        ]
+        configuration.timeoutIntervalForRequest = TimeInterval(HarborProxyLatencyPolicy.requestTimeoutSeconds)
+        configuration.timeoutIntervalForResource = TimeInterval(HarborProxyLatencyPolicy.requestTimeoutSeconds)
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let deadline = ContinuousClock.now.advanced(
+            by: .seconds(HarborProxyLatencyPolicy.requestTimeoutSeconds))
+        var timings: [Int] = []
+        for _ in 0..<HarborProxyLatencyPolicy.realPingRequestCount {
             guard !isCancelled else { return .failed("测试已取消") }
-            let curl = Process()
-            let output = Pipe()
-            curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-            curl.arguments = [
-                "-q", "--silent", "--fail", "--noproxy", "",
-                "--proxy", "http://127.0.0.1:\(port)",
-                "--connect-timeout", String(HarborProxyLatencyPolicy.connectTimeoutSeconds),
-                "--max-time", String(HarborProxyLatencyPolicy.requestTimeoutSeconds),
-                "--output", "/dev/null", "--write-out", "%{time_total}",
-                address
-            ]
-            var environment = ProcessInfo.processInfo.environment
-            for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
-                environment.removeValue(forKey: key)
+            let remaining = ContinuousClock.now.duration(to: deadline)
+            guard remaining > .zero else { return .failed("真实测速超时") }
+            let result = ProbeResponse()
+            let done = DispatchSemaphore(value: 0)
+            let started = ContinuousClock.now
+            let task = session.dataTask(with: target) { _, response, error in
+                result.set(response != nil && error == nil,
+                           errorCode: (error as NSError?)?.code)
+                done.signal()
             }
-            curl.environment = environment
-            curl.standardOutput = output
-            curl.standardError = FileHandle.nullDevice
-            guard install(curl, asRequest: true) else { return .failed("测试已取消") }
-            do { try curl.run() } catch {
-                clear(curl, asRequest: true)
-                lastError = "HTTPS 测试工具启动失败"
-                continue
-            }
-            if isCancelled, curl.isRunning { curl.terminate() }
-            curl.waitUntilExit()
-            clear(curl, asRequest: true)
+            guard install(task) else { return .failed("测试已取消") }
+            task.resume()
+            let completed = done.wait(timeout: .now() + remaining.timeInterval) == .success
+            if !completed { task.cancel() }
+            clear(task)
             guard !isCancelled else { return .failed("测试已取消") }
-            let value = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if curl.terminationStatus == 0, let seconds = Double(value), seconds >= 0 {
-                return .succeeded(max(1, Int((seconds * 1_000).rounded())))
+            guard completed, result.succeeded else {
+                if completed && result.errorCode == NSURLErrorAppTransportSecurityRequiresSecureConnection {
+                    return .failed("测速地址的 HTTP 请求被 macOS 安全策略阻止")
+                }
+                return .failed(completed ? "真实测速请求失败" : "真实测速超时")
             }
-            // curl exit codes are intentionally coarse. A timeout alone
-            // cannot tell TLS handshake filtering from a broken proxy path.
-            switch curl.terminationStatus {
-            case 28: lastError = "HTTPS 超时（TLS / WebSocket / 上游网络）"
-            case 35: lastError = "TLS 握手失败"
-            case 52, 56: lastError = "远端断开代理连接"
-            case 5, 6: lastError = "DNS 解析失败"
-            case 7: lastError = "代理连接失败"
-            case 22: lastError = "HTTPS 返回错误状态"
-            default: lastError = "HTTPS 验证未通过（代码 \(curl.terminationStatus)）"
-            }
+            let elapsed = started.duration(to: .now).timeInterval
+            timings.append(Int(elapsed * 1_000))
+            Thread.sleep(forTimeInterval:
+                Double(HarborProxyLatencyPolicy.realPingPauseMilliseconds) / 1_000)
         }
-        return .failed(lastError)
+        guard let minimum = timings.filter({ $0 > 0 }).min() else {
+            return .failed("真实测速请求失败")
+        }
+        return .succeeded(minimum)
     }
 
     private var isCancelled: Bool {
@@ -191,28 +185,232 @@ private final class HarborRealDelayAttempt: @unchecked Sendable {
         return cancelled
     }
 
-    private func install(_ process: Process, asRequest: Bool) -> Bool {
+    private func install(_ process: Process) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         guard !cancelled else { return false }
-        if asRequest { request = process } else { engine = process }
+        engine = process
         return true
     }
 
-    private func clear(_ process: Process, asRequest: Bool) {
+    private func clear(_ process: Process) {
         lock.lock()
         defer { lock.unlock() }
-        if asRequest, request === process { request = nil }
-        if !asRequest, engine === process { engine = nil }
+        if engine === process { engine = nil }
+    }
+
+    private func install(_ task: URLSessionTask) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled else { return false }
+        request = task
+        return true
+    }
+
+    private func clear(_ task: URLSessionTask) {
+        lock.lock()
+        defer { lock.unlock() }
+        if request === task { request = nil }
     }
 }
 
-/// Measures real HTTPS response time through an isolated Xray instance. A
+private final class ProbeResponse: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    private var code: Int?
+    var succeeded: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+    var errorCode: Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        return code
+    }
+    func set(_ newValue: Bool, errorCode: Int?) {
+        lock.lock()
+        value = newValue
+        code = errorCode
+        lock.unlock()
+    }
+}
+
+private extension Duration {
+    var timeInterval: TimeInterval {
+        let parts = components
+        return TimeInterval(parts.seconds) + TimeInterval(parts.attoseconds) / 1e18
+    }
+}
+
+/// One Xray process for the entire real-ping batch. Each mixed inbound is
+/// routed to exactly one outbound, matching v2rayN's speedtest configuration.
+final class HarborRealDelayBatch: @unchecked Sendable {
+    private let engine: Process
+    private let configPath: URL
+    private let basePort: Int
+    private let portsByNodeID: [String: Int]
+    private let cancellation: HarborLatencyCancellation
+    private let cancellationObserver: UUID
+    private let lock = NSLock()
+    private var stopped = false
+
+    init?(nodes: [HarborProxyNode], root: URL,
+          cancellation: HarborLatencyCancellation) {
+        guard Set(nodes.map(\.id)).count == nodes.count else { return nil }
+        guard let basePort = HarborNodeLatencyTester.reservePortRange(nodes.count) else { return nil }
+        let configPath = root.appendingPathComponent("probe-batch-\(UUID().uuidString).json")
+        let xray = root.appendingPathComponent("xray")
+        guard FileManager.default.isExecutableFile(atPath: xray.path),
+              let data = try? HarborXrayConfig.makeRealPingBatch(
+                nodes: nodes, basePort: basePort),
+              (try? data.write(to: configPath, options: .atomic)) != nil else {
+            HarborNodeLatencyTester.releasePortRange(basePort, count: nodes.count)
+            return nil
+        }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configPath.path)
+        let engine = Process()
+        engine.executableURL = xray
+        engine.currentDirectoryURL = root
+        engine.arguments = ["run", "-config", configPath.path]
+        engine.standardOutput = FileHandle.nullDevice
+        engine.standardError = FileHandle.nullDevice
+        self.engine = engine
+        self.configPath = configPath
+        self.basePort = basePort
+        self.portsByNodeID = Dictionary(uniqueKeysWithValues:
+            nodes.enumerated().map { ($0.element.id, basePort + $0.offset) })
+        self.cancellation = cancellation
+        guard let observer = cancellation.observe({ [weak engine] in
+            if engine?.isRunning == true { engine?.terminate() }
+        }) else {
+            try? FileManager.default.removeItem(at: configPath)
+            HarborNodeLatencyTester.releasePortRange(basePort, count: nodes.count)
+            return nil
+        }
+        self.cancellationObserver = observer
+        do { try engine.run() } catch {
+            close()
+            return nil
+        }
+        guard HarborNodeLatencyTester.waitUntilListening(
+            port: basePort, process: engine, cancellation: cancellation),
+              HarborNodeLatencyTester.waitUntilListening(
+                port: basePort + nodes.count - 1,
+                process: engine, cancellation: cancellation) else {
+            close()
+            return nil
+        }
+    }
+
+    func close() {
+        lock.lock()
+        if stopped { lock.unlock(); return }
+        stopped = true
+        lock.unlock()
+        cancellation.removeObserver(cancellationObserver)
+        if engine.isRunning { engine.terminate() }
+        if engine.processIdentifier != 0 { engine.waitUntilExit() }
+        try? FileManager.default.removeItem(at: configPath)
+        HarborNodeLatencyTester.releasePortRange(basePort, count: portsByNodeID.count)
+    }
+
+    func measure(node: HarborProxyNode) async -> HarborNodeDelayReport {
+        guard let port = portsByNodeID[node.id], !cancellation.isCancelled else {
+            return .failed("测试已取消")
+        }
+        let target = HarborNodeLatencyTester.realPingURL()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.connectionProxyDictionary = [
+            kCFNetworkProxiesSOCKSEnable as String: 1,
+            kCFNetworkProxiesSOCKSProxy as String: "127.0.0.1",
+            kCFNetworkProxiesSOCKSPort as String: port
+        ]
+        configuration.timeoutIntervalForRequest = TimeInterval(HarborProxyLatencyPolicy.requestTimeoutSeconds)
+        configuration.timeoutIntervalForResource = TimeInterval(HarborProxyLatencyPolicy.requestTimeoutSeconds)
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        guard let observer = cancellation.observe({ session.invalidateAndCancel() }) else {
+            return .failed("测试已取消")
+        }
+        defer { cancellation.removeObserver(observer) }
+        let deadline = ContinuousClock.now.advanced(
+            by: .seconds(HarborProxyLatencyPolicy.requestTimeoutSeconds))
+        var timings: [Int] = []
+        for _ in 0..<HarborProxyLatencyPolicy.realPingRequestCount {
+            guard !cancellation.isCancelled, !Task.isCancelled else {
+                return .failed("测试已取消")
+            }
+            let remaining = ContinuousClock.now.duration(to: deadline)
+            guard remaining > .zero else { return .failed("真实测速超时") }
+            var request = URLRequest(url: target, cachePolicy: .reloadIgnoringLocalCacheData)
+            request.timeoutInterval = remaining.timeInterval
+            let started = ContinuousClock.now
+            do {
+                // Any HTTP response is a result, including non-2xx statuses,
+                // just as HttpClient.GetAsync is used by v2rayN.
+                _ = try await session.data(for: request)
+            } catch {
+                if cancellation.isCancelled || Task.isCancelled {
+                    return .failed("测试已取消")
+                }
+                if (error as NSError).code == NSURLErrorAppTransportSecurityRequiresSecureConnection {
+                    return .failed("测速地址的 HTTP 请求被 macOS 安全策略阻止")
+                }
+                return .failed(ContinuousClock.now >= deadline
+                    ? "真实测速超时" : "真实测速请求失败")
+            }
+            timings.append(Int(started.duration(to: .now).timeInterval * 1_000))
+            try? await Task.sleep(for: .milliseconds(
+                HarborProxyLatencyPolicy.realPingPauseMilliseconds))
+        }
+        guard let minimum = timings.filter({ $0 > 0 }).min() else {
+            return .failed("真实测速请求失败")
+        }
+        return .succeeded(minimum)
+    }
+}
+
+/// Measures real HTTP response time through an isolated Xray instance. A
 /// result proves that the node protocol and remote proxy path carried traffic;
 /// it is not a direct TCP handshake to the server port.
 enum HarborNodeLatencyTester {
     private static let portLock = NSLock()
     private nonisolated(unsafe) static var reservedPorts: Set<Int> = []
+
+    fileprivate static func realPingURL() -> URL {
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/v2rayN/guiConfigs/guiNConfig.json")
+        let data = try? Data(contentsOf: path)
+        return HarborProxyRealPingTarget.resolve(v2rayNConfigurationData: data)
+    }
+
+    static func startRealBatch(nodes: [HarborProxyNode], root: URL,
+                               cancellation: HarborLatencyCancellation) async -> HarborRealDelayBatch? {
+        await Task.detached(priority: .utility) {
+            HarborRealDelayBatch(nodes: nodes, root: root, cancellation: cancellation)
+        }.value
+    }
+
+    fileprivate static func reservePortRange(_ count: Int) -> Int? {
+        guard (1...HarborProxyLatencyPolicy.realPingBatchSize).contains(count) else { return nil }
+        portLock.lock()
+        defer { portLock.unlock() }
+        for base in 18200...(19400 - count) {
+            let range = base..<(base + count)
+            if range.allSatisfy({ !reservedPorts.contains($0) && isAvailable($0) }) {
+                reservedPorts.formUnion(range)
+                return base
+            }
+        }
+        return nil
+    }
+
+    fileprivate static func releasePortRange(_ base: Int, count: Int) {
+        portLock.lock()
+        reservedPorts.subtract(base..<(base + count))
+        portLock.unlock()
+    }
 
     /// Fast server-port reachability only. This intentionally does not claim
     /// that credentials, TLS, the proxy protocol, or internet egress work.

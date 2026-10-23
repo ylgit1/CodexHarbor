@@ -295,6 +295,7 @@ struct HarborDestructiveConfirmDialog: View {
     let title: String
     let message: String
     var confirmTitle: String = "删除"
+    var isWorking = false
     let onCancel: () -> Void
     let onConfirm: () -> Void
 
@@ -324,13 +325,16 @@ struct HarborDestructiveConfirmDialog: View {
                 Button("取消", action: onCancel)
                     .keyboardShortcut(.cancelAction)
                     .buttonStyle(HarborActionButtonStyle(tint: .secondary, prominence: .secondary))
+                    .disabled(isWorking)
                 Button(confirmTitle, role: .destructive, action: onConfirm)
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(HarborActionButtonStyle(tint: HarborColors.red, prominence: .prominent))
+                    .disabled(isWorking)
             }
         }
         .padding(24)
         .frame(width: 440)
         .background(HarborColors.cardBackground)
+        .interactiveDismissDisabled(isWorking)
     }
 }

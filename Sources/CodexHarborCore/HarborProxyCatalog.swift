@@ -38,12 +38,14 @@ public enum HarborProxyRegion: String, CaseIterable, Sendable {
     }
 }
 
-/// Real-delay probes are bounded because every concurrent item owns one
-/// isolated Xray process and an HTTPS request.
+/// Real-delay probes share one Xray batch, as in v2rayN.
 public enum HarborProxyLatencyPolicy {
     public static let parallelCount = 4
+    public static let realPingBatchSize = 1_000
     public static let connectTimeoutSeconds = 2
-    public static let requestTimeoutSeconds = 5
+    public static let requestTimeoutSeconds = 10
+    public static let realPingRequestCount = 2
+    public static let realPingPauseMilliseconds = 100
     public static let listenerStartupTimeoutMilliseconds = 3_000
     public static let goodUpperBoundMilliseconds = 1_500
     public static let warningUpperBoundMilliseconds = 2_000
@@ -55,10 +57,28 @@ public enum HarborProxyMeasurementLabel {
     }
 
     public static let explanation =
-        "通过独立 Xray 和节点代理完成 HTTPS 请求的真实延迟；它验证代理可用性，但不等同于下载带宽"
+        "参照 v2rayN：通过独立 Xray 的 SOCKS5 代理请求同一测速地址两次，显示较低延迟；不等同于下载带宽"
 }
 
-public struct HarborProxyProbeResult: Sendable, Equatable {
+public enum HarborProxyRealPingTarget {
+    public static let defaultURL = URL(string: "https://www.google.com/generate_204")!
+
+    /// v2rayN 7.17.0 stores the selected real-ping URL in guiNConfig.json.
+    /// An absent or malformed local configuration uses its own default URL.
+    public static func resolve(v2rayNConfigurationData data: Data?) -> URL {
+        guard let data, let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let speedTest = root["SpeedTestItem"] as? [String: Any],
+              let raw = speedTest["SpeedPingTestUrl"] as? String,
+              raw.utf8.count <= 2_048,
+              let url = URL(string: raw),
+              let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = url.host, !host.isEmpty,
+              url.user == nil, url.password == nil else { return defaultURL }
+        return url
+    }
+}
+
+public struct HarborProxyProbeResult: Codable, Sendable, Equatable {
     public var milliseconds: Int?
     public var tcpMilliseconds: Int?
     public var checkedAt: Date
@@ -76,6 +96,89 @@ public struct HarborProxyProbeResult: Sendable, Equatable {
         self.realTested = realTested ?? (milliseconds != nil)
         self.tcpTested = tcpTested ?? (tcpMilliseconds != nil)
         self.realFailureReason = realFailureReason
+    }
+}
+
+/// Subscription refreshes keep the first successful latency order. Only a
+/// genuinely new profile or a profile whose resolved server IP changed needs
+/// another end-to-end probe.
+public enum HarborProxySubscriptionRefreshPolicy {
+    public static func nodesRequiringProbe(
+        previousNodeIDs: Set<String>,
+        refreshedNodes: [HarborProxyNode],
+        previousResolvedIPs: [String: String],
+        currentResolvedIPs: [String: String]
+    ) -> Set<String> {
+        Set(refreshedNodes.compactMap { node in
+            if !previousNodeIDs.contains(node.id) { return node.id }
+            let host = node.host.lowercased()
+            guard let old = previousResolvedIPs[host],
+                  let current = currentResolvedIPs[host], old != current else { return nil }
+            return node.id
+        })
+    }
+
+    public static func initialLatencyOrder(
+        _ nodes: [HarborProxyNode],
+        results: [String: HarborProxyProbeResult]
+    ) -> [HarborProxyNode] {
+        let original = Dictionary(uniqueKeysWithValues: nodes.enumerated().map { ($0.element.id, $0.offset) })
+        return nodes.sorted { lhs, rhs in
+            switch (results[lhs.id]?.milliseconds, results[rhs.id]?.milliseconds) {
+            case let (left?, right?) where left != right: return left < right
+            case (_?, nil): return true
+            case (nil, _?): return false
+            default: return (original[lhs.id] ?? 0) < (original[rhs.id] ?? 0)
+            }
+        }
+    }
+}
+
+public enum HarborProxyAutomaticName {
+    public static let unresolvedRegion = "待识别"
+
+    public static func speedTier(milliseconds: Int) -> String {
+        if milliseconds < HarborProxyLatencyPolicy.goodUpperBoundMilliseconds { return "高速" }
+        if milliseconds < HarborProxyLatencyPolicy.warningUpperBoundMilliseconds { return "中速" }
+        return "低速"
+    }
+
+    public static func make(region: String, milliseconds: Int, sequence: Int) -> String {
+        "\(region)-\(speedTier(milliseconds: milliseconds))-可用-\(String(format: "%03d", sequence))"
+    }
+
+    public static func sequence(from name: String?) -> Int? {
+        guard let suffix = name?.split(separator: "-").last,
+              suffix.count == 3, let value = Int(suffix), value > 0 else { return nil }
+        return value
+    }
+
+    /// The IP country shown in the table is also the country used in the
+    /// automatic name. Never infer it from a provider's node remark.
+    public static func refreshed(
+        _ nodes: [HarborProxyNode],
+        results: [String: HarborProxyProbeResult],
+        locations: [String: HarborProxyIPLocation]
+    ) -> [HarborProxyNode] {
+        var sequences: [String: Int] = [:]
+        return nodes.map { original in
+            var node = original
+            guard !node.subscriptionID.isEmpty,
+                  let result = results[node.id], result.realTested else { return node }
+            node.customName = nil
+            guard let milliseconds = result.milliseconds else {
+                node.automaticName = nil
+                return node
+            }
+            let region = locations[node.host.lowercased()]?.displayRegion ?? unresolvedRegion
+            let base = "\(region)-\(speedTier(milliseconds: milliseconds))-可用"
+            let sequence = sequences[base, default: 0] + 1
+            sequences[base] = sequence
+            node.automaticName = make(
+                region: region, milliseconds: milliseconds, sequence: sequence
+            )
+            return node
+        }
     }
 }
 
@@ -99,8 +202,12 @@ public struct HarborProxyIPLocation: Codable, Equatable, Sendable {
         }
     }
 
+    public var displayRegion: String {
+        countryCode == "ZZ" ? HarborProxyAutomaticName.unresolvedRegion : countryName
+    }
+
     public var flag: String {
-        guard countryCode.count == 2,
+        guard countryCode != "ZZ", countryCode.count == 2,
               countryCode.unicodeScalars.allSatisfy({ (65...90).contains($0.value) }) else {
             return "🌐"
         }

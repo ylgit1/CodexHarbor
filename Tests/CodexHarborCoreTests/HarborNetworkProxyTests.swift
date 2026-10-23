@@ -73,11 +73,13 @@ struct HarborNetworkProxyTests {
     @Test("Real proxy delay has bounded concurrency and request timeouts")
     func measuredProxyDurationLabel() {
         #expect(HarborProxyMeasurementLabel.measured(197) == "197 ms")
-        #expect(HarborProxyMeasurementLabel.explanation.contains("HTTPS"))
-        #expect(HarborProxyMeasurementLabel.explanation.contains("代理可用性"))
+        #expect(HarborProxyMeasurementLabel.explanation.contains("SOCKS5"))
+        #expect(HarborProxyMeasurementLabel.explanation.contains("v2rayN"))
         #expect(HarborProxyLatencyPolicy.parallelCount == 4)
         #expect(HarborProxyLatencyPolicy.connectTimeoutSeconds == 2)
-        #expect(HarborProxyLatencyPolicy.requestTimeoutSeconds == 5)
+        #expect(HarborProxyLatencyPolicy.requestTimeoutSeconds == 10)
+        #expect(HarborProxyLatencyPolicy.realPingRequestCount == 2)
+        #expect(HarborProxyLatencyPolicy.realPingPauseMilliseconds == 100)
         #expect(HarborProxyLatencyPolicy.listenerStartupTimeoutMilliseconds == 3_000)
         #expect(HarborProxyLatencyPolicy.goodUpperBoundMilliseconds == 1_500)
         #expect(HarborProxyLatencyPolicy.warningUpperBoundMilliseconds == 2_000)
@@ -85,6 +87,50 @@ struct HarborNetworkProxyTests {
         #expect(result.milliseconds == 1_650)
         #expect(result.tcpMilliseconds == 197)
         #expect(result.succeeded)
+    }
+
+    @Test("Real ping uses v2rayN's selected URL and its default on invalid configuration")
+    func v2rayNRealPingTarget() {
+        let configured = Data(#"{"SpeedTestItem":{"SpeedPingTestUrl":"http://www.msftconnecttest.com/connecttest.txt"}}"#.utf8)
+        #expect(HarborProxyRealPingTarget.resolve(v2rayNConfigurationData: configured).absoluteString
+                == "http://www.msftconnecttest.com/connecttest.txt")
+        #expect(HarborProxyRealPingTarget.resolve(v2rayNConfigurationData: nil)
+                == HarborProxyRealPingTarget.defaultURL)
+        let invalid = Data(#"{"SpeedTestItem":{"SpeedPingTestUrl":"file:///etc/passwd"}}"#.utf8)
+        #expect(HarborProxyRealPingTarget.resolve(v2rayNConfigurationData: invalid)
+                == HarborProxyRealPingTarget.defaultURL)
+    }
+
+    @Test("Isolated real ping does not let routing rules bypass the node")
+    func realPingRoutesAllViaNode() throws {
+        let node = HarborProxyNode(name: "test", protocolName: "vless",
+            host: "node.example.com", port: 443,
+            credential: "00000000-0000-0000-0000-000000000001")
+        let data = try HarborXrayConfig.make(node: node, httpPort: 18080,
+            ruleMode: true, routeAllViaProxy: true)
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let routing = try #require(json["routing"] as? [String: Any])
+        #expect((routing["rules"] as? [[String: Any]])?.isEmpty == true)
+    }
+
+    @Test("Real ping batch uses one mixed inbound and matching outbound per node")
+    func realPingBatchConfiguration() throws {
+        let nodes = ["192.0.2.1", "192.0.2.2"].map { host in
+            HarborProxyNode(name: host, protocolName: "vless", host: host,
+                port: 443, credential: "00000000-0000-0000-0000-000000000001")
+        }
+        let data = try HarborXrayConfig.makeRealPingBatch(nodes: nodes, basePort: 18200)
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let inbounds = try #require(json["inbounds"] as? [[String: Any]])
+        let outbounds = try #require(json["outbounds"] as? [[String: Any]])
+        let routing = try #require(json["routing"] as? [String: Any])
+        let rules = try #require(routing["rules"] as? [[String: Any]])
+        #expect(inbounds.map { $0["port"] as? Int } == [18200, 18201])
+        #expect(inbounds.allSatisfy { $0["protocol"] as? String == "mixed" })
+        #expect(outbounds.map { $0["tag"] as? String } == ["proxy18200", "proxy18201"])
+        #expect(rules.map { $0["inboundTag"] as? [String] } == [["mixed18200"], ["mixed18201"]])
+        #expect(rules.map { $0["outboundTag"] as? String } == ["proxy18200", "proxy18201"])
+        #expect(HarborProxyLatencyPolicy.realPingBatchSize == 1_000)
     }
 
     @Test("TCP and HTTPS probes retain independent measured/failed/unmeasured states")
@@ -221,6 +267,91 @@ struct HarborNetworkProxyTests {
         #expect(result.nodes.contains { $0.id == "new-id" })
         #expect(result.nodes.contains { $0.id == "manual" })
         #expect(!result.nodes.contains { $0.id == "expired" })
+    }
+
+    @Test("Subscription refresh preserves measured order and probes only new or IP-changed nodes")
+    func stableMeasuredSubscriptionOrder() {
+        let first = HarborProxyNode(id: "first", name: "A", automaticName: "美国-高速-可用-001",
+            protocolName: "vless", host: "a.example.com", port: 443, credential: "a",
+            subscriptionID: "group")
+        let second = HarborProxyNode(id: "second", name: "B", automaticName: "新加坡-中速-可用-001",
+            protocolName: "vless", host: "b.example.com", port: 443, credential: "b",
+            subscriptionID: "group")
+        let reorderedSecond = HarborProxyNode(id: "generated-b", name: "B2", protocolName: "vless",
+            host: "b.example.com", port: 443, credential: "b", subscriptionID: "group")
+        let reorderedFirst = HarborProxyNode(id: "generated-a", name: "A2", protocolName: "vless",
+            host: "a.example.com", port: 443, credential: "a", subscriptionID: "group")
+        let added = HarborProxyNode(id: "new", name: "C", protocolName: "vless",
+            host: "c.example.com", port: 443, credential: "c", subscriptionID: "group")
+
+        let merged = HarborProxySubscriptionReconciler.replace(
+            current: [first, second], incoming: [reorderedSecond, added, reorderedFirst],
+            subscriptionID: "group", selectedID: nil, keepActiveConnection: false
+        )
+        #expect(merged.nodes.map(\.id) == ["first", "second", "new"])
+        #expect(merged.nodes[0].automaticName == "美国-高速-可用-001")
+        #expect(merged.nodes[1].automaticName == "新加坡-中速-可用-001")
+
+        let requiringProbe = HarborProxySubscriptionRefreshPolicy.nodesRequiringProbe(
+            previousNodeIDs: ["first", "second"], refreshedNodes: merged.nodes,
+            previousResolvedIPs: ["a.example.com": "192.0.2.1", "b.example.com": "192.0.2.2"],
+            currentResolvedIPs: ["a.example.com": "192.0.2.9", "b.example.com": "192.0.2.2",
+                                 "c.example.com": "192.0.2.3"]
+        )
+        #expect(requiringProbe == ["first", "new"])
+    }
+
+    @Test("Initial real delay order and automatic names put the fastest usable node first")
+    func initialLatencyOrderAndNaming() {
+        let slow = HarborProxyNode(id: "slow", name: "slow", protocolName: "vless",
+            host: "slow.example.com", port: 443, credential: "slow")
+        let failed = HarborProxyNode(id: "failed", name: "failed", protocolName: "vless",
+            host: "failed.example.com", port: 443, credential: "failed")
+        let fast = HarborProxyNode(id: "fast", name: "fast", protocolName: "vless",
+            host: "fast.example.com", port: 443, credential: "fast")
+        let results = [
+            "slow": HarborProxyProbeResult(milliseconds: 1_740, realTested: true),
+            "failed": HarborProxyProbeResult(milliseconds: nil, realTested: true),
+            "fast": HarborProxyProbeResult(milliseconds: 596, realTested: true)
+        ]
+        #expect(HarborProxySubscriptionRefreshPolicy.initialLatencyOrder(
+            [slow, failed, fast], results: results
+        ).map(\.id) == ["fast", "slow", "failed"])
+        #expect(HarborProxyAutomaticName.make(region: "美国", milliseconds: 596, sequence: 1)
+                == "美国-高速-可用-001")
+        #expect(HarborProxyAutomaticName.make(region: "新加坡", milliseconds: 1_740, sequence: 1)
+                == "新加坡-中速-可用-001")
+        #expect(HarborProxyAutomaticName.sequence(from: "美国-高速-可用-017") == 17)
+    }
+
+    @Test("Every probe refreshes names from server IP country, never provider remarks")
+    func automaticNamesUseServerLocation() {
+        let first = HarborProxyNode(id: "first", name: "SIN-SG-old",
+            customName: "新加坡-高速-可用-001", protocolName: "vless",
+            host: "172.64.155.175", port: 2096, credential: "one", subscriptionID: "group")
+        let second = HarborProxyNode(id: "second", name: "NRT-JP-original",
+            protocolName: "vless", host: "172.64.229.213", port: 443,
+            credential: "two", subscriptionID: "group")
+        let results = [
+            "first": HarborProxyProbeResult(milliseconds: 609, realTested: true),
+            "second": HarborProxyProbeResult(milliseconds: 209, realTested: true)
+        ]
+        let locations = [
+            first.host: HarborProxyIPLocation(ip: first.host, countryCode: "US"),
+            second.host: HarborProxyIPLocation(ip: second.host, countryCode: "US")
+        ]
+        let renamed = HarborProxyAutomaticName.refreshed(
+            [first, second], results: results, locations: locations
+        )
+        #expect(renamed.map(\.displayName) == ["美国-高速-可用-001", "美国-高速-可用-002"])
+        #expect(renamed.allSatisfy { $0.customName == nil })
+        #expect(renamed.map(\.name) == ["SIN-SG-old", "NRT-JP-original"])
+
+        let unknown = HarborProxyAutomaticName.refreshed(
+            [first], results: results, locations: [:]
+        )
+        #expect(unknown[0].displayName == "待识别-高速-可用-001")
+        #expect(HarborProxyIPLocation(ip: first.host, countryCode: "ZZ").flag == "🌐")
     }
 
     @Test("Removed active subscription node stays selected until user switches")

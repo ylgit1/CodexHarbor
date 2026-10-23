@@ -129,7 +129,11 @@ public struct HarborProxyNode: Codable, Identifiable, Sendable, Hashable {
         endpoint.customName = nil
         endpoint.automaticName = nil
         endpoint.subscriptionID = ""
-        guard let data = try? JSONEncoder().encode(endpoint) else { return "" }
+        // JSONEncoder's default object-key order is not stable across
+        // processes/toolchains; hashes must survive restarts and macOS CI.
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        guard let data = try? encoder.encode(endpoint) else { return "" }
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }

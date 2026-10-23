@@ -162,10 +162,10 @@ public struct SearchTool: Sendable {
             }
         }
 
-        let values = try searchRoot.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
-        if values.isRegularFile == true {
-            try appendMatches(from: searchRoot)
-        } else if values.isDirectory == true {
+        // DirectoryEnumerator's NSFastEnumeration iterator cannot be created
+        // directly inside an async context on newer Swift toolchains.
+        // Keep enumeration synchronous; the workspace lookup above is async.
+        func appendDirectoryMatches() throws {
             let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
             guard let enumerator = FileManager.default.enumerator(
                 at: searchRoot,
@@ -178,6 +178,13 @@ public struct SearchTool: Sendable {
                 try appendMatches(from: fileURL)
                 if truncated { break }
             }
+        }
+
+        let values = try searchRoot.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
+        if values.isRegularFile == true {
+            try appendMatches(from: searchRoot)
+        } else if values.isDirectory == true {
+            try appendDirectoryMatches()
         } else {
             throw BridgeError.invalidPath(searchRoot.path)
         }

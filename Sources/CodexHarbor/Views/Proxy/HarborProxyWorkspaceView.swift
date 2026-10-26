@@ -14,7 +14,9 @@ struct HarborProxyWorkspaceView: View {
     @State private var protocolFilter = "全部"
     @State private var latencyFilter = "全部"
     @State private var showUnavailable = false
-    @State private var latencyAscending: Bool? = nil
+    @State private var latencyAscending: Bool? = true
+    // The table keeps its last committed ordering while a batch is running.
+    @State private var frozenLatencyResults: [String: HarborProxyProbeResult]?
     @State private var page = 1
     @State private var pageSize = 10
     @State private var gridMode = false
@@ -64,21 +66,23 @@ struct HarborProxyWorkspaceView: View {
         }
     }
 
-    /// A single transient failure remains visible. Repeated failures are kept
-    /// in an explicit recoverable view instead of disappearing permanently.
+    /// Freeze filtering and ordering during probing; only the cell's live status
+    /// changes until the whole batch completes.
+    private var displayedProbeResults: [String: HarborProxyProbeResult] {
+        proxy.latencyTesting ? (frozenLatencyResults ?? proxy.probeResults) : proxy.probeResults
+    }
+
     private var groupNodes: [HarborProxyNode] {
         sourceGroupNodes.filter { node in
-            guard let result = proxy.probeResults[node.id], result.realTested else { return true }
-            return result.succeeded || (result.consecutiveRealFailures ?? 1) < 2
-                || showUnavailable
+            guard let result = displayedProbeResults[node.id], result.realTested else { return true }
+            return !result.isConfirmedUnavailable || showUnavailable
         }
     }
 
     private var unavailableCount: Int {
         sourceGroupNodes.filter {
-            guard let result = proxy.probeResults[$0.id] else { return false }
-            return result.realTested && !result.succeeded
-                && (result.consecutiveRealFailures ?? 1) >= 2
+            guard let result = displayedProbeResults[$0.id] else { return false }
+            return result.isConfirmedUnavailable
         }.count
     }
 
@@ -87,7 +91,7 @@ struct HarborProxyWorkspaceView: View {
             if region != "全部" && location(of: node) != region { return false }
             if protocolFilter != "全部" && node.protocolName.uppercased() != protocolFilter { return false }
             if latencyFilter != "全部" {
-                guard let delay = proxy.probeResults[node.id]?.milliseconds else { return false }
+                guard let delay = displayedProbeResults[node.id]?.milliseconds else { return false }
                 if latencyFilter == "快速"
                     && delay >= HarborProxyLatencyPolicy.goodUpperBoundMilliseconds { return false }
                 if latencyFilter == "一般"
@@ -105,8 +109,8 @@ struct HarborProxyWorkspaceView: View {
         if let ascending = latencyAscending {
             let position = Dictionary(uniqueKeysWithValues: result.enumerated().map { ($0.element.id, $0.offset) })
             result.sort { a, b in
-                let x = proxy.probeResults[a.id]?.milliseconds
-                let y = proxy.probeResults[b.id]?.milliseconds
+                let x = displayedProbeResults[a.id]?.milliseconds
+                let y = displayedProbeResults[b.id]?.milliseconds
                 switch (x, y) {
                 case let (lhs?, rhs?) where lhs != rhs: return ascending ? lhs < rhs : lhs > rhs
                 case (_?, nil): return true
@@ -163,6 +167,14 @@ struct HarborProxyWorkspaceView: View {
         .onChange(of: protocolFilter) { _, _ in page = 1 }
         .onChange(of: latencyFilter) { _, _ in page = 1 }
         .onChange(of: latencyAscending) { _, _ in page = 1 }
+        .onChange(of: proxy.latencyTesting) { _, testing in
+            if testing {
+                frozenLatencyResults = proxy.probeResults
+            } else {
+                frozenLatencyResults = nil
+                page = 1
+            }
+        }
         .onChange(of: pageSize) { _, _ in page = 1 }
         .onChange(of: proxy.localPort) { _, _ in copiedProxyURL = nil }
         .onChange(of: proxy.nodeServerLocations) { _, _ in
@@ -822,7 +834,7 @@ struct HarborProxyWorkspaceView: View {
                 Button {
                     Task { await proxy.testRealLatency(sourceGroupNodes.map(\.id)) }
                 } label: {
-                    Label("真实测速", systemImage: "speedometer")
+                    Label("测速", systemImage: "speedometer")
                         .font(.system(size: 10.5, weight: .medium))
                         .lineLimit(1)
                         .fixedSize(horizontal: true, vertical: false)
@@ -1084,7 +1096,7 @@ struct HarborProxyWorkspaceView: View {
                         if showRegion {
                             HStack(spacing: 5) {
                                 Text(regionFlag(node)).font(.system(size: 13))
-                                Text(location(of: node)).lineLimit(1)
+                                Text(locationLabel(of: node)).lineLimit(1)
                             }
                             .font(.system(size: 10.5))
                             .foregroundStyle(.secondary)
@@ -1112,7 +1124,7 @@ struct HarborProxyWorkspaceView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                         HStack(spacing: 5) {
                             Text(regionFlag(node)).font(.system(size: 13))
-                            Text(location(of: node)).lineLimit(1)
+                            Text(locationLabel(of: node)).lineLimit(1)
                                 .help(regionHint(node))
                         }
                         .font(.system(size: 10.5))
@@ -1261,15 +1273,18 @@ struct HarborProxyWorkspaceView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                     HStack(spacing: 8) {
-                        Text("\(regionFlag(node)) \(location(of: node))")
+                        Text("\(regionFlag(node)) \(locationLabel(of: node))")
                             .help(regionHint(node))
                         Spacer(minLength: 2)
-                        Text(delay.map { "\($0) ms" }
-                             ?? (probe?.realTested == true ? "不可用" : "未测"))
+                        Text(realLatencyText(
+                            delay: delay, probe: probe, connected: connected,
+                            connecting: connecting, nodeID: node.id))
                             .lineLimit(1)
                             .font(.system(size: 10.5, weight: delay == nil ? .regular : .semibold))
                             .monospacedDigit()
-                            .foregroundStyle(delay.map(latencyColor) ?? Color.secondary)
+                            .foregroundStyle(realLatencyTextColor(
+                                delay: delay, probe: probe, connected: connected,
+                                connecting: connecting, nodeID: node.id))
                             .help(probe?.realFailureReason ?? "真实代理请求延迟")
                     }
                     .font(.system(size: 9.5))
@@ -1456,7 +1471,8 @@ struct HarborProxyWorkspaceView: View {
         if let delay {
             return "\(delay) ms" + (probe?.isStale() == true ? " · 旧" : "")
         }
-        return probe?.realTested == true ? "不可用" : "未测"
+        guard probe?.realTested == true else { return "未测速" }
+        return probe?.isConfirmedUnavailable == true ? "不可用" : "待复测"
     }
 
     private func realLatencyTextColor(delay: Int?, probe: HarborProxyProbeResult?,
@@ -1466,7 +1482,8 @@ struct HarborProxyWorkspaceView: View {
             return HarborColors.orange
         }
         if let delay { return latencyColor(delay) }
-        return probe?.realTested == true ? HarborColors.red : Color.secondary
+        guard probe?.realTested == true else { return Color.secondary }
+        return probe?.isConfirmedUnavailable == true ? HarborColors.red : HarborColors.orange
     }
 
     private func regionEmoji(_ name: String) -> String {
@@ -1500,6 +1517,13 @@ struct HarborProxyWorkspaceView: View {
             ?? HarborProxyAutomaticName.unresolvedRegion
     }
 
+    private func locationLabel(of node: HarborProxyNode) -> String {
+        let region = location(of: node)
+        guard region != HarborProxyAutomaticName.unresolvedRegion,
+              proxy.exitLocation(for: node) == nil else { return region }
+        return region + "·入口"
+    }
+
     private func regionHint(_ node: HarborProxyNode) -> String {
         if let exit = proxy.exitLocation(for: node) {
             return "真实代理出口 IP：\(exit.ip) · 优先显示出口地区"
@@ -1510,7 +1534,7 @@ struct HarborProxyWorkspaceView: View {
             }
             return "节点服务器 IP：\(location.ip) · 出口未确认，使用服务器地区"
         }
-        return "出口 IP 尚未确认；真实测速将尝试识别，失败时使用服务器 IP 地区"
+        return "出口 IP 尚未确认；将独立识别，失败时使用服务器 IP 地区"
     }
 
     // A centered, padded form with the same visual language as hosted-key setup.

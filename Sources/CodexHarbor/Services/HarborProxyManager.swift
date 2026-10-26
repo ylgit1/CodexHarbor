@@ -243,6 +243,8 @@ final class HarborProxyManager: ObservableObject {
     private var exitGeoTask: Task<Void, Never>?
     private var exitGeoPendingIDs = Set<String>()
     private var exitGeoAttemptedAt: [String: Date] = [:]
+    private var exitGeoFailureCounts: [String: Int] = [:]
+    private var exitGeoRetryTask: Task<Void, Never>?
     private var nodeServerResolvedAt: [String: Date] = [:]
     private var lastActiveHealthCheckAt: Date?
     private var configurationLoaded = false
@@ -407,6 +409,9 @@ final class HarborProxyManager: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.refreshSystemProxyState(synchronizeOwnership: true)
+                if let activeNode = self.activeNode {
+                    self.enqueueExitGeoRefresh(for: [activeNode])
+                }
                 await self.retryDueFailedNodes()
             }
         }
@@ -419,6 +424,9 @@ final class HarborProxyManager: ObservableObject {
                 guard let self else { return }
                 self.refreshSystemProxyState(synchronizeOwnership: true)
                 await self.reconcileXrayLiveness()
+                if let activeNode = self.activeNode {
+                    self.enqueueExitGeoRefresh(for: [activeNode])
+                }
                 await self.retryDueFailedNodes()
             }
         }
@@ -541,6 +549,7 @@ final class HarborProxyManager: ObservableObject {
             startupTrace("adopted-existing-xray")
             bootstrapped = true
             scheduleGeoIPRefresh()
+            if let activeNode { enqueueExitGeoRefresh(for: [activeNode]) }
             scheduleLegacyRealPingRetest()
             Task { [weak self] in await self?.retryDueFailedNodes() }
             return
@@ -567,37 +576,18 @@ final class HarborProxyManager: ObservableObject {
         Task { [weak self] in await self?.retryDueFailedNodes() }
     }
 
-    /// Rebuild old cached availability and order once after switching the
-    /// measurement method. Later subscription updates still retain results for
-    /// unchanged nodes exactly as before.
+    /// Old-method scores are incomparable with real SOCKS5 measurements.
+    /// Invalidate them once; never start a large batch simply by opening the app.
     private func scheduleLegacyRealPingRetest() {
-        guard store.realPingMethodVersion != 2, coreInstalled else { return }
-        let groups = subscriptions.map(\.id)
-        let subscriptionIDs = Set(groups)
-        let oldResults = nodes.filter { subscriptionIDs.contains($0.subscriptionID) }
-        guard oldResults.contains(where: { probeResults[$0.id]?.realTested == true }) else {
-            store.realPingMethodVersion = 2
-            persist()
-            return
-        }
-        for node in oldResults {
+        guard store.realPingMethodVersion != 2 else { return }
+        for node in nodes where !node.subscriptionID.isEmpty {
             guard let previous = probeResults[node.id] else { continue }
             probeResults[node.id] = HarborProxyProbeResult(
                 milliseconds: nil, checkedAt: previous.checkedAt, realTested: false
             )
         }
+        store.realPingMethodVersion = 2
         persist()
-        Task { [weak self] in
-            guard let self else { return }
-            for subscriptionID in groups {
-                let ids = self.nodes.filter { $0.subscriptionID == subscriptionID }.map(\.id)
-                guard !ids.isEmpty else { continue }
-                await self.testRealLatency(ids)
-                guard ids.allSatisfy({ self.probeResults[$0]?.realTested == true }) else { return }
-            }
-            self.store.realPingMethodVersion = 2
-            self.persist()
-        }
     }
 
     /// Prefer the last exit IP observed through this exact node's isolated
@@ -916,17 +906,9 @@ final class HarborProxyManager: ObservableObject {
                 scheduleGeoIPRefresh()
                 persist()
                 busy = false
-                if !testIDs.isEmpty {
-                    await testLatency(
-                        Array(testIDs),
-                        finalization: .init(
-                            subscriptionID: id,
-                            newNodeIDs: testIDs.subtracting(update.previousNodeIDs),
-                            initialImport: update.previousNodeIDs.isEmpty
-                        )
-                    )
-                }
-                detail = "订阅「\(updated.name)」已保存并更新 \(update.count) 个节点；新增或 IP 变化 \(testIDs.count) 个" +
+                // Import and refresh never start an unrequested batch probe.
+                // New or changed nodes are shown as 未测速 until the user tests.
+                detail = "订阅「\(updated.name)」已保存并更新 \(update.count) 个节点；待测速 \(testIDs.count) 个" +
                     (update.retainedActive
                         ? "；原连接保持运行，请手动选择新节点"
                         : "；不会自动切换当前连接")
@@ -989,6 +971,9 @@ final class HarborProxyManager: ObservableObject {
         for nodeID in removedIDs {
             probeResults.removeValue(forKey: nodeID)
             nodeExitLocations.removeValue(forKey: nodeID)
+            exitGeoFailureCounts.removeValue(forKey: nodeID)
+            exitGeoAttemptedAt.removeValue(forKey: nodeID)
+            exitGeoPendingIDs.remove(nodeID)
         }
         subscriptionUpdatedAt.removeValue(forKey: id)
         if let selectedID, removedIDs.contains(selectedID) {
@@ -1029,15 +1014,8 @@ final class HarborProxyManager: ObservableObject {
             scheduleGeoIPRefresh()
             persist()
             busy = false
-            if !testIDs.isEmpty {
-                await testLatency(
-                    Array(testIDs),
-                    finalization: .init(subscriptionID: id,
-                                        newNodeIDs: testIDs.subtracting(update.previousNodeIDs),
-                                        initialImport: update.previousNodeIDs.isEmpty)
-                )
-            }
-            detail = "订阅更新完成：\(update.count) 个节点；新增或 IP 变化 \(testIDs.count) 个" +
+            // Don't silently test the full subscription after refresh.
+            detail = "订阅更新完成：\(update.count) 个节点；待测速 \(testIDs.count) 个" +
                 (update.retainedActive ? "；原连接仍在运行，请手动选择最新节点" : "")
         } catch {
             busy = false
@@ -1096,6 +1074,9 @@ final class HarborProxyManager: ObservableObject {
         selectedID = merged.selectedID
         scheduleGeoIPRefresh()
         probeResults = probeResults.filter { validIDs.contains($0.key) }
+        exitGeoFailureCounts = exitGeoFailureCounts.filter { validIDs.contains($0.key) }
+        exitGeoAttemptedAt = exitGeoAttemptedAt.filter { validIDs.contains($0.key) }
+        exitGeoPendingIDs = exitGeoPendingIDs.filter { validIDs.contains($0) }
         nodeExitLocations = nodeExitLocations.filter { id, observation in
             validIDs.contains(id) && merged.nodes.contains { node in
                 node.id == id && observation.verifiedLocation(
@@ -1501,11 +1482,11 @@ final class HarborProxyManager: ObservableObject {
     /// active or wakes. Successful nodes are never swept on a timer.
     private func retryDueFailedNodes() async {
         guard bootstrapped, !busy, !latencyTesting, coreInstalled else { return }
-        let due = nodes.compactMap { node in
-            probeResults[node.id]?.shouldRetryFailure() == true ? node.id : nil
-        }
-        guard !due.isEmpty else { return }
-        await testRealLatency(due)
+        // Retest only the currently active node. Waking the laptop or
+        // foregrounding the app must not launch a full failed-subscription sweep.
+        guard let id = activeNodeID,
+              probeResults[id]?.shouldRetryFailure() == true else { return }
+        await testRealLatency([id])
     }
 
     /// Retained for existing callers: latency without an explicit kind means
@@ -1551,9 +1532,9 @@ final class HarborProxyManager: ObservableObject {
         let latencyForcedDomains = forcedProxyDomains
         let sharedRealBatch = await HarborNodeLatencyTester.startRealBatch(
             nodes: targets, root: latencyRoot, cancellation: cancellation)
-        let batchSize = sharedRealBatch == nil
-            ? HarborProxyLatencyPolicy.parallelCount
-            : min(targets.count, HarborProxyLatencyPolicy.realPingBatchSize)
+        // Keep one Xray for all nodes, but run at most four HTTP probes
+        // concurrently. The former batch size launched every request at once.
+        let batchSize = HarborProxyLatencyPolicy.parallelCount
         for offset in stride(from: 0, to: targets.count, by: batchSize) {
             if latencyCancellationRequested || Task.isCancelled { break }
             let batch = Array(targets[offset..<min(offset + batchSize, targets.count)])
@@ -1562,7 +1543,7 @@ final class HarborProxyManager: ObservableObject {
             await withTaskGroup(of: (String, Int?, String?).self) { group in
                 for node in batch {
                     group.addTask {
-                        let report: HarborNodeDelayReport
+                        var report: HarborNodeDelayReport
                         if let sharedRealBatch {
                             report = await sharedRealBatch.measure(node: node)
                         } else {
@@ -1572,6 +1553,20 @@ final class HarborProxyManager: ObservableObject {
                                 forcedProxyDomains: latencyForcedDomains,
                                 cancellation: cancellation
                             )
+                        }
+                        if (report.failure == "真实测速超时" ||
+                            report.failure == "真实测速请求失败"),
+                           !cancellation.isCancelled, !Task.isCancelled {
+                            if let sharedRealBatch {
+                                report = await sharedRealBatch.measure(node: node)
+                            } else {
+                                report = await HarborNodeLatencyTester.measure(
+                                    node: node, root: latencyRoot,
+                                    ruleMode: latencyRuleMode,
+                                    forcedProxyDomains: latencyForcedDomains,
+                                    cancellation: cancellation
+                                )
+                            }
                         }
                         return (node.id, report.milliseconds, report.failure)
                     }
@@ -1622,12 +1617,15 @@ final class HarborProxyManager: ObservableObject {
             for id in Set(targets.map(\.subscriptionID)).filter({ !$0.isEmpty }) {
                 refreshAutomaticNames(for: id)
             }
-            enqueueExitGeoRefresh(for: targets)
+            // GeoIP work is triggered by connection/activation, never by a delay test.
             persist()
         }
+        let confirmedUnavailable = targets.filter { node in
+            probeResults[node.id]?.isConfirmedUnavailable == true
+        }.count
         detail = latencyCancellationRequested || Task.isCancelled
             ? "已停止测速，完成 \(latencyCompleted)/\(latencyTotal) 个节点"
-            : "真实测速完成：可用 \(succeeded)，不可用 \(latencyCompleted - succeeded)"
+            : "真实测速完成：可用 \(succeeded)，待复测 \(latencyCompleted - succeeded - confirmedUnavailable)，不可用 \(confirmedUnavailable)"
         if targets.count == 1,
            let reason = probeResults[targets[0].id]?.realFailureReason,
            !latencyCancellationRequested {
@@ -1649,7 +1647,9 @@ final class HarborProxyManager: ObservableObject {
             if let cached = nodeExitLocations[current.id],
                !cached.needsRefresh(for: current, resolvedServerIP: serverIP) { continue }
             if let attempted = exitGeoAttemptedAt[current.id],
-               now.timeIntervalSince(attempted) < HarborProxyGeoIPPolicy.exitFailureRetryInterval {
+               now.timeIntervalSince(attempted) < HarborProxyGeoIPPolicy.retryInterval(
+                   afterFailures: exitGeoFailureCounts[current.id] ?? 1
+               ) {
                 continue
             }
             exitGeoPendingIDs.insert(current.id)
@@ -1672,16 +1672,23 @@ final class HarborProxyManager: ObservableObject {
                     for: node, resolvedServerIP: serverIP
                 ) ?? true
                 let retryAllowed = exitGeoAttemptedAt[node.id].map {
-                    now.timeIntervalSince($0) >= HarborProxyGeoIPPolicy.exitFailureRetryInterval
+                    now.timeIntervalSince($0) >= HarborProxyGeoIPPolicy.retryInterval(
+                        afterFailures: exitGeoFailureCounts[node.id] ?? 1
+                    )
                 } ?? true
                 return needsRefresh && retryAllowed
             }
             guard !due.isEmpty else { continue }
             for node in due { exitGeoAttemptedAt[node.id] = now }
             let cancellation = HarborLatencyCancellation()
-            guard let batch = await HarborNodeLatencyTester.startRealBatch(
-                nodes: due, root: root, cancellation: cancellation
-            ) else { continue }
+            // Reuse the live SOCKS5 listener for the active node. This reports
+            // the same outbound that websites see, without launching Xray again.
+            let isolated = due.filter {
+                !($0.id == activeNodeID && running && healthy && localPort != nil)
+            }
+            let batch = isolated.isEmpty ? nil : await HarborNodeLatencyTester.startRealBatch(
+                nodes: isolated, root: root, cancellation: cancellation
+            )
             var requests = 0
             for target in due {
                 guard !Task.isCancelled else { break }
@@ -1691,10 +1698,21 @@ final class HarborProxyManager: ObservableObject {
                 }
                 guard !Task.isCancelled else { break }
                 requests += 1
-                guard let observed = await batch.exitLocation(node: target),
-                      !Task.isCancelled,
+                let observed: HarborProxyIPLocation?
+                if target.id == activeNodeID, running, healthy, let localPort {
+                    observed = await HarborNodeGeoIPResolver.exitLocation(socksPort: localPort + 1)
+                } else {
+                    observed = await batch?.exitLocation(node: target)
+                }
+                guard !Task.isCancelled,
                       let latest = nodes.first(where: { $0.id == target.id }),
                       latest.endpointSignature == target.endpointSignature else { continue }
+                guard let observed else {
+                    exitGeoFailureCounts[target.id, default: 0] += 1
+                    continue
+                }
+                exitGeoFailureCounts.removeValue(forKey: target.id)
+                exitGeoAttemptedAt.removeValue(forKey: target.id)
                 nodeExitLocations[target.id] = HarborProxyExitLocation(
                     location: observed, endpointSignature: target.endpointSignature,
                     resolvedServerIP: nodeServerLocations[latest.host.lowercased()]?.ip
@@ -1705,9 +1723,34 @@ final class HarborProxyManager: ObservableObject {
                 persist()
             }
             if Task.isCancelled { cancellation.cancel() }
-            await Task.detached(priority: .utility) { batch.close() }.value
+            if let batch {
+                await Task.detached(priority: .utility) { batch.close() }.value
+            }
         }
         exitGeoTask = nil
+        scheduleExitGeoRetry()
+    }
+
+    /// One sleeping task at most; retries only the currently connected exit,
+    /// with 10s/1m/10m/1h backoff, not every node on a periodic sweep.
+    private func scheduleExitGeoRetry() {
+        exitGeoRetryTask?.cancel()
+        exitGeoRetryTask = nil
+        guard running, healthy, let activeNodeID,
+              let count = exitGeoFailureCounts[activeNodeID], count <= 4,
+              let attempted = exitGeoAttemptedAt[activeNodeID] else { return }
+        let due = attempted.addingTimeInterval(
+            HarborProxyGeoIPPolicy.retryInterval(afterFailures: count))
+        let milliseconds = Int(max(0, due.timeIntervalSinceNow) * 1_000)
+        exitGeoRetryTask = Task(priority: .utility) { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(milliseconds)) }
+            catch { return }
+            guard let self, !Task.isCancelled else { return }
+            self.exitGeoRetryTask = nil
+            if let activeNode = self.activeNode {
+                self.enqueueExitGeoRefresh(for: [activeNode])
+            }
+        }
     }
 
     private func finalizeSubscriptionProbes(_ finalization: SubscriptionProbeFinalization) {

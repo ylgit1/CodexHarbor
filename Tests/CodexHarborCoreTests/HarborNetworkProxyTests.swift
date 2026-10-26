@@ -48,6 +48,30 @@ struct HarborNetworkProxyTests {
         #expect(!result.succeeded)
         #expect(result.realFailureReason?.contains("超时") == true)
     }
+    @Test("A single transient failure is pending rather than unavailable")
+    func realLatencyAvailabilityStates() {
+        let untested = HarborProxyProbeResult(milliseconds: nil, realTested: false)
+        let pending = HarborProxyProbeResult(milliseconds: nil, realTested: true,
+            consecutiveRealFailures: 1)
+        let unavailable = HarborProxyProbeResult(milliseconds: nil, realTested: true,
+            consecutiveRealFailures: 2)
+        let recovered = HarborProxyProbeResult(milliseconds: 184, realTested: true,
+            consecutiveRealFailures: 0)
+        #expect(!untested.isConfirmedUnavailable && !untested.isAwaitingRetry)
+        #expect(pending.isAwaitingRetry && !pending.isConfirmedUnavailable)
+        #expect(unavailable.isConfirmedUnavailable && !unavailable.isAwaitingRetry)
+        #expect(recovered.succeeded && !recovered.isConfirmedUnavailable)
+    }
+
+    @Test("Failed exit IP lookups back off instead of blocking for one hour")
+    func exitGeoIPRetryBackoff() {
+        #expect(HarborProxyGeoIPPolicy.retryInterval(afterFailures: 1) == 10)
+        #expect(HarborProxyGeoIPPolicy.retryInterval(afterFailures: 2) == 60)
+        #expect(HarborProxyGeoIPPolicy.retryInterval(afterFailures: 3) == 600)
+        #expect(HarborProxyGeoIPPolicy.retryInterval(afterFailures: 4) == 3600)
+        #expect(HarborProxyGeoIPPolicy.retryInterval(afterFailures: 99) == 3600)
+    }
+
     @Test("Workbench fits the minimum-height desktop window without clipping")
     func compactDashboardLayout() {
         let compact = HarborDashboardSizing.resolve(width: 805, height: 585)

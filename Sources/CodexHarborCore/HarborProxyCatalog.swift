@@ -58,7 +58,13 @@ public enum HarborProxyLatencyPolicy {
 public enum HarborProxyGeoIPPolicy {
     public static let serverDNSCacheInterval: TimeInterval = 6 * 60 * 60
     public static let exitRefreshInterval: TimeInterval = 7 * 24 * 60 * 60
-    public static let exitFailureRetryInterval: TimeInterval = 60 * 60
+    public static let exitFailureRetryIntervals: [TimeInterval] = [
+        10, 60, 10 * 60, 60 * 60
+    ]
+
+    public static func retryInterval(afterFailures failures: Int) -> TimeInterval {
+        exitFailureRetryIntervals[min(max(1, failures) - 1, exitFailureRetryIntervals.count - 1)]
+    }
     public static let countryCacheInterval: TimeInterval = 30 * 24 * 60 * 60
 }
 
@@ -97,6 +103,14 @@ public struct HarborProxyProbeResult: Codable, Sendable, Equatable {
     public var realCheckedAt: Date?
     public var consecutiveRealFailures: Int?
     public var succeeded: Bool { milliseconds != nil }
+    /// A single transient failure remains visible and is eligible for retry.
+    public var isConfirmedUnavailable: Bool {
+        realTested && !succeeded && (consecutiveRealFailures ?? 1) >= 2
+    }
+    public var isAwaitingRetry: Bool {
+        realTested && !succeeded && !isConfirmedUnavailable
+    }
+
     public init(milliseconds: Int?, checkedAt: Date = .now,
                 realTested: Bool? = nil, realFailureReason: String? = nil,
                 realCheckedAt: Date? = nil, consecutiveRealFailures: Int? = nil) {

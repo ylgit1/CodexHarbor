@@ -98,23 +98,11 @@ enum HarborNodeGeoIPResolver {
               let url = URL(string: "https://ipwho.is/?fields=success,ip,country_code") else {
             return nil
         }
-        let config = URLSessionConfiguration.ephemeral
-        config.connectionProxyDictionary = [
-            "SOCKSEnable": 1,
-            "SOCKSProxy": "127.0.0.1",
-            "SOCKSPort": socksPort
-        ]
-        config.timeoutIntervalForRequest = 6
-        config.timeoutIntervalForResource = 6
-        config.waitsForConnectivity = false
-        let session = URLSession(configuration: config)
-        defer { session.invalidateAndCancel() }
-        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
-        request.timeoutInterval = 6
-        guard let (data, response) = try? await session.data(for: request),
-              !Task.isCancelled,
-              (response as? HTTPURLResponse)?.statusCode == 200,
-              data.count < 4_096,
+        // Force SOCKS5 + remote DNS; URLSession on some macOS builds can
+        // silently bypass its SOCKS proxy dictionary and report the host IP.
+        // A failed proxy must return nil, never the machine's direct address.
+        guard let data = await exitDataViaCurl(socksPort: socksPort, url: url),
+              !Task.isCancelled, data.count < 4_096,
               let result = try? JSONDecoder().decode(Response.self, from: data),
               result.success, let observedIP = result.ip,
               let canonical = HarborIPAddress.normalizedLiteral(observedIP),
@@ -124,6 +112,26 @@ enum HarborNodeGeoIPResolver {
               code.utf8.allSatisfy({ (65...90).contains($0) }),
               code != "ZZ" else { return nil }
         return HarborProxyIPLocation(ip: canonical, countryCode: code)
+    }
+
+    private static func exitDataViaCurl(socksPort: Int, url: URL) async -> Data? {
+        await Task.detached(priority: .utility) {
+            let curl = Process()
+            curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+            curl.arguments = [
+                "--disable", "--silent", "--fail", "--max-time", "7",
+                "--proxy", "socks5h://127.0.0.1:\(socksPort)",
+                "--noproxy", "", "--url", url.absoluteString
+            ]
+            let output = Pipe()
+            curl.standardOutput = output
+            curl.standardError = FileHandle.nullDevice
+            guard (try? curl.run()) != nil else { return nil as Data? }
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            curl.waitUntilExit()
+            guard curl.terminationStatus == 0, data.count < 4_096 else { return nil }
+            return data
+        }.value
     }
 
     static func isPublic(_ ip: String) -> Bool {

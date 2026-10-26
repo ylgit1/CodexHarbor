@@ -25,10 +25,10 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 
 - [最新 DMG · GitHub 公共下载（无需登录）](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg)
 - [最新 DMG · Gitee 下载（访问大文件可能需要登录）](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg)
-- [v0.1.22 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.22/Codex-Harbor-v0.1.22-arm64.dmg)
-- [v0.1.22 固定版本 · Gitee](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/v0.1.22/Codex-Harbor-v0.1.22-arm64.dmg)
+- [v0.1.23 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.23/Codex-Harbor-v0.1.23-arm64.dmg)
+- [v0.1.23 固定版本 · Gitee](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/v0.1.23/Codex-Harbor-v0.1.23-arm64.dmg)
 
-v0.1.22 DMG 可通过 [SHA-256 校验清单](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/SHA256SUMS) 核验下载完整性。
+v0.1.23 DMG 可通过 [SHA-256 校验清单](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/SHA256SUMS) 核验下载完整性。
 Gitee Raw 大文件可能要求登录，无法直接下载时可使用 GitHub 公共文件下载地址。
 要求 macOS 14 或更新版本及 Apple Silicon；Xray、`geoip.dat`、`geosite.dat`
 已内置，首次启动不需要下载代理内核。

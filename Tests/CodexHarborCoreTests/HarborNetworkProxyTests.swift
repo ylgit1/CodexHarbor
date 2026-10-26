@@ -98,7 +98,7 @@ struct HarborNetworkProxyTests {
         #expect(HarborProxyMeasurementLabel.measured(197) == "197 ms")
         #expect(HarborProxyMeasurementLabel.explanation.contains("SOCKS5"))
         #expect(HarborProxyMeasurementLabel.explanation.contains("v2rayN"))
-        #expect(HarborProxyLatencyPolicy.parallelCount == 16)
+        #expect(HarborProxyLatencyPolicy.parallelCount == 32)
         #expect(HarborProxyLatencyPolicy.requestTimeoutSeconds == 5)
         #expect(HarborProxyLatencyPolicy.realPingRequestCount == 2)
         #expect(HarborProxyLatencyPolicy.realPingPauseMilliseconds == 100)

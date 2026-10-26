@@ -40,7 +40,10 @@ public enum HarborProxyRegion: String, CaseIterable, Sendable {
 
 /// Real-delay probes share one Xray batch, as in v2rayN.
 public enum HarborProxyLatencyPolicy {
-    public static let parallelCount = 4
+    // A batch shares one Xray process, so HTTP probes are inexpensive. Sixteen
+    // concurrent nodes keeps large subscriptions responsive without creating
+    // one process per node or flooding the target with every node at once.
+    public static let parallelCount = 16
     public static let realPingBatchSize = 1_000
     // v2rayN ConnectionHandler.GetRealPingTime uses Global.LocalFetch (5s)
     // for two requests to the configured SpeedPingTestUrl.

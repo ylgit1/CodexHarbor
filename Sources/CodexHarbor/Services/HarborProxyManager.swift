@@ -1532,8 +1532,9 @@ final class HarborProxyManager: ObservableObject {
         let latencyForcedDomains = forcedProxyDomains
         let sharedRealBatch = await HarborNodeLatencyTester.startRealBatch(
             nodes: targets, root: latencyRoot, cancellation: cancellation)
-        // Keep one Xray for all nodes, but run at most four HTTP probes
-        // concurrently. The former batch size launched every request at once.
+        // Keep one Xray for all nodes and bound only the HTTP probes. A failed
+        // node is retried by a later user test; retrying it immediately here
+        // doubles the worst-case duration without adding an independent signal.
         let batchSize = HarborProxyLatencyPolicy.parallelCount
         for offset in stride(from: 0, to: targets.count, by: batchSize) {
             if latencyCancellationRequested || Task.isCancelled { break }
@@ -1543,7 +1544,7 @@ final class HarborProxyManager: ObservableObject {
             await withTaskGroup(of: (String, Int?, String?).self) { group in
                 for node in batch {
                     group.addTask {
-                        var report: HarborNodeDelayReport
+                        let report: HarborNodeDelayReport
                         if let sharedRealBatch {
                             report = await sharedRealBatch.measure(node: node)
                         } else {
@@ -1553,20 +1554,6 @@ final class HarborProxyManager: ObservableObject {
                                 forcedProxyDomains: latencyForcedDomains,
                                 cancellation: cancellation
                             )
-                        }
-                        if (report.failure == "真实测速超时" ||
-                            report.failure == "真实测速请求失败"),
-                           !cancellation.isCancelled, !Task.isCancelled {
-                            if let sharedRealBatch {
-                                report = await sharedRealBatch.measure(node: node)
-                            } else {
-                                report = await HarborNodeLatencyTester.measure(
-                                    node: node, root: latencyRoot,
-                                    ruleMode: latencyRuleMode,
-                                    forcedProxyDomains: latencyForcedDomains,
-                                    cancellation: cancellation
-                                )
-                            }
                         }
                         return (node.id, report.milliseconds, report.failure)
                     }

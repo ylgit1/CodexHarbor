@@ -168,7 +168,11 @@ public enum HarborProxySubscriptionRefreshPolicy {
             case let (left?, right?) where left != right: return left < right
             case (_?, nil): return true
             case (nil, _?): return false
-            default: return (original[lhs.id] ?? 0) < (original[rhs.id] ?? 0)
+            default:
+                let leftUnavailable = results[lhs.id]?.isConfirmedUnavailable == true
+                let rightUnavailable = results[rhs.id]?.isConfirmedUnavailable == true
+                if leftUnavailable != rightUnavailable { return !leftUnavailable }
+                return (original[lhs.id] ?? 0) < (original[rhs.id] ?? 0)
             }
         }
     }

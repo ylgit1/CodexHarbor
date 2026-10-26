@@ -401,18 +401,26 @@ struct HarborNetworkProxyTests {
     func initialLatencyOrderAndNaming() {
         let slow = HarborProxyNode(id: "slow", name: "slow", protocolName: "vless",
             host: "slow.example.com", port: 443, credential: "slow")
-        let failed = HarborProxyNode(id: "failed", name: "failed", protocolName: "vless",
-            host: "failed.example.com", port: 443, credential: "failed")
+        let unavailable = HarborProxyNode(id: "unavailable", name: "unavailable", protocolName: "vless",
+            host: "unavailable.example.com", port: 443, credential: "unavailable")
+        let untested = HarborProxyNode(id: "untested", name: "untested", protocolName: "vless",
+            host: "untested.example.com", port: 443, credential: "untested")
+        let awaitingRetry = HarborProxyNode(id: "awaiting-retry", name: "awaiting-retry",
+            protocolName: "vless", host: "awaiting.example.com", port: 443,
+            credential: "awaiting-retry")
         let fast = HarborProxyNode(id: "fast", name: "fast", protocolName: "vless",
             host: "fast.example.com", port: 443, credential: "fast")
         let results = [
             "slow": HarborProxyProbeResult(milliseconds: 1_740, realTested: true),
-            "failed": HarborProxyProbeResult(milliseconds: nil, realTested: true),
+            "unavailable": HarborProxyProbeResult(milliseconds: nil, realTested: true,
+                consecutiveRealFailures: 2),
+            "awaiting-retry": HarborProxyProbeResult(milliseconds: nil, realTested: true,
+                consecutiveRealFailures: 1),
             "fast": HarborProxyProbeResult(milliseconds: 596, realTested: true)
         ]
         #expect(HarborProxySubscriptionRefreshPolicy.initialLatencyOrder(
-            [slow, failed, fast], results: results
-        ).map(\.id) == ["fast", "slow", "failed"])
+            [unavailable, slow, untested, awaitingRetry, fast], results: results
+        ).map(\.id) == ["fast", "slow", "untested", "awaiting-retry", "unavailable"])
         #expect(HarborProxyAutomaticName.make(region: "美国", protocolName: "vless", sequence: 1)
                 == "美国-VLESS-001")
         #expect(HarborProxyAutomaticName.make(region: "新加坡", protocolName: "trojan", sequence: 2)

@@ -14,12 +14,12 @@ struct HarborProxyWorkspaceView: View {
     @State private var protocolFilter = "全部"
     @State private var latencyFilter = "全部"
     @State private var showUnavailable = false
-    @State private var latencyAscending: Bool? = true
     // The table keeps its last committed ordering while a batch is running.
     @State private var frozenLatencyResults: [String: HarborProxyProbeResult]?
     @State private var page = 1
     @State private var pageSize = 10
-    @State private var gridMode = false
+    @AppStorage("com.codexharbor.proxy.gridMode")
+    private var gridMode = false
     @State private var editor: Editor?
     @State private var subscriptionName = ""
     @State private var subscriptionURL = ""
@@ -87,7 +87,7 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private var shownNodes: [HarborProxyNode] {
-        var result = groupNodes.filter { node in
+        let result = groupNodes.filter { node in
             if region != "全部" && location(of: node) != region { return false }
             if protocolFilter != "全部" && node.protocolName.uppercased() != protocolFilter { return false }
             if latencyFilter != "全部" {
@@ -106,20 +106,9 @@ struct HarborProxyWorkspaceView: View {
                 || node.host.localizedCaseInsensitiveContains(text)
                 || node.protocolName.localizedCaseInsensitiveContains(text)
         }
-        if let ascending = latencyAscending {
-            let position = Dictionary(uniqueKeysWithValues: result.enumerated().map { ($0.element.id, $0.offset) })
-            result.sort { a, b in
-                let x = displayedProbeResults[a.id]?.milliseconds
-                let y = displayedProbeResults[b.id]?.milliseconds
-                switch (x, y) {
-                case let (lhs?, rhs?) where lhs != rhs: return ascending ? lhs < rhs : lhs > rhs
-                case (_?, nil): return true
-                case (nil, _?): return false
-                default: return (position[a.id] ?? 0) < (position[b.id] ?? 0)
-                }
-            }
-        }
-        return result
+        return HarborProxySubscriptionRefreshPolicy.initialLatencyOrder(
+            result, results: displayedProbeResults
+        )
     }
     private var maxPage: Int { max(1, (shownNodes.count + pageSize - 1) / pageSize) }
     private var currentPage: Int { min(max(1, page), maxPage) }
@@ -166,7 +155,6 @@ struct HarborProxyWorkspaceView: View {
         .onChange(of: region) { _, _ in page = 1 }
         .onChange(of: protocolFilter) { _, _ in page = 1 }
         .onChange(of: latencyFilter) { _, _ in page = 1 }
-        .onChange(of: latencyAscending) { _, _ in page = 1 }
         .onChange(of: proxy.latencyTesting) { _, testing in
             if testing {
                 frozenLatencyResults = proxy.probeResults
@@ -317,37 +305,58 @@ struct HarborProxyWorkspaceView: View {
         return .secondary
     }
 
-    private var proxyStateTitle: String {
-        if proxy.requiresRecovery { return "系统代理等待恢复" }
-        if proxy.switchingNodeID != nil { return "正在切换节点…" }
-        if proxy.running && proxy.checkingConnectivity { return "代理已启动 · 检测网络中" }
-        if proxy.running && !proxy.healthy { return "代理连接异常" }
-        if proxy.running && proxy.activeNodeID != nil && proxy.systemManaged { return "正在使用代理" }
-        if proxy.running { return "本地代理已连接" }
-        if proxy.busy { return "正在处理代理…" }
-        return "未使用 Harbor 代理"
+    private var headerNode: HarborProxyNode? {
+        if let id = proxy.switchingNodeID {
+            return proxy.nodes.first { $0.id == id }
+        }
+        if proxy.running, let node = proxy.activeNode { return node }
+        return proxy.selectedNode
     }
 
-    private var proxyStateSubtitle: String {
+    private var proxyNodeTitle: String {
+        headerNode?.displayName ?? "未选择代理节点"
+    }
+
+    private var proxyConnectionStatus: String {
         if proxy.requiresRecovery { return "请先恢复系统代理设置，避免网络异常" }
-        if proxy.switchingNodeID != nil { return "正在准备新节点，仍可继续选择其他节点" }
+        if proxy.switchingNodeID != nil { return "正在切换 · 启动并验证新节点" }
         if proxy.running && proxy.checkingConnectivity {
-            return "HTTP/SOCKS5 端口已就绪，正在后台检测节点连通性"
+            return "正在连接 · 本地端口已就绪，检测真实网络中"
         }
-        if proxy.running && !proxy.healthy { return "内核已启动，但连通性检查未通过" }
+        if proxy.running && !proxy.healthy { return "连接异常 · 真实网络检测未通过" }
         if proxy.running && proxy.activeNodeID != nil && proxy.systemManaged {
-            return proxy.activeNode.map { "系统代理已接管 · \($0.displayName)" } ?? "系统代理已接管"
+            return "已连接 · macOS 系统代理已接管"
         }
         if proxy.running {
             if proxy.detail.hasPrefix("本地节点已连接，但系统代理未接管") {
                 return proxy.detail
             }
-            return proxy.activeNode.map { "节点 \($0.displayName) 已连接 · 未接管 macOS 系统代理" }
-                ?? "内核已连接 · 未接管系统代理"
+            return "已连接 · 尚未接管 macOS 系统代理"
         }
-        if proxy.busy { return "操作正在后台执行，页面仍可浏览" }
-        if let node = proxy.selectedNode { return "上次选择：\(node.displayName) · 点击下方节点重新连接" }
-        return "点击下方的订阅节点选择并连接"
+        if proxy.busy { return "正在处理代理配置…" }
+        return headerNode == nil ? "未连接 · 请先添加或选择节点" : "未连接 · 点击下方节点开始使用"
+    }
+
+    private var proxyLatencyText: String? {
+        if proxy.switchingNodeID != nil { return "切换中" }
+        if proxy.running && proxy.checkingConnectivity { return "检测中" }
+        guard let node = headerNode,
+              let result = proxy.probeResults[node.id],
+              let latency = result.milliseconds else {
+            return headerNode == nil ? nil : "未测速"
+        }
+        let prefix = proxy.running && proxy.activeNodeID == node.id ? "" : "上次 "
+        return prefix + HarborProxyMeasurementLabel.measured(latency)
+            + (result.isStale() ? " · 旧" : "")
+    }
+
+    private var proxyLatencyColor: Color {
+        if proxy.switchingNodeID != nil || (proxy.running && proxy.checkingConnectivity) {
+            return HarborColors.orange
+        }
+        guard let node = headerNode,
+              let latency = proxy.probeResults[node.id]?.milliseconds else { return .secondary }
+        return latencyColor(latency)
     }
 
     private var currentNode: some View {
@@ -360,34 +369,29 @@ struct HarborProxyWorkspaceView: View {
                             in: RoundedRectangle(cornerRadius: 11, style: .continuous))
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
-                    Circle()
-                        .fill(proxyStateColor)
-                        .frame(width: 7, height: 7)
-                    Text(proxyStateTitle)
-                        .font(.system(size: 14, weight: .semibold))
+                    Text(proxyNodeTitle)
+                        .font(.system(size: 14.5, weight: .semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
-                    if proxy.running, let node = proxy.activeNode,
-                       let latency = proxy.probeResults[node.id]?.milliseconds {
-                        Text("延迟 " + HarborProxyMeasurementLabel.measured(latency))
+                        .truncationMode(.middle)
+                    if let latencyText = proxyLatencyText {
+                        Text(latencyText)
                             .font(.system(size: 10, weight: .medium))
                             .monospacedDigit()
-                            .foregroundStyle(latencyColor(latency))
+                            .foregroundStyle(proxyLatencyColor)
                             .padding(.horizontal, 8)
                             .frame(height: 21)
-                            .background(latencyColor(latency).opacity(0.09), in: Capsule())
-                            .help(HarborProxyMeasurementLabel.explanation
-                                  + " · 检测于 "
-                                  + (proxy.probeResults[node.id]?.effectiveRealCheckedAt?.formatted(
-                                      date: .abbreviated, time: .shortened
-                                  ) ?? "未知"))
+                            .background(proxyLatencyColor.opacity(0.09), in: Capsule())
                     }
                 }
-                Text(proxyStateSubtitle)
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                HStack(spacing: 6) {
+                    Circle().fill(proxyStateColor).frame(width: 6, height: 6)
+                    Text(proxyConnectionStatus)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
             Spacer(minLength: 12)
             VStack(alignment: .trailing, spacing: 3) {
@@ -844,11 +848,6 @@ struct HarborProxyWorkspaceView: View {
                 .help("通过独立 Xray 的 SOCKS5 代理请求测速地址；不改变当前节点或系统代理")
             }
 
-            if gridMode {
-                latencySortButton
-                    .frame(width: 96)
-            }
-
             if unavailableCount > 0 {
                 Button {
                     showUnavailable.toggle()
@@ -873,32 +872,6 @@ struct HarborProxyWorkspaceView: View {
         }
     }
 
-    private var latencySortButton: some View {
-        let selected = latencyAscending != nil
-        return Button {
-            if latencyAscending != nil {
-                latencyAscending = !(latencyAscending ?? false)
-            } else {
-                latencyAscending = true
-            }
-            page = 1
-        } label: {
-            HStack(spacing: 3) {
-                Text("真实延迟")
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                Image(systemName: !selected ? "arrow.up.arrow.down"
-                      : (latencyAscending == true ? "arrow.up" : "arrow.down"))
-                    .font(.system(size: 9, weight: .semibold))
-            }
-            .font(.system(size: 10.5, weight: selected ? .semibold : .medium))
-            .frame(height: 32, alignment: .leading)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-        .help("按真实代理请求延迟排序；节点名称中的 ms 并非本机测试结果")
-    }
-
     private func modeButton(_ symbol: String, selected: Bool,
                             action: @escaping () -> Void) -> some View {
         Button(action: action) {
@@ -912,6 +885,7 @@ struct HarborProxyWorkspaceView: View {
         .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue, cornerRadius: 6))
         .help(selected ? "当前显示" + (symbol == "list.bullet" ? "列表" : "卡片") : "切换为" + (symbol == "list.bullet" ? "列表" : "卡片") + "视图")
         .accessibilityLabel((symbol == "list.bullet" ? "列表" : "卡片") + "视图")
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     /// Only node content scrolls. Controls and pagination stay in view at any
@@ -966,7 +940,7 @@ struct HarborProxyWorkspaceView: View {
                             .lineLimit(1)
                             .frame(width: 88, alignment: .leading)
                     } else {
-                        latencySortButton.frame(width: 102, alignment: .leading)
+                        Text("真实延迟").frame(width: 102, alignment: .leading)
                     }
                     Image(systemName: "speedometer").frame(width: 26)
                         .help("单节点真实测速")

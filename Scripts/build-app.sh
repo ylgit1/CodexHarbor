@@ -95,11 +95,15 @@ if [[ -n "$(git -C "$project_root" status --porcelain 2>/dev/null)" ]]; then
   build_commit="${build_commit}-dirty"
 fi
 release_tag="$(git -C "$project_root" describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null || true)"
+version_tag="$release_tag"
+if [[ ! "$version_tag" =~ '^v[0-9]+\.[0-9]+\.[0-9]+$' ]]; then
+  version_tag="$(git -C "$project_root" describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+fi
 if [[ "$build_number" == <-> ]]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build_number" "$staging_app_path/Contents/Info.plist"
 fi
-if [[ "$release_tag" =~ '^v[0-9]+\.[0-9]+\.[0-9]+$' ]]; then
-  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${release_tag#v}" "$staging_app_path/Contents/Info.plist"
+if [[ "$version_tag" =~ '^v[0-9]+\.[0-9]+\.[0-9]+$' ]]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${version_tag#v}" "$staging_app_path/Contents/Info.plist"
 fi
 /usr/libexec/PlistBuddy -c "Add :HarborGitCommit string $build_commit" "$staging_app_path/Contents/Info.plist"
 echo "==> 版本标记：${release_tag:-development} (${build_number}) · $build_commit"
@@ -185,10 +189,15 @@ else
   echo "    免费方案：用钥匙串访问 → 证书助理创建「Codex Harbor Local Code Signing」自签名代码签名证书。" >&2
   echo "    或者登录 Xcode 的免费 Apple Account / Personal Team 创建开发证书。" >&2
 fi
-# Sign nested executable first, then the enclosing app. Avoid --deep when
+# Sign nested executables first, then the enclosing app. Avoid --deep when
 # signing: it can re-sign nested code with an unexpected identity.
-codesign --force --sign "$sign_identity" --identifier "com.codexharbor.agent" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
-codesign --force --sign "$sign_identity" "$staging_app_path"
+sign_options=()
+if [[ "$sign_identity" == "Developer ID Application:"* ]]; then
+  sign_options=(--options runtime --timestamp)
+fi
+codesign --force "${sign_options[@]}" --sign "$sign_identity" --identifier "com.codexharbor.xray" "$xray_destination/xray"
+codesign --force "${sign_options[@]}" --sign "$sign_identity" --identifier "com.codexharbor.agent" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
+codesign --force "${sign_options[@]}" --sign "$sign_identity" "$staging_app_path"
 
 codesign --verify --deep --strict "$staging_app_path"
 plutil -lint "$staging_app_path/Contents/Info.plist"

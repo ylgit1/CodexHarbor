@@ -50,6 +50,15 @@ struct CodexHarborApp: App {
     @StateObject private var proxy = HarborProxyManager.shared
 
     init() {
+        if CommandLine.arguments.dropFirst().first == "print-build-info" {
+            guard Bundle.main.bundleIdentifier == "com.codexharbor.app",
+                  let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+                  let commit = Bundle.main.object(forInfoDictionaryKey: "HarborGitCommit") as? String else {
+                exit(EXIT_FAILURE)
+            }
+            FileHandle.standardOutput.write(Data("v\(version)|\(commit)\n".utf8))
+            exit(EXIT_SUCCESS)
+        }
         if CommandLine.arguments.dropFirst().first == "serve-relay" {
             do {
                 let server = HarborRelayServer()

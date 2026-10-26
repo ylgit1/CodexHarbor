@@ -393,7 +393,7 @@ CODEX_HARBOR_SIGN_IDENTITY="Codex Harbor Local Code Signing" ./Scripts/build-app
 
 截图需用户另行在「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」授权 Codex Harbor 主程序；后台 Agent 不直接调用截图框架，主程序只处理按需授权的单窗口截图，不通过 `screencapture` 绕过系统权限。如果 macOS 首次打开应用时提示来源未验证，可以在 Finder 中 Control 点击应用并选择“打开”。
 
-正式 Developer ID 公证及自动更新发布流水线仍需独立配置。
+正式 Developer ID 公证需要单独配置开发者证书和公证凭据。当前下载仍采用手动安装 DMG，不提供自动替换应用；不要把本地自签名或 ad-hoc 包标为已公证。
 
 ## 快速开始
 
@@ -461,7 +461,7 @@ swift test
 
 ### 持续集成与性能验收
 
-GitHub Actions 的 macOS 工作流会运行测试、Release 打包、签名和 Info.plist 检查；Developer ID 签名与 Apple 公证仍需要另行配置凭据。
+GitHub Actions 的 macOS 工作流会运行测试、Release 打包，并创建、校验、挂载 DMG；它会把镜像内的 App 复制到临时目录，实际运行主程序的无副作用构建信息检查及 Agent Tool Catalog，核对签名、Info.plist 与内置 Xray，不改 `/Applications` 或系统代理。完整的首次 GUI 启动、真实节点切换与退出后系统代理恢复仍需在隔离的 macOS 测试用户中手动验收；不要在共享 CI 主机上自动修改系统网络设置。
 
 分别在前台静止、后台静止、连接切换等场景执行：
 
@@ -477,7 +477,7 @@ GitHub Actions 的 macOS 工作流会运行测试、Release 打包、签名和 I
 ./Scripts/restart-installed-app.sh
 ```
 
-安装脚本默认不强制退出正在使用的 App。构建号按 Git 提交数量生成，并在 Info.plist 写入提交哈希；精确打在 `vX.Y.Z` 标签上时才更新公开版本号。
+安装脚本默认不强制退出正在使用的 App。构建号按 Git 提交数量生成，并在 Info.plist 写入提交哈希；开发构建使用最近可达的版本号与 `dev-提交号` 镜像名，正式发布镜像只在干净工作区且精确打在 `vX.Y.Z` 标签上生成。
 
 ### 构建 Release App
 
@@ -499,6 +499,25 @@ GitHub Actions 的 macOS 工作流会运行测试、Release 打包、签名和 I
 ./Scripts/build-app.sh fast --no-install
 ```
 
+验证实际分发镜像（未打版本标签或工作区有改动时，镜像名使用 `dev-<提交>`，避免误作正式版本）：
+
+```bash
+./Scripts/create-dmg.sh
+./Scripts/verify-dmg.sh "$(./Scripts/create-dmg.sh --print-path)"
+```
+
+正式发布前还需在独立测试用户中：从 DMG 拖入安装、首次启动、连接已知可用节点、切换节点、退出应用，并确认 macOS 系统代理恢复到原值。当前 CI 对节点切换与恢复只覆盖策略测试，不声称完成了真实系统代理端到端测试。
+
+以后取得 Developer ID Application 证书及公证凭据后，在干净且精确打上 `vX.Y.Z` 标签的提交上显式指定同一签名身份构建；`notarytool` 凭据先存入本机钥匙串，再执行可选公证步骤：
+
+```bash
+CODEX_HARBOR_SIGN_IDENTITY="Developer ID Application: <名称>" ./Scripts/build-app.sh full --no-install
+./Scripts/create-dmg.sh
+CODEX_HARBOR_SIGN_IDENTITY="Developer ID Application: <名称>" ./Scripts/notarize-dmg.sh "$(./Scripts/create-dmg.sh --print-path)" "your-notarytool-profile"
+```
+
+仅发布公证并装订后的最终 DMG，按最后输出重新生成 SHA-256 清单；不要把证书、私钥或公证密码提交到仓库。自动更新仍需在正式签名稳定后另行设计。
+
 复用已有 Release 二进制，只重新打包：
 
 ```bash
@@ -516,7 +535,7 @@ dist/Codex Harbor.app
 1. 防止重复构建的进程锁
 2. Release 编译
 3. Staging App 组装
-4. ad-hoc codesign
+4. 使用可用的固定证书签名；没有证书时退回 ad-hoc 签名
 5. Info.plist / 签名静态校验
 6. 安全替换 `/Applications/Codex Harbor.app`
 7. 暂存上一版本
@@ -642,7 +661,7 @@ git diff --check
 为了避免把未实现能力写进 README，当前版本有以下明确边界：
 
 - 仅支持 macOS
-- 默认构建仍是 ad-hoc 签名，尚未提供 Developer ID 公证发布流水线
+- 本机可使用固定开发证书或自签名证书；尚未配置 Developer ID 凭据，当前正式下载包不具备 Apple 公证与自动更新
 - “使用统计”目前主要统计 Codex 请求、Token、延迟和成功率
 - ChatGPT 接入能记录 MCP 调用审计和诊断，但不能代表整个 ChatGPT 账号的消息数、Token 或订阅额度
 - OpenAI 本地管道需要相应 Tunnel 配置；公网 HTTPS 需要相应 Cloudflare/域名配置

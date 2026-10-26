@@ -110,6 +110,24 @@ struct HarborNetworkProxyTests {
         #expect(result.succeeded)
     }
 
+    @Test("Real proxy probe queue refills each completed slot without a wave barrier")
+    func proxyProbeQueueRefills() {
+        var queue = HarborProxyLatencyQueue(count: 65, limit: HarborProxyLatencyPolicy.parallelCount)
+        #expect(Array(queue.initialIndices()) == Array(0..<32))
+        #expect(queue.initialIndices().isEmpty)
+        #expect(queue.nextIndex() == 32)
+        #expect(queue.nextIndex() == 33)
+        #expect((0..<31).compactMap { _ in queue.nextIndex() } == Array(34..<65))
+        #expect(queue.nextIndex() == nil)
+
+        var small = HarborProxyLatencyQueue(count: 2, limit: 32)
+        #expect(Array(small.initialIndices()) == [0, 1])
+        #expect(small.nextIndex() == nil)
+        var empty = HarborProxyLatencyQueue(count: 0, limit: 32)
+        #expect(empty.initialIndices().isEmpty)
+        #expect(empty.nextIndex() == nil)
+    }
+
     @Test("Real ping uses v2rayN's selected URL and its default on invalid configuration")
     func v2rayNRealPingTarget() {
         let configured = Data(#"{"SpeedTestItem":{"SpeedPingTestUrl":"http://www.msftconnecttest.com/connecttest.txt"}}"#.utf8)

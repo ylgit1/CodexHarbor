@@ -58,6 +58,31 @@ public enum HarborProxyLatencyPolicy {
     public static let failedRetryIntervals: [TimeInterval] = [10 * 60, 60 * 60, 6 * 60 * 60, 24 * 60 * 60]
 }
 
+/// Keeps a fixed number of probes in flight without waiting for a whole wave.
+public struct HarborProxyLatencyQueue: Sendable {
+    private let count: Int
+    private let limit: Int
+    private var next = 0
+
+    public init(count: Int, limit: Int) {
+        self.count = max(0, count)
+        self.limit = max(1, limit)
+    }
+
+    public mutating func initialIndices() -> Range<Int> {
+        let end = min(count, limit)
+        let indices = next..<end
+        next = end
+        return indices
+    }
+
+    public mutating func nextIndex() -> Int? {
+        guard next < count else { return nil }
+        defer { next += 1 }
+        return next
+    }
+}
+
 public enum HarborProxyGeoIPPolicy {
     public static let serverDNSCacheInterval: TimeInterval = 6 * 60 * 60
     public static let exitRefreshInterval: TimeInterval = 7 * 24 * 60 * 60

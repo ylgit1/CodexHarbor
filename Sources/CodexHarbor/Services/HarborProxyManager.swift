@@ -1532,34 +1532,38 @@ final class HarborProxyManager: ObservableObject {
         let latencyForcedDomains = forcedProxyDomains
         let sharedRealBatch = await HarborNodeLatencyTester.startRealBatch(
             nodes: targets, root: latencyRoot, cancellation: cancellation)
-        // Keep one Xray for all nodes and bound only the HTTP probes. A failed
-        // node is retried by a later user test; retrying it immediately here
-        // doubles the worst-case duration without adding an independent signal.
-        let batchSize = HarborProxyLatencyPolicy.parallelCount
-        for offset in stride(from: 0, to: targets.count, by: batchSize) {
-            if latencyCancellationRequested || Task.isCancelled { break }
-            let batch = Array(targets[offset..<min(offset + batchSize, targets.count)])
-            latencyTestingIDs = Set(batch.map(\.id))
-            latencyCurrentID = batch.first?.id
+        // Keep one Xray for all nodes and bound only the HTTP probes. Refill
+        // each free slot immediately, so a slow node cannot block the next wave.
+        // Failed nodes are retried by a later user test, not immediately here.
+        let measureNode: @Sendable (HarborProxyNode) async -> (String, Int?, String?) = { node in
+            let report: HarborNodeDelayReport
+            if let sharedRealBatch {
+                report = await sharedRealBatch.measure(node: node)
+            } else {
+                report = await HarborNodeLatencyTester.measure(
+                    node: node, root: latencyRoot,
+                    ruleMode: latencyRuleMode,
+                    forcedProxyDomains: latencyForcedDomains,
+                    cancellation: cancellation
+                )
+            }
+            return (node.id, report.milliseconds, report.failure)
+        }
+        if !latencyCancellationRequested && !Task.isCancelled {
+            var queue = HarborProxyLatencyQueue(
+                count: targets.count, limit: HarborProxyLatencyPolicy.parallelCount)
             await withTaskGroup(of: (String, Int?, String?).self) { group in
-                for node in batch {
-                    group.addTask {
-                        let report: HarborNodeDelayReport
-                        if let sharedRealBatch {
-                            report = await sharedRealBatch.measure(node: node)
-                        } else {
-                            report = await HarborNodeLatencyTester.measure(
-                                node: node, root: latencyRoot,
-                                ruleMode: latencyRuleMode,
-                                forcedProxyDomains: latencyForcedDomains,
-                                cancellation: cancellation
-                            )
-                        }
-                        return (node.id, report.milliseconds, report.failure)
-                    }
+                for index in queue.initialIndices() {
+                    let node = targets[index]
+                    latencyTestingIDs.insert(node.id)
+                    group.addTask { await measureNode(node) }
                 }
-                for await (id, result, failure) in group {
-                    guard !latencyCancellationRequested, !Task.isCancelled else { continue }
+                latencyCurrentID = targets.first?.id
+                while let (id, result, failure) = await group.next() {
+                    guard !latencyCancellationRequested, !Task.isCancelled else {
+                        group.cancelAll()
+                        break
+                    }
                     let previous = probeResults[id]
                     let checkedAt = Date.now
                     let failures = result == nil
@@ -1589,6 +1593,12 @@ final class HarborProxyManager: ObservableObject {
                     if result != nil { succeeded += 1 }
                     latencyTestingIDs.remove(id)
                     latencyCompleted += 1
+                    if let index = queue.nextIndex() {
+                        let node = targets[index]
+                        latencyTestingIDs.insert(node.id)
+                        latencyCurrentID = node.id
+                        group.addTask { await measureNode(node) }
+                    }
                 }
             }
         }

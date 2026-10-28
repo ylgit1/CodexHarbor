@@ -216,6 +216,9 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var probeResults: [String: HarborProxyProbeResult] = [:]
     @Published private(set) var nodeServerLocations: [String: HarborProxyIPLocation] = [:]
     @Published private(set) var nodeExitLocations: [String: HarborProxyExitLocation] = [:]
+    @Published private(set) var exitGeoUpdating = false
+    @Published private(set) var exitGeoCompleted = 0
+    @Published private(set) var exitGeoTotal = 0
     @Published private(set) var latencyTesting = false
     @Published private(set) var installingCore = false
     @Published private(set) var latencyCurrentID: String?
@@ -242,6 +245,9 @@ final class HarborProxyManager: ObservableObject {
     private var geoRefreshTask: Task<Void, Never>?
     private var exitGeoTask: Task<Void, Never>?
     private var exitGeoPendingIDs = Set<String>()
+    private var exitGeoForcedIDs = Set<String>()
+    private var exitGeoManualIDs = Set<String>()
+    private var exitGeoManualSucceeded = 0
     private var exitGeoAttemptedAt: [String: Date] = [:]
     private var exitGeoFailureCounts: [String: Int] = [:]
     private var exitGeoRetryTask: Task<Void, Never>?
@@ -1614,7 +1620,8 @@ final class HarborProxyManager: ObservableObject {
             for id in Set(targets.map(\.subscriptionID)).filter({ !$0.isEmpty }) {
                 refreshAutomaticNames(for: id)
             }
-            // GeoIP work is triggered by connection/activation, never by a delay test.
+            // A speed test does not change region data. Users can request an
+            // independent exit-region update from the dedicated button.
             persist()
         }
         let confirmedUnavailable = targets.filter { node in
@@ -1630,23 +1637,37 @@ final class HarborProxyManager: ObservableObject {
         }
     }
 
-    /// Exit discovery has its own queue and Xray process. A speed-test batch is
-    /// always closed before this starts, so repeated tests cannot restart or
-    /// extend region work already in flight.
+    /// Explicit region updates do not restart the active node or run a speed
+    /// test. Existing observations stay visible until a replacement succeeds.
+    func refreshExitLocations(for ids: [String]) {
+        guard coreInstalled, !busy, !latencyTesting, !exitGeoUpdating else { return }
+        let requested = Set(ids)
+        let candidates = nodes.filter { requested.contains($0.id) }
+        guard !candidates.isEmpty else { return }
+        exitGeoManualIDs = Set(candidates.map(\.id))
+        exitGeoForcedIDs.formUnion(exitGeoManualIDs)
+        exitGeoUpdating = true
+        exitGeoCompleted = 0
+        exitGeoTotal = candidates.count
+        exitGeoManualSucceeded = 0
+        detail = "正在识别普通网站的出口地区：0/\(exitGeoTotal)"
+        enqueueExitGeoRefresh(for: candidates)
+    }
+
+    /// Exit discovery has its own queue and Xray process.
     private func enqueueExitGeoRefresh(for candidates: [HarborProxyNode]) {
         let now = Date.now
         for candidate in candidates {
             guard let current = nodes.first(where: { $0.id == candidate.id }),
-                  current.endpointSignature == candidate.endpointSignature,
-                  probeResults[current.id]?.milliseconds != nil
-                    || (activeNodeID == current.id && healthy) else { continue }
+                  current.endpointSignature == candidate.endpointSignature else { continue }
             let serverIP = nodeServerLocations[current.host.lowercased()]?.ip
             if let cached = nodeExitLocations[current.id],
-               !cached.needsRefresh(for: current, resolvedServerIP: serverIP) { continue }
+               !cached.needsRefresh(for: current, resolvedServerIP: serverIP),
+               !exitGeoForcedIDs.contains(current.id) { continue }
             if let attempted = exitGeoAttemptedAt[current.id],
                now.timeIntervalSince(attempted) < HarborProxyGeoIPPolicy.retryInterval(
                    afterFailures: exitGeoFailureCounts[current.id] ?? 1
-               ) {
+               ), !exitGeoForcedIDs.contains(current.id) {
                 continue
             }
             exitGeoPendingIDs.insert(current.id)
@@ -1673,51 +1694,71 @@ final class HarborProxyManager: ObservableObject {
                         afterFailures: exitGeoFailureCounts[node.id] ?? 1
                     )
                 } ?? true
-                return needsRefresh && retryAllowed
+                return (needsRefresh && retryAllowed) || exitGeoForcedIDs.contains(node.id)
             }
             guard !due.isEmpty else { continue }
             for node in due { exitGeoAttemptedAt[node.id] = now }
             let cancellation = HarborLatencyCancellation()
-            // Reuse the live SOCKS5 listener for the active node. This reports
-            // the same outbound that websites see, without launching Xray again.
-            let isolated = due.filter {
-                !($0.id == activeNodeID && running && healthy && localPort != nil)
-            }
-            let batch = isolated.isEmpty ? nil : await HarborNodeLatencyTester.startRealBatch(
-                nodes: isolated, root: root, cancellation: cancellation
-            )
-            var requests = 0
-            for target in due {
-                guard !Task.isCancelled else { break }
-                if requests > 0 {
-                    do { try await Task.sleep(for: .milliseconds(1100)) }
-                    catch { break }
-                }
-                guard !Task.isCancelled else { break }
-                requests += 1
-                let observed: HarborProxyIPLocation?
-                if target.id == activeNodeID, running, healthy, let localPort {
-                    observed = await HarborNodeGeoIPResolver.exitLocation(socksPort: localPort + 1)
-                } else {
-                    observed = await batch?.exitLocation(node: target)
-                }
-                guard !Task.isCancelled,
-                      let latest = nodes.first(where: { $0.id == target.id }),
-                      latest.endpointSignature == target.endpointSignature else { continue }
-                guard let observed else {
-                    exitGeoFailureCounts[target.id, default: 0] += 1
-                    continue
-                }
-                exitGeoFailureCounts.removeValue(forKey: target.id)
-                exitGeoAttemptedAt.removeValue(forKey: target.id)
-                nodeExitLocations[target.id] = HarborProxyExitLocation(
-                    location: observed, endpointSignature: target.endpointSignature,
-                    resolvedServerIP: nodeServerLocations[latest.host.lowercased()]?.ip
+            // A lone automatic refresh can reuse the active listener. Manual
+            // batches always use isolated inbounds so node switches cannot
+            // attribute an exit IP to the wrong profile.
+            let livePort = due.count == 1 && due[0].id == activeNodeID
+                && !exitGeoManualIDs.contains(due[0].id) && running && healthy
+                ? localPort.map { $0 + 1 } : nil
+            let batch: HarborRealDelayBatch?
+            if livePort == nil {
+                batch = await HarborNodeLatencyTester.startRealBatch(
+                    nodes: due, root: root, cancellation: cancellation
                 )
-                if !latest.subscriptionID.isEmpty {
-                    refreshAutomaticNames(for: latest.subscriptionID)
+            } else {
+                batch = nil
+            }
+            let inspect: @Sendable (HarborProxyNode) async
+                -> (HarborProxyNode, HarborProxyIPLocation?) = { node in
+                if let livePort {
+                    return (node, await HarborNodeGeoIPResolver.exitLocation(socksPort: livePort))
                 }
-                persist()
+                return (node, await batch?.exitLocation(node: node))
+            }
+            var queue = HarborProxyLatencyQueue(
+                count: due.count, limit: HarborProxyGeoIPPolicy.exitParallelCount
+            )
+            await withTaskGroup(of: (HarborProxyNode, HarborProxyIPLocation?).self) { group in
+                for index in queue.initialIndices() {
+                    let target = due[index]
+                    group.addTask { await inspect(target) }
+                }
+                while let (target, observed) = await group.next() {
+                    guard !Task.isCancelled else { group.cancelAll(); break }
+                    if let index = queue.nextIndex() {
+                        let next = due[index]
+                        group.addTask { await inspect(next) }
+                    }
+                    guard let latest = nodes.first(where: { $0.id == target.id }),
+                          latest.endpointSignature == target.endpointSignature,
+                          livePort == nil || activeNodeID == target.id else { continue }
+                    let manuallyRequested = exitGeoManualIDs.remove(target.id) != nil
+                    exitGeoForcedIDs.remove(target.id)
+                    if manuallyRequested {
+                        exitGeoCompleted += 1
+                        detail = "正在识别普通网站的出口地区：\(exitGeoCompleted)/\(exitGeoTotal)"
+                    }
+                    guard let observed else {
+                        exitGeoFailureCounts[target.id, default: 0] += 1
+                        continue
+                    }
+                    if manuallyRequested { exitGeoManualSucceeded += 1 }
+                    exitGeoFailureCounts.removeValue(forKey: target.id)
+                    exitGeoAttemptedAt.removeValue(forKey: target.id)
+                    nodeExitLocations[target.id] = HarborProxyExitLocation(
+                        location: observed, endpointSignature: target.endpointSignature,
+                        resolvedServerIP: nodeServerLocations[latest.host.lowercased()]?.ip
+                    )
+                    if !latest.subscriptionID.isEmpty {
+                        refreshAutomaticNames(for: latest.subscriptionID)
+                    }
+                    persist()
+                }
             }
             if Task.isCancelled { cancellation.cancel() }
             if let batch {
@@ -1725,6 +1766,12 @@ final class HarborProxyManager: ObservableObject {
             }
         }
         exitGeoTask = nil
+        if exitGeoUpdating {
+            detail = "出口地区识别完成：确认 \(exitGeoManualSucceeded)/\(exitGeoTotal) 个；未确认的节点仍显示入口"
+            exitGeoUpdating = false
+            exitGeoManualIDs.removeAll()
+            exitGeoForcedIDs.removeAll()
+        }
         scheduleExitGeoRetry()
     }
 

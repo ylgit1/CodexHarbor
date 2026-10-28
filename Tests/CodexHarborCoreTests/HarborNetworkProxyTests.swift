@@ -65,6 +65,7 @@ struct HarborNetworkProxyTests {
 
     @Test("Failed exit IP lookups back off instead of blocking for one hour")
     func exitGeoIPRetryBackoff() {
+        #expect(HarborProxyGeoIPPolicy.exitParallelCount == 8)
         #expect(HarborProxyGeoIPPolicy.retryInterval(afterFailures: 1) == 10)
         #expect(HarborProxyGeoIPPolicy.retryInterval(afterFailures: 2) == 60)
         #expect(HarborProxyGeoIPPolicy.retryInterval(afterFailures: 3) == 600)
@@ -238,6 +239,13 @@ struct HarborNetworkProxyTests {
         let encoded = try JSONEncoder().encode(observation)
         #expect(try JSONDecoder().decode(HarborProxyExitLocation.self,
             from: encoded) == observation)
+        var legacy = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        legacy.removeValue(forKey: "probeVersion")
+        let legacyData = try JSONSerialization.data(withJSONObject: legacy)
+        let legacyObservation = try JSONDecoder().decode(HarborProxyExitLocation.self,
+            from: legacyData)
+        #expect(legacyObservation.verifiedLocation(for: node) == nil)
+        #expect(legacyObservation.needsRefresh(for: node))
     }
 
     @Test("Automatic names use each node's observed exit over shared server geography")

@@ -848,6 +848,21 @@ struct HarborProxyWorkspaceView: View {
                 .help("通过独立 Xray 的 SOCKS5 代理请求测速地址；不改变当前节点或系统代理")
             }
 
+            Button {
+                proxy.refreshExitLocations(for: sourceGroupNodes.map(\.id))
+            } label: {
+                Label(proxy.exitGeoUpdating
+                      ? "识别 \(proxy.exitGeoCompleted)/\(proxy.exitGeoTotal)"
+                      : "更新出口地区", systemImage: "globe.americas")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+            .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+            .disabled(sourceGroupNodes.isEmpty || proxy.busy || proxy.latencyTesting
+                      || proxy.exitGeoUpdating || !proxy.coreInstalled)
+            .help("独立检测普通网站看到的出口 IP，并更新节点地区与自动名称；不重新测速")
+
             if unavailableCount > 0 {
                 Button {
                     showUnavailable.toggle()
@@ -1500,7 +1515,7 @@ struct HarborProxyWorkspaceView: View {
 
     private func regionHint(_ node: HarborProxyNode) -> String {
         if let exit = proxy.exitLocation(for: node) {
-            return "真实代理出口 IP：\(exit.ip) · 优先显示出口地区"
+            return "普通网站检测到的出口 IP：\(exit.ip) · 优先显示出口地区"
         }
         if let location = proxy.serverLocation(for: node) {
             if location.countryCode == "ZZ" {

@@ -86,6 +86,7 @@ public struct HarborProxyLatencyQueue: Sendable {
 public enum HarborProxyGeoIPPolicy {
     public static let serverDNSCacheInterval: TimeInterval = 6 * 60 * 60
     public static let exitRefreshInterval: TimeInterval = 7 * 24 * 60 * 60
+    public static let exitParallelCount = 8
     public static let exitFailureRetryIntervals: [TimeInterval] = [
         10, 60, 10 * 60, 60 * 60
     ]
@@ -262,6 +263,8 @@ public struct HarborProxyExitLocation: Codable, Equatable, Sendable {
     public let endpointSignature: String
     public let observedAt: Date
     public let resolvedServerIP: String?
+    // Missing on observations made with the old Cloudflare-hosted probe.
+    private let probeVersion: Int?
 
     public init(location: HarborProxyIPLocation, endpointSignature: String,
                 observedAt: Date = .now, resolvedServerIP: String? = nil) {
@@ -269,12 +272,14 @@ public struct HarborProxyExitLocation: Codable, Equatable, Sendable {
         self.endpointSignature = endpointSignature
         self.observedAt = observedAt
         self.resolvedServerIP = resolvedServerIP
+        self.probeVersion = 2
     }
 
     public func verifiedLocation(for node: HarborProxyNode, resolvedServerIP currentIP: String? = nil,
                                  now: Date = .now)
         -> HarborProxyIPLocation? {
-        guard !endpointSignature.isEmpty,
+        guard probeVersion == 2,
+              !endpointSignature.isEmpty,
               endpointSignature == node.endpointSignature,
               location.verifiedCountryCode != nil else {
             return nil

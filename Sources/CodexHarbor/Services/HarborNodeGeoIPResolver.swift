@@ -90,28 +90,42 @@ enum HarborNodeGeoIPResolver {
         return code
     }
 
-    /// Query the IP actually observed by the geolocation provider via an
-    /// isolated Xray SOCKS inbound. Callers must use a forced-proxy outbound,
-    /// never the macOS system proxy or a direct-route runtime listener.
+    /// Ask a non-Cloudflare site for the IP it sees through this node. Looking
+    /// up that explicit IP separately avoids mistaking a CF-only ProxyIP for
+    /// the exit used by ordinary websites.
     static func exitLocation(socksPort: Int) async -> HarborProxyIPLocation? {
         guard (1...65_535).contains(socksPort), !Task.isCancelled,
-              let url = URL(string: "https://ipwho.is/?fields=success,ip,country_code") else {
+              let url = URL(string: "https://checkip.amazonaws.com/") else {
             return nil
         }
         // Force SOCKS5 + remote DNS; URLSession on some macOS builds can
         // silently bypass its SOCKS proxy dictionary and report the host IP.
         // A failed proxy must return nil, never the machine's direct address.
         guard let data = await exitDataViaCurl(socksPort: socksPort, url: url),
-              !Task.isCancelled, data.count < 4_096,
-              let result = try? JSONDecoder().decode(Response.self, from: data),
-              result.success, let observedIP = result.ip,
+              !Task.isCancelled, data.count < 128,
+              let observedIP = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
               let canonical = HarborIPAddress.normalizedLiteral(observedIP),
               isPublic(canonical),
-              let code = result.country_code?.uppercased(),
-              code.count == 2,
-              code.utf8.allSatisfy({ (65...90).contains($0) }),
-              code != "ZZ" else { return nil }
+              let code = await exitCountryCode(for: canonical, socksPort: socksPort) else {
+            return nil
+        }
         return HarborProxyIPLocation(ip: canonical, countryCode: code)
+    }
+
+    private static func exitCountryCode(for ip: String, socksPort: Int) async -> String? {
+        guard let encoded = ip.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+              let url = URL(string: "https://ipwho.is/\(encoded)?fields=success,ip,country_code"),
+              let data = await exitDataViaCurl(socksPort: socksPort, url: url),
+              !Task.isCancelled,
+              let result = try? JSONDecoder().decode(Response.self, from: data),
+              result.success,
+              let returnedIP = result.ip, HarborIPAddress.equivalent(returnedIP, ip),
+              let code = result.country_code?.uppercased(), code != "ZZ",
+              code.count == 2, code.utf8.allSatisfy({ (65...90).contains($0) }) else {
+            return nil
+        }
+        return code
     }
 
     private static func exitDataViaCurl(socksPort: Int, url: URL) async -> Data? {

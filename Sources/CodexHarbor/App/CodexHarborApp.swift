@@ -112,9 +112,11 @@ struct CodexHarborApp: App {
         } label: {
             Label(
                 "Codex Harbor",
-                systemImage: model.environment.activeMode == nil
-                    ? "circle.dashed"
-                    : "point.3.connected.trianglepath.dotted"
+                systemImage: model.requiresCodexReload || model.errorMessage != nil || proxy.requiresRecovery
+                    ? "exclamationmark.circle"
+                    : (model.environment.activeMode == nil
+                        ? "circle.dashed"
+                        : "point.3.connected.trianglepath.dotted")
             )
             .onAppear {
                 // The menu bar remains alive if every main window is closed.

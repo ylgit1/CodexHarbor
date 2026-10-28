@@ -1,36 +1,28 @@
 import CodexHarborCore
 import Foundation
-import Security
 import SystemConfiguration
 
 /// Separate from the ChatGPT transport. Never edit a different application's
 /// active proxy settings, even if an old Harbor recovery file is present.
 @MainActor
 enum HarborSystemProxy {
-    private static var sessionAuthorization: AuthorizationRef?
-
     private struct Snapshot: Codable {
         var serviceID: String
         var original: Data
         var managed: Data
     }
     enum Failure: LocalizedError {
-        case unavailable, inUse, notOwned, authorization, changeFailed
+        case unavailable, inUse, notOwned, changeFailed
         var errorDescription: String? {
             switch self {
             case .unavailable: "未找到当前网络服务"
             case .inUse: "系统代理正被其他程序使用，请先在原程序中清除系统代理"
             case .notOwned: "系统代理已被其他程序更改，不能覆盖，请手动检查网络设置"
-            case .authorization: "无法取得 macOS 系统代理修改权限"
             case .changeFailed: "系统代理应用或恢复失败"
             }
         }
     }
 
-    private static let keys = ["HTTPEnable","HTTPProxy","HTTPPort",
-                               "HTTPSEnable","HTTPSProxy","HTTPSPort",
-                               "SOCKSEnable","SOCKSProxy","SOCKSPort",
-                               "ProxyAutoConfigEnable","ProxyAutoDiscoveryEnable","ExceptionsList"]
     private static var backupURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/CodexHarbor/NetworkProxy/system-recovery.json")
@@ -72,11 +64,7 @@ enum HarborSystemProxy {
             .contains { (value[$0] as? NSNumber)?.boolValue == true }
     }
     private static func equal(_ a: [String: Any], _ b: [String: Any]) -> Bool {
-        keys.allSatisfy { key in
-            let one = a[key] as? NSObject
-            let two = b[key] as? NSObject
-            return one == two
-        }
+        HarborSystemProxyNetworkSetup.matches(a, b)
     }
 
     static func isOwned() -> Bool {
@@ -121,65 +109,48 @@ enum HarborSystemProxy {
         return items.isEmpty ? "未启用" : items.joined(separator: " · ")
     }
 
-    @MainActor
-    private final class Authorized {
-        let prefs: SCPreferences
-        nonisolated(unsafe) let auth: AuthorizationRef
-        nonisolated(unsafe) private var ownsReference: Bool
-        init(interactive: Bool) throws {
-            let reference: AuthorizationRef
-            if let cached = sessionAuthorization {
-                reference = cached
-                ownsReference = false
-            } else {
-                var created: AuthorizationRef?
-                let flags: AuthorizationFlags = interactive ? [.interactionAllowed, .extendRights] : [.extendRights]
-                guard AuthorizationCreate(nil, nil, flags, &created) == errAuthorizationSuccess,
-                      let created else { throw Failure.authorization }
-                reference = created
-                ownsReference = true
-            }
-            guard let preferences = SCPreferencesCreateWithAuthorization(
-                nil, "com.codexharbor.proxy.write" as CFString, nil, reference
-            ) else {
-                if ownsReference { AuthorizationFree(reference, []) }
-                throw Failure.authorization
-            }
-            prefs = preferences
-            auth = reference
-        }
-        func retainGrantedSession() {
-            if ownsReference {
-                sessionAuthorization = auth
-                ownsReference = false
-            }
-        }
-        deinit {
-            if ownsReference { AuthorizationFree(auth, []) }
-        }
-    }
+    private static func apply(
+        serviceID: String, values: [String: Any], expected: [String: Any]
+    ) throws {
+        guard let prefs = SCPreferencesCreate(nil, "com.codexharbor.proxy.read" as CFString, nil),
+              let service = SCNetworkServiceCopy(prefs, serviceID as CFString),
+              let name = SCNetworkServiceGetName(service) as String?,
+              let allServices = SCNetworkServiceCopyAll(prefs) as? [SCNetworkService],
+              allServices.filter({ (SCNetworkServiceGetName($0) as String?) == name }).count == 1,
+              let proto = SCNetworkServiceCopyProtocol(service, kSCNetworkProtocolTypeProxies)
+        else { throw Failure.unavailable }
+        let current = SCNetworkProtocolGetConfiguration(proto) as? [String: Any] ?? [:]
+        guard equal(current, expected),
+              let commands = HarborSystemProxyNetworkSetup.commands(
+                current: current, desired: values
+              ) else { throw Failure.notOwned }
 
-    private static func apply(_ proto: SCNetworkProtocol, prefs: SCPreferences, values: [String: Any]) throws {
-        guard SCNetworkProtocolSetConfiguration(proto, values as CFDictionary),
-              SCPreferencesCommitChanges(prefs), SCPreferencesApplyChanges(prefs)
-        else { throw Failure.changeFailed }
+        // Apple's networksetup has the network-configuration entitlement. Do
+        // not invoke a shell or fall back to interactive Authorization Services.
+        for command in commands {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
+            process.arguments = [command[0], name] + Array(command.dropFirst())
+            process.standardOutput = Pipe()
+            process.standardError = Pipe()
+            do { try process.run() } catch { throw Failure.changeFailed }
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { throw Failure.changeFailed }
+        }
     }
 
     static func enable(port: Int, forcedProxyDomains: [String] = HarborProxyDomainRules.defaults,
                        interactive: Bool = false) throws {
-        guard (1024...65535).contains(port) else { throw Failure.unavailable }
+        // Retain the caller's API shape; this path never requests interactive authorization.
+        guard (1024...65534).contains(port) else { throw Failure.unavailable }
         if hasBackup { throw Failure.notOwned }
-        // Fail closed before requesting authorization. This prevents a subtle
+        // Fail closed before changing the network service. This prevents a subtle
         // overwrite when v2rayN still controls Wi-Fi's loopback proxy.
         guard let inspector = SCPreferencesCreate(nil, "com.codexharbor.proxy.read" as CFString, nil),
               let (id, active) = currentService(inspector) else { throw Failure.unavailable }
         let inspected = SCNetworkProtocolGetConfiguration(active) as? [String: Any] ?? [:]
         if hasOther(inspected) { throw Failure.inUse }
-        let context = try Authorized(interactive: interactive)
-        guard let target = proxy(context.prefs, serviceID: id) else { throw Failure.unavailable }
-        let previous = SCNetworkProtocolGetConfiguration(target) as? [String: Any] ?? [:]
-        if hasOther(previous) { throw Failure.inUse }
-        var updated = previous
+        var updated = inspected
         updated["HTTPEnable"] = 1; updated["HTTPProxy"] = "127.0.0.1"; updated["HTTPPort"] = port
         updated["HTTPSEnable"] = 1; updated["HTTPSProxy"] = "127.0.0.1"; updated["HTTPSPort"] = port
         updated["SOCKSEnable"] = 1; updated["SOCKSProxy"] = "127.0.0.1"
@@ -198,19 +169,16 @@ enum HarborSystemProxy {
         }
         for host in ["localhost", "127.0.0.0/8", "::1"] where !bypass.contains(host) { bypass.append(host) }
         updated["ExceptionsList"] = bypass
-        let backup = Snapshot(serviceID: id, original: try encoded(previous), managed: try encoded(updated))
+        let backup = Snapshot(serviceID: id, original: try encoded(inspected), managed: try encoded(updated))
         let parent = backupURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         try JSONEncoder().encode(backup).write(to: backupURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backupURL.path)
         do {
-            try apply(target, prefs: context.prefs, values: updated)
+            try apply(serviceID: id, values: updated, expected: inspected)
             guard isOwned() else { throw Failure.changeFailed }
-            context.retainGrantedSession()
         } catch {
-            try? apply(target, prefs: context.prefs, values: previous)
-            if let restored = SCNetworkProtocolGetConfiguration(target) as? [String: Any],
-               equal(restored, previous) { try? FileManager.default.removeItem(at: backupURL) }
+            _ = try? restore(interactive: false)
             throw error
         }
     }
@@ -229,7 +197,9 @@ enum HarborSystemProxy {
             try FileManager.default.removeItem(at: backupURL)
             return true
         }
-        if !equal(current, managed) {
+        if !equal(current, managed) && !HarborSystemProxyNetworkSetup.recoverable(
+            current, original: original, managed: managed
+        ) {
             // Another client has already taken over the system proxy.
             // Relinquish our recovery marker only if macOS no longer points
             // to Harbor's former local HTTP/HTTPS port.
@@ -237,17 +207,12 @@ enum HarborSystemProxy {
             try FileManager.default.removeItem(at: backupURL)
             return true
         }
-        let context = try Authorized(interactive: interactive)
-        guard let authorizedTarget = proxy(context.prefs, serviceID: snapshot.serviceID),
-              equal(SCNetworkProtocolGetConfiguration(authorizedTarget) as? [String: Any] ?? [:], managed)
-        else { throw Failure.notOwned }
-        try apply(authorizedTarget, prefs: context.prefs, values: original)
+        try apply(serviceID: snapshot.serviceID, values: original, expected: current)
         guard let verifier = SCPreferencesCreate(nil, "com.codexharbor.proxy.verify" as CFString, nil),
               let verified = proxy(verifier, serviceID: snapshot.serviceID),
               equal(SCNetworkProtocolGetConfiguration(verified) as? [String: Any] ?? [:], original)
         else { throw Failure.changeFailed }
         try FileManager.default.removeItem(at: backupURL)
-        context.retainGrantedSession()
         return true
     }
 }

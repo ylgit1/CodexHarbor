@@ -5,6 +5,58 @@ import Testing
 
 @Suite("Independent network proxy")
 struct HarborNetworkProxyTests {
+    @Test("System proxy writes use networksetup and restore the saved disabled endpoints")
+    func systemProxyNetworkSetupRoundTrip() throws {
+        let original: [String: Any] = [
+            "HTTPEnable": 0, "HTTPProxy": "127.0.0.1", "HTTPPort": 10808,
+            "HTTPSEnable": 0, "HTTPSProxy": "127.0.0.1", "HTTPSPort": 10808,
+            "SOCKSEnable": 0, "SOCKSProxy": "127.0.0.1", "SOCKSPort": 10808,
+            "ProxyAutoConfigEnable": 0, "ProxyAutoDiscoveryEnable": 0,
+            "ExceptionsList": ["localhost"]
+        ]
+        var managed = original
+        managed["HTTPEnable"] = 1; managed["HTTPPort"] = 18080
+        managed["HTTPSEnable"] = 1; managed["HTTPSPort"] = 18080
+        managed["SOCKSEnable"] = 1; managed["SOCKSPort"] = 18081
+
+        #expect(HarborSystemProxyNetworkSetup.commands(current: original, desired: managed) == [
+            ["-setwebproxy", "127.0.0.1", "18080"], ["-setwebproxystate", "on"],
+            ["-setsecurewebproxy", "127.0.0.1", "18080"], ["-setsecurewebproxystate", "on"],
+            ["-setsocksfirewallproxy", "127.0.0.1", "18081"],
+            ["-setsocksfirewallproxystate", "on"]
+        ])
+        #expect(HarborSystemProxyNetworkSetup.commands(current: managed, desired: original) == [
+            ["-setwebproxy", "127.0.0.1", "10808"], ["-setwebproxystate", "off"],
+            ["-setsecurewebproxy", "127.0.0.1", "10808"], ["-setsecurewebproxystate", "off"],
+            ["-setsocksfirewallproxy", "127.0.0.1", "10808"],
+            ["-setsocksfirewallproxystate", "off"]
+        ])
+        #expect(HarborSystemProxyNetworkSetup.commands(current: managed, desired: managed)?.isEmpty == true)
+        #expect(HarborSystemProxyNetworkSetup.matches(managed, managed))
+
+        var partiallyRestored = managed
+        partiallyRestored["HTTPPort"] = 10808
+        #expect(HarborSystemProxyNetworkSetup.recoverable(
+            partiallyRestored, original: original, managed: managed))
+        partiallyRestored["HTTPProxy"] = "other.example"
+        #expect(!HarborSystemProxyNetworkSetup.recoverable(
+            partiallyRestored, original: original, managed: managed))
+
+        let fresh: [String: Any] = ["HTTPEnable": 0, "HTTPSEnable": 0, "SOCKSEnable": 0]
+        #expect(HarborSystemProxyNetworkSetup.matches(
+            ["HTTPEnable": 0, "HTTPProxy": "127.0.0.1", "HTTPPort": 18080,
+             "HTTPSEnable": 0, "SOCKSEnable": 0], fresh))
+        #expect(HarborSystemProxyNetworkSetup.commands(
+            current: managed, desired: fresh)?.contains(["-setwebproxystate", "off"]) == true)
+        #expect(HarborSystemProxyNetworkSetup.commands(
+            current: managed, desired: ["HTTPEnable": 1]) == nil)
+
+        var withoutBypass = managed
+        withoutBypass["ExceptionsList"] = [String]()
+        #expect(HarborSystemProxyNetworkSetup.commands(
+            current: managed, desired: withoutBypass) == [["-setproxybypassdomains", "Empty"]])
+    }
+
     @Test("Runtime outbound must match complete node identity, not UI selection")
     func runtimeOutboundVerification() throws {
         let node = HarborProxyNode(

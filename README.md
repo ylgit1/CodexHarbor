@@ -25,10 +25,10 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 
 - [最新 DMG · GitHub 公共下载（无需登录）](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg)
 - [最新 DMG · Gitee 下载（访问大文件可能需要登录）](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg)
-- [v0.1.24 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.24/Codex-Harbor-v0.1.24-arm64.dmg)
-- [v0.1.24 固定版本 · Gitee](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/v0.1.24/Codex-Harbor-v0.1.24-arm64.dmg)
+- [v0.1.25 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.25/Codex-Harbor-v0.1.25-arm64.dmg)
+- [v0.1.25 固定版本 · Gitee](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/v0.1.25/Codex-Harbor-v0.1.25-arm64.dmg)
 
-v0.1.24 DMG 可通过 [SHA-256 校验清单](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/SHA256SUMS) 核验下载完整性。
+v0.1.25 DMG 可通过 [SHA-256 校验清单](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/SHA256SUMS) 核验下载完整性。
 Gitee Raw 大文件可能要求登录，无法直接下载时可使用 GitHub 公共文件下载地址。
 要求 macOS 14 或更新版本及 Apple Silicon；Xray、`geoip.dat`、`geosite.dat`
 已内置，首次启动不需要下载代理内核。
@@ -113,11 +113,11 @@ flowchart LR
 
 **节点切换/重启恢复**：列表与卡片中的任意节点在未连接、连接中和已连接时
 均可点击；快速连续点击会执行最后一次选择。切换节点只更新独立 Xray 内核，
-保持 HTTP/SOCKS 固定端口与当前系统代理配置，不再为每次切换重复申请 macOS
-管理员权限。应用启动时会恢复最后节点与之前的系统代理意图，自动接管采用非交互方式；
-macOS 未授予网络设置权限时只保持本地 Xray 运行并显示具体原因，
-**不尝试绕过系统授权机制**。退出时同样不主动弹出系统权限窗口，
-如果无权安全恢复网络设置则保留代理内核以免断网，下一次启动重新接管。
+保持 HTTP/SOCKS 固定端口与当前系统代理配置。设置、清理和退出恢复系统代理
+改用 macOS 自带的 `networksetup`，不再由应用反复请求管理员密码；若无法安全修改，
+只报告失败，不回退到弹窗授权。应用启动时会恢复最后节点与之前的系统代理意图；
+如无法安全恢复网络设置，则保留代理内核以免断网，下一次启动重新检查。
+地区筛选栏隐藏滚动条，在栏上滚动鼠标滚轮可横向查看其他地区。
 应用内实际地址均按原始端口字符串显示（无千分位符）。
 
 **快速启动**：Xray 监听本地 HTTP/SOCKS5 端口成功后立即显示「代理已启动 · 检测网络中」，
@@ -144,7 +144,7 @@ XTLS Xray-core、`geoip.dat` 和 `geosite.dat`。首次启动会把它们复制�
 **切换代理的安全前提**：如果 v2rayN 当前仍控制系统代理（例如 127.0.0.1:10808），
 Harbor 拒绝覆盖；请先在 v2rayN 内清除系统代理，然后在 Harbor 内设置。设置前备份
 原代理参数，清除时按所有权检查恢复，避免覆盖其他程序的网络变更。关闭或退出时先恢复
-macOS 代理再终止本机 Xray；如需系统授权且未恢复，则阻止普通退出并提示手动恢复。
+macOS 代理再终止本机 Xray；恢复失败则阻止普通退出并提示手动恢复。
 启动时对异常退出留下的系统代理快照尝试安全恢复，并按完整进程命令验证后清理孤立内核。
 「开机启动 Xray」仅启动内核，**不会自动接管系统代理**。本功能不是所有程序透明代理，
 忽略 macOS 系统代理的客户端仍需要自行配置。
@@ -375,7 +375,7 @@ Transport Installer 当前同时包含 Apple Silicon（arm64）与 Intel（x86_6
 
 ## 下载与安装
 
-从上方「下载安装」下载 v0.1.24 DMG，双击打开后将 `Codex Harbor.app` 拖入 `Applications`。Gitee Raw 大文件可能要求登录，无法直接下载时使用 GitHub 公共文件下载地址；安装前建议校验 SHA-256。当前安装包尚未经过 Apple 公证，其他 Mac 首次打开时可能需要在「系统设置 → 隐私与安全性」中手动允许。
+从上方「下载安装」下载 v0.1.25 DMG，双击打开后将 `Codex Harbor.app` 拖入 `Applications`。Gitee Raw 大文件可能要求登录，无法直接下载时使用 GitHub 公共文件下载地址；安装前建议校验 SHA-256。当前安装包尚未经过 Apple 公证，其他 Mac 首次打开时可能需要在「系统设置 → 隐私与安全性」中手动允许。
 
 构建脚本会优先沿用已安装 Agent 的签名证书，并自动识别有效的 **Apple Development / Developer ID Application** 证书或本机固定名称的自签名证书；`HarborChatGPTAgent` 使用 `com.codexharbor.agent` 代码签名标识。
 

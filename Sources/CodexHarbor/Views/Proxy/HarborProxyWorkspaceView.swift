@@ -817,9 +817,11 @@ struct HarborProxyWorkspaceView: View {
                         tint: HarborColors.blue, cornerRadius: 6))
                 }
             }
-            .padding(.leading, 10)
+            .padding(.horizontal, 10)
+            .background(HarborHorizontalWheelBridge())
         }
         .scrollIndicators(.hidden)
+        .help("在地区栏上滚动鼠标滚轮，可查看更多地区")
         .frame(minWidth: 0, maxWidth: .infinity)
     }
 
@@ -1831,4 +1833,47 @@ struct HarborProxyWorkspaceView: View {
         .buttonStyle(HarborInteractivePlainButtonStyle(tint: tint, cornerRadius: 10))
     }
 
+}
+
+/// SwiftUI's hidden indicator can still leave a visible NSScroller when the
+/// macOS preference is "Always". Keep the horizontal content scrollable and
+/// translate vertical wheel motion only while the pointer is over this bar.
+private struct HarborHorizontalWheelBridge: NSViewRepresentable {
+    func makeNSView(context: Context) -> WheelView { WheelView() }
+    func updateNSView(_ nsView: WheelView, context: Context) { nsView.hideScroller() }
+
+    final class WheelView: NSView {
+        nonisolated(unsafe) private var monitor: Any?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
+            guard window != nil else { return }
+            hideScroller()
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                guard let self, let scroll = enclosingScrollView,
+                      event.window === window,
+                      abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX),
+                      let document = scroll.documentView else { return event }
+                let clip = scroll.contentView
+                let point = clip.convert(event.locationInWindow, from: nil)
+                guard clip.bounds.contains(point) else { return event }
+                let maxX = max(0, document.frame.width - clip.bounds.width)
+                let step: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 20
+                let nextX = min(maxX, max(0, clip.bounds.origin.x - event.scrollingDeltaY * step))
+                guard nextX != clip.bounds.origin.x else { return event }
+                clip.scroll(to: NSPoint(x: nextX, y: clip.bounds.origin.y))
+                scroll.reflectScrolledClipView(clip)
+                return nil
+            }
+        }
+
+        func hideScroller() {
+            enclosingScrollView?.hasHorizontalScroller = false
+        }
+
+        deinit {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+        }
+    }
 }

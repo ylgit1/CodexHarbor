@@ -69,6 +69,17 @@ struct HarborNetworkProxyTests {
             node: node, httpPort: 18080, ruleMode: true, routeVerificationViaProxy: true
         )
         #expect(HarborProxyRuntimeIdentity.matches(configuration: config, node: node))
+        let document = try #require(JSONSerialization.jsonObject(with: config) as? [String: Any])
+        let dns = try #require(document["dns"] as? [String: Any])
+        #expect(dns["queryStrategy"] as? String == "UseIPv4")
+        let dnsServers = try #require(dns["servers"] as? [[String: Any]])
+        #expect(dnsServers.map { $0["address"] as? String } == [
+            "https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"
+        ])
+        let routing = try #require(document["routing"] as? [String: Any])
+        let rules = try #require(routing["rules"] as? [[String: Any]])
+        #expect(rules.first?["inboundTag"] as? [String] == ["codexharbor-proxy-dns"])
+        #expect(rules.first?["outboundTag"] as? String == "proxy")
         var changed = node
         changed.id = "another-local-id"
         changed.name = "Renamed profile"
@@ -181,6 +192,27 @@ struct HarborNetworkProxyTests {
         #expect(empty.nextIndex() == nil)
     }
 
+    @Test("OpenVPN probes scale to eight on large Macs but respect CPU and RAM limits")
+    func openVPNParallelismIsBounded() {
+        let gib: UInt64 = 1_024 * 1_024 * 1_024
+        let policy = HarborProxyLatencyPolicy.openVPNParallelCount
+        #expect(policy(8, 16 * gib) == 8)
+        #expect(policy(10, 32 * gib) == 8)
+        #expect(policy(8, 8 * gib) == 6)
+        #expect(policy(8, 4 * gib) == 3)
+        #expect(policy(2, 16 * gib) == 2)
+        #expect(policy(1, 16 * gib) == 1)
+
+        // With eight slots the next relay is dispatched immediately when one
+        // finishes, instead of waiting for the other seven in that batch.
+        var queue = HarborProxyLatencyQueue(count: 24, limit: policy(8, 16 * gib))
+        #expect(Array(queue.initialIndices()) == Array(0..<8))
+        #expect(queue.nextIndex() == 8)
+        #expect(queue.nextIndex() == 9)
+        #expect((0..<14).compactMap { _ in queue.nextIndex() } == Array(10..<24))
+        #expect(queue.nextIndex() == nil)
+    }
+
     @Test("Real ping uses v2rayN's selected URL and its default on invalid configuration")
     func v2rayNRealPingTarget() {
         let configured = Data(#"{"SpeedTestItem":{"SpeedPingTestUrl":"http://www.msftconnecttest.com/connecttest.txt"}}"#.utf8)
@@ -202,7 +234,10 @@ struct HarborNetworkProxyTests {
             ruleMode: true, routeAllViaProxy: true)
         let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let routing = try #require(json["routing"] as? [String: Any])
-        #expect((routing["rules"] as? [[String: Any]])?.isEmpty == true)
+        let rules = try #require(routing["rules"] as? [[String: Any]])
+        #expect(rules.count == 1)
+        #expect(rules[0]["inboundTag"] as? [String] == ["codexharbor-proxy-dns"])
+        #expect(rules[0]["outboundTag"] as? String == "proxy")
     }
 
     @Test("Real ping batch uses one mixed inbound and matching outbound per node")
@@ -412,6 +447,286 @@ struct HarborNetworkProxyTests {
         }
     }
 
+    @Test("Community sources exclude the old free mixed feed")
+    func communitySources() throws {
+        let residential = HarborProxyCommunitySource.residential
+        let vpnGate = HarborProxyCommunitySource.vpnGate
+        #expect(HarborProxyCommunitySource.offered == [.vpnGate])
+        #expect(residential.url.hasSuffix("/output/residential.txt"))
+        #expect(vpnGate.url == HarborVPNGate.feedURL)
+        #expect(HarborProxyCommunitySource.matching(residential.url) == .residential)
+        #expect(HarborProxyCommunitySource.matching(residential.fallbackURL) == .residential)
+        #expect(HarborProxyCommunitySource.matching(vpnGate.url) == .vpnGate)
+        #expect(HarborProxyCommunitySource.matching(
+            "https://cdn.jsdelivr.net/gh/hezhanleiok/freesub@main/output/v2ray.txt") == nil)
+        #expect(HarborProxyCommunitySource.matching("https://example.com/sub") == nil)
+        let link = "vless://00000000-0000-0000-0000-000000000001@example.com:443?security=tls#sample"
+        let subscription = Data(link.utf8).base64EncodedString()
+        let response = try JSONSerialization.data(withJSONObject: [
+            "content": Data(subscription.utf8).base64EncodedString(),
+            "encoding": "base64"
+        ])
+        let decoded = try #require(HarborProxyCommunitySource.decodedAPIContents(response))
+        #expect(HarborProxyLinks.parse(decoded).count == 1)
+        #expect(HarborProxyCommunitySource.decodedAPIContents(Data("{}".utf8)) == nil)
+    }
+
+    @Test("VPN Gate CSV supports quoted fields and keeps uncertain relays distinct")
+    func vpnGateCSV() throws {
+        let profile = """
+        remote 93.184.216.34 443
+        proto tcp-client
+        <ca>
+        -----BEGIN CERTIFICATE-----
+        abc
+        -----END CERTIFICATE-----
+        </ca>
+        <cert>
+        -----BEGIN CERTIFICATE-----
+        def
+        -----END CERTIFICATE-----
+        </cert>
+        <key>
+        -----BEGIN PRIVATE KEY-----
+        ghi
+        -----END PRIVATE KEY-----
+        </key>
+        """
+        let encoded = Data(profile.utf8).base64EncodedString()
+        let columns = "100,20,30,Japan,JP,1,2,3,4,5,operator,ignored,\(encoded)"
+        let csv = "*vpn_servers\n#HostName,IP,Score\nvolunteer,93.184.216.34,\(columns)\n"
+        let nodes = HarborVPNGate.parse(csv, subscriptionID: "vpn")
+        let node = try #require(nodes.first)
+        #expect(nodes.count == 1)
+        #expect(node.protocolName == "openvpn")
+        #expect(node.network == "tcp")
+        #expect(node.security == "vpngate-unverified")
+        #expect(node.path == "JP")
+        let config = try HarborMihomoConfig.make(node: node, httpPort: 18080)
+        #expect(HarborMihomoConfig.matches(configuration: config, node: node))
+        let json = try #require(JSONSerialization.jsonObject(with: config) as? [String: Any])
+        let dns = try #require(json["dns"] as? [String: Any])
+        #expect(dns["enable"] as? Bool == true)
+        #expect(dns["ipv6"] as? Bool == false)
+        #expect(dns["enhanced-mode"] as? String == "redir-host")
+        #expect(dns["use-system-hosts"] as? Bool == false)
+        #expect(dns["respect-rules"] as? Bool == true)
+        #expect(dns["default-nameserver"] as? [String] == ["1.1.1.1", "8.8.8.8"])
+        #expect(dns["proxy-server-nameserver"] as? [String] == ["1.1.1.1", "8.8.8.8"])
+        #expect(dns["nameserver"] as? [String] == [
+            "https://cloudflare-dns.com/dns-query#selected",
+            "https://dns.google/dns-query#selected"
+        ])
+        var legacyConfig = json
+        legacyConfig.removeValue(forKey: "dns")
+        let legacyBytes = try JSONSerialization.data(withJSONObject: legacyConfig)
+        #expect(!HarborMihomoConfig.matches(configuration: legacyBytes, node: node))
+        let chained = try HarborMihomoConfig.make(
+            node: node, httpPort: 18080, underlaySocksPort: 18201)
+        let parsed = try #require(JSONSerialization.jsonObject(with: chained) as? [String: Any])
+        let proxies = try #require(parsed["proxies"] as? [[String: Any]])
+        #expect(proxies.count == 2)
+        #expect(proxies[0]["dialer-proxy"] as? String == "underlay")
+        #expect(proxies[0]["handshake-timeout"] as? Int == 30)
+        #expect(proxies[1]["port"] as? Int == 18201)
+        #expect(HarborMihomoConfig.matches(configuration: chained, node: node,
+                                           underlaySocksPort: 18201))
+        #expect(!HarborMihomoConfig.matches(configuration: chained, node: node,
+                                            underlaySocksPort: 18203))
+        var changed = node
+        changed.credential = "invalid"
+        #expect(!HarborMihomoConfig.matches(configuration: config, node: changed))
+    }
+
+    @Test("Optional captured VPN Gate feed yields Mihomo-compatible profiles")
+    func capturedVPNGateFeed() throws {
+        guard let feedPath = ProcessInfo.processInfo.environment["CODEX_HARBOR_VPNGATE_FIXTURE"],
+              let binaryPath = ProcessInfo.processInfo.environment["CODEX_HARBOR_MIHOMO_BINARY"] else {
+            return
+        }
+        let feed = try String(contentsOfFile: feedPath, encoding: .utf8)
+        let nodes = HarborVPNGate.parse(feed, subscriptionID: "captured")
+        let volunteerCount = nodes.filter { $0.security == "vpngate-unverified" }.count
+        print("VPN Gate captured candidates: \(nodes.count), volunteer: \(volunteerCount)")
+        #expect(nodes.count >= 10)
+        #expect(nodes.contains { $0.security == "vpngate-unverified" })
+        let node = try #require(nodes.first)
+        let config = try HarborMihomoConfig.make(node: node, httpPort: 18200)
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codexharbor-vpngate-\(UUID().uuidString).json")
+        try config.write(to: path, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: path) }
+        let engine = Process()
+        let diagnostics = Pipe()
+        engine.executableURL = URL(fileURLWithPath: binaryPath)
+        engine.arguments = ["-t", "-f", path.path]
+        engine.standardOutput = diagnostics
+        engine.standardError = diagnostics
+        try engine.run()
+        let errorText = String(decoding: diagnostics.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        engine.waitUntilExit()
+        #expect(engine.terminationStatus == 0, "Mihomo config validation failed: \(errorText.prefix(300))")
+    }
+
+    @Test("Home-line screening requires explicit residential network data")
+    func homeLineClassification() {
+        #expect(HarborProxyNetworkEvidence.classify(
+            userType: "residential", connectionType: "Cable/DSL", isAnycast: false
+        ) == .residential)
+        #expect(HarborProxyNetworkEvidence.classify(
+            userType: "business", connectionType: "Cable/DSL", isAnycast: false
+        ) == .other)
+        #expect(HarborProxyNetworkEvidence.classify(
+            userType: "residential", connectionType: "Corporate", isAnycast: false
+        ) == .other)
+        #expect(HarborProxyNetworkEvidence.classify(
+            userType: "hosting", connectionType: "Cable/DSL", isAnycast: false
+        ) == .hosting)
+        #expect(HarborProxyNetworkEvidence.classify(
+            userType: "residential", connectionType: "Cable/DSL", isAnycast: true
+        ) == .hosting)
+    }
+
+    @Test("VPN Gate entry IP selection is repeatable with duplicates and cached entries")
+    func vpnGateEntryIPSelection() {
+        let nodes = (0..<60).map { index in
+            HarborProxyNode(name: "Relay \(index)", protocolName: "openvpn",
+                            host: "93.184.216.\(index + 1)", port: 443,
+                            credential: "profile", security: "vpngate-unverified",
+                            subscriptionID: "gate")
+        }
+        var candidates = [nodes[0], nodes[1], nodes[0]] + nodes
+        var datacenter = nodes[2]
+        datacenter.security = "vpngate-datacenter"
+        candidates.insert(datacenter, at: 0)
+        let cached: Set<String> = [nodes[1].host]
+        let first = HarborVPNGate.unclassifiedVolunteerIPs(
+            in: candidates, cached: cached, limit: 48)
+        let second = HarborVPNGate.unclassifiedVolunteerIPs(
+            in: candidates, cached: cached, limit: 48)
+        #expect(first == second)
+        #expect(first.count == 48)
+        #expect(first.first == nodes[0].host)
+        #expect(!first.contains(nodes[1].host))
+        #expect(Set(first).count == first.count)
+    }
+
+    @Test("A pool rescan advances past the failed first batch and prioritizes home lines")
+    func vpnGateProbeRotation() {
+        let nodes = (0..<30).map { index in
+            HarborProxyNode(id: "relay-\(index)", name: "Relay \(index)",
+                            protocolName: "openvpn", host: "93.184.216.\(index + 1)",
+                            port: 443, credential: "profile", security: "vpngate-unverified",
+                            path: "JP", subscriptionID: "gate")
+        }
+        let failed = Dictionary(uniqueKeysWithValues: nodes.prefix(24).map {
+            ($0.id, HarborProxyProbeResult(milliseconds: nil, realTested: true,
+                                           consecutiveRealFailures: 2))
+        })
+        let home = [nodes[26].host: HarborProxyNetworkEvidence(kind: .residential, isp: "ISP")]
+        let picked = HarborVPNGateProbePolicy.select(
+            nodes: nodes, evidence: home, results: failed, limit: 4)
+        #expect(picked.first?.id == nodes[26].id)
+        #expect(picked.count == 4)
+        #expect(picked.allSatisfy { failed[$0.id] == nil })
+    }
+
+    @Test("VPN Gate retries direct failures when the tested underlay changes")
+    func vpnGateProbeRouteChange() throws {
+        let nodes = (0..<4).map { index in
+            HarborProxyNode(id: "relay-\(index)", name: "Relay \(index)",
+                            protocolName: "openvpn", host: "93.184.216.\(index + 1)",
+                            port: 443, credential: "profile", subscriptionID: "gate")
+        }
+        let results = [
+            nodes[0].id: HarborProxyProbeResult(
+                milliseconds: nil, realTested: true,
+                consecutiveRealFailures: 5, probeRouteID: "direct"),
+            nodes[1].id: HarborProxyProbeResult(
+                milliseconds: nil, realTested: true,
+                consecutiveRealFailures: 2, probeRouteID: "underlay:old")
+        ]
+        let picked = HarborVPNGateProbePolicy.select(
+            nodes: nodes, evidence: [:], results: results, limit: 4,
+            probeRouteID: "underlay:new")
+        #expect(Set(picked.map(\.id)) == Set(nodes.map(\.id)))
+        #expect(picked.prefix(2).map(\.id) == [nodes[0].id, nodes[1].id])
+
+        let stored = try JSONEncoder().encode(results[nodes[0].id]!)
+        #expect(try JSONDecoder().decode(HarborProxyProbeResult.self, from: stored)
+            .probeRouteID == "direct")
+        // Older encrypted state files have no route property.
+        var legacy = try JSONSerialization.jsonObject(with: stored) as! [String: Any]
+        legacy.removeValue(forKey: "probeRouteID")
+        let decoded = try JSONDecoder().decode(
+            HarborProxyProbeResult.self, from: JSONSerialization.data(withJSONObject: legacy))
+        #expect(decoded.probeRouteID == nil)
+    }
+
+    @Test("VPN Gate rotates oldest failed candidates when the whole pool failed")
+    func vpnGateFullyFailedRotation() {
+        let nodes = (0..<30).map { index in
+            HarborProxyNode(id: "relay-\(index)", name: "Relay \(index)",
+                            protocolName: "openvpn", host: "93.184.216.\(index + 1)",
+                            port: 443, credential: "profile", subscriptionID: "gate")
+        }
+        let old = Date(timeIntervalSince1970: 1_000)
+        let recent = Date(timeIntervalSince1970: 2_000)
+        let results = Dictionary(uniqueKeysWithValues: nodes.enumerated().map { index, node in
+            (node.id, HarborProxyProbeResult(
+                milliseconds: nil, checkedAt: index < 24 ? recent : old,
+                realTested: true, consecutiveRealFailures: 3, probeRouteID: "underlay:vless"))
+        })
+        let picked = HarborVPNGateProbePolicy.select(
+            nodes: nodes, evidence: [:], results: results, limit: 6,
+            probeRouteID: "underlay:vless")
+        #expect(picked.map(\.id) == nodes.suffix(6).map(\.id))
+    }
+
+    @Test("Optional VPN Gate network probe never touches the system proxy")
+    func liveVPNGateProbe() throws {
+        guard let feedPath = ProcessInfo.processInfo.environment["CODEX_HARBOR_VPNGATE_LIVE_FEED"],
+              let binaryPath = ProcessInfo.processInfo.environment["CODEX_HARBOR_MIHOMO_BINARY"] else {
+            return
+        }
+        let feed = try String(contentsOfFile: feedPath, encoding: .utf8)
+        let nodes = HarborVPNGate.parse(feed, subscriptionID: "live")
+        let hosts = Set((ProcessInfo.processInfo.environment["CODEX_HARBOR_VPNGATE_LIVE_HOSTS"] ?? "")
+            .split(separator: ",").map(String.init))
+        let targets = hosts.isEmpty ? Array(nodes.prefix(8))
+            : Array(nodes.filter { hosts.contains($0.host) }.prefix(8))
+        var successful = 0
+        for (index, node) in targets.enumerated() {
+            let port = 19220 + index * 2
+            let path = FileManager.default.temporaryDirectory
+                .appendingPathComponent("codexharbor-probe-\(UUID().uuidString).json")
+            try HarborMihomoConfig.make(node: node, httpPort: port)
+                .write(to: path, options: .atomic)
+            defer { try? FileManager.default.removeItem(at: path) }
+            let engine = Process()
+            engine.executableURL = URL(fileURLWithPath: binaryPath)
+            engine.arguments = ["-f", path.path]
+            engine.standardOutput = FileHandle.nullDevice
+            engine.standardError = FileHandle.nullDevice
+            try engine.run()
+            Thread.sleep(forTimeInterval: 0.5)
+            let curl = Process()
+            curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+            curl.arguments = ["--disable", "--silent", "--max-time", "7",
+                              "--proxy", "socks5h://127.0.0.1:\(port + 1)",
+                              "--noproxy", "", "--output", "/dev/null",
+                              "--url", "https://www.msftconnecttest.com/connecttest.txt"]
+            curl.standardOutput = FileHandle.nullDevice
+            curl.standardError = FileHandle.nullDevice
+            try curl.run()
+            curl.waitUntilExit()
+            if curl.terminationStatus == 0 { successful += 1 }
+            if engine.isRunning { engine.terminate() }
+            engine.waitUntilExit()
+        }
+        print("VPN Gate live probe: \(successful)/\(targets.count) HTTPS exits passed")
+    }
+
     @Test("Subscription update preserves matching IDs, favorites, and aliases")
     func stableSubscriptionRefresh() {
         let source = HarborProxyNode(id: "fav-active", name: "old", customName: "我的节点",
@@ -594,6 +909,7 @@ struct HarborNetworkProxyTests {
     @Test("Node clicks remain selectable and the last click wins during a switch")
     func queuedActivation() {
         var queue = HarborProxyActivationQueue()
+        #expect(!queue.hasPending)
         #expect(queue.takeNext() == nil)
 
         // A first connection must be selectable even when it differs from
@@ -603,12 +919,15 @@ struct HarborNetworkProxyTests {
         #expect(queue.takeNext() == nil)
 
         queue.enqueue("old-node", restart: false, userInitiated: false)
+        #expect(queue.hasPending)
         queue.enqueue("new-node", restart: false, userInitiated: true)
         queue.enqueue("last-clicked-node", restart: true, userInitiated: true)
+        #expect(queue.hasPending) // prior preflight must not commit its node
         let last = queue.takeNext()
         #expect(last?.nodeID == "last-clicked-node")
         #expect(last?.restart == true)
         #expect(last?.userInitiated == true)
+        #expect(!queue.hasPending)
         #expect(queue.takeNext() == nil)
     }
 
@@ -668,16 +987,18 @@ struct HarborNetworkProxyTests {
         #expect(listeners.compactMap { $0["port"] as? Int } == [18080, 18081])
         let rules = try #require(object["routing"] as? [String: Any])
         let entries = try #require(rules["rules"] as? [[String: Any]])
-        #expect(entries.count == 4)
+        #expect(entries.count == 5)
+        #expect(entries[0]["inboundTag"] as? [String] == ["codexharbor-proxy-dns"])
         #expect(entries[0]["outboundTag"] as? String == "proxy")
-        #expect(entries[0]["domain"] as? [String] == ["domain:gitee.com", "domain:gitee.io"])
-        #expect(entries[1]["ip"] as? [String] == ["geoip:private"])
-        #expect(entries[2]["domain"] as? [String] == ["geosite:cn"])
-        #expect(entries[3]["ip"] as? [String] == ["geoip:cn"])
+        #expect(entries[1]["outboundTag"] as? String == "proxy")
+        #expect(entries[1]["domain"] as? [String] == ["domain:gitee.com", "domain:gitee.io"])
+        #expect(entries[2]["ip"] as? [String] == ["geoip:private"])
+        #expect(entries[3]["domain"] as? [String] == ["geosite:cn"])
+        #expect(entries[4]["ip"] as? [String] == ["geoip:cn"])
         let all = try HarborXrayConfig.make(node: node, httpPort: 18080, ruleMode: false)
         let other = try #require(JSONSerialization.jsonObject(with: all) as? [String: Any])
         let allRules = try #require(other["routing"] as? [String: Any])
-        #expect((allRules["rules"] as? [[String: Any]])?.count == 2)
+        #expect((allRules["rules"] as? [[String: Any]])?.count == 3)
         #expect((allRules["rules"] as? [[String: Any]])?.first?["outboundTag"] as? String == "proxy")
     }
 
@@ -693,8 +1014,9 @@ struct HarborNetworkProxyTests {
         let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let routing = try #require(json["routing"] as? [String: Any])
         let rules = try #require(routing["rules"] as? [[String: Any]])
+        #expect(rules.first?["inboundTag"] as? [String] == ["codexharbor-proxy-dns"])
         #expect(rules.first?["outboundTag"] as? String == "proxy")
-        #expect(rules.first?["domain"] as? [String] == HarborXrayConfig.verificationHosts)
+        #expect(rules.dropFirst().first?["domain"] as? [String] == HarborXrayConfig.verificationHosts)
         #expect(HarborXrayConfig.verificationHosts == ["full:www.msftconnecttest.com"])
         let custom = try HarborXrayConfig.make(
             node: node, httpPort: 18080, ruleMode: true,
@@ -702,7 +1024,7 @@ struct HarborNetworkProxyTests {
         let customJSON = try #require(JSONSerialization.jsonObject(with: custom) as? [String: Any])
         let customRouting = try #require(customJSON["routing"] as? [String: Any])
         let customRules = try #require(customRouting["rules"] as? [[String: Any]])
-        #expect(customRules.first?["domain"] as? [String] == ["full:www.example.com"])
+        #expect(customRules.dropFirst().first?["domain"] as? [String] == ["full:www.example.com"])
         #expect(rules.dropFirst().contains { $0["domain"] as? [String] == ["geosite:cn"] })
     }
 
@@ -720,7 +1042,7 @@ struct HarborNetworkProxyTests {
         let json = try #require(JSONSerialization.jsonObject(with: config) as? [String: Any])
         let routing = try #require(json["routing"] as? [String: Any])
         let rules = try #require(routing["rules"] as? [[String: Any]])
-        #expect(rules.first?["domain"] as? [String] == [
+        #expect(rules.dropFirst().first?["domain"] as? [String] == [
             "domain:gitee.com", "domain:git.example.com"
         ])
         #expect(throws: HarborProxyError.self) {
@@ -733,7 +1055,7 @@ struct HarborNetworkProxyTests {
                                                   ruleMode: true, forcedProxyDomains: [])
         let disabledJSON = try #require(JSONSerialization.jsonObject(with: disabled) as? [String: Any])
         let disabledRouting = try #require(disabledJSON["routing"] as? [String: Any])
-        #expect((disabledRouting["rules"] as? [[String: Any]])?.count == 3)
+        #expect((disabledRouting["rules"] as? [[String: Any]])?.count == 4)
     }
 
     @Test("Installed Xray accepts generated rule-mode configuration when available")

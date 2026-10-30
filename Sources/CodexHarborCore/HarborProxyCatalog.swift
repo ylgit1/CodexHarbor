@@ -44,6 +44,18 @@ public enum HarborProxyLatencyPolicy {
     // concurrent nodes keeps large subscriptions responsive without creating
     // one process per node or flooding the target with every node at once.
     public static let parallelCount = 32
+
+    /// An OpenVPN probe owns an isolated Mihomo process (unlike the shared
+    /// Xray real-ping batch). Bound concurrency by CPU and RAM so a large
+    /// VPN Gate pool can run in parallel without starving the active proxy.
+    /// Modern Apple Silicon Macs with >= 16 GiB use up to 8 simultaneous
+    /// probes; machines with less RAM use a smaller pool.
+    public static func openVPNParallelCount(processors: Int, physicalMemory: UInt64) -> Int {
+        let gib: UInt64 = 1_024 * 1_024 * 1_024
+        let memoryLimit = physicalMemory >= 16 * gib ? 8 : (physicalMemory >= 8 * gib ? 6 : 3)
+        return max(1, min(8, max(1, processors), memoryLimit))
+    }
+
     public static let realPingBatchSize = 1_000
     // v2rayN ConnectionHandler.GetRealPingTime uses Global.LocalFetch (5s)
     // for two requests to the configured SpeedPingTestUrl.
@@ -131,6 +143,10 @@ public struct HarborProxyProbeResult: Codable, Sendable, Equatable {
     public var realFailureReason: String?
     public var realCheckedAt: Date?
     public var consecutiveRealFailures: Int?
+    /// Connection path used for the observation. A direct failure must not
+    /// disqualify the same OpenVPN relay when it is tried through an underlay.
+    /// Optional for encrypted probe records saved by older app versions.
+    public var probeRouteID: String?
     public var succeeded: Bool { milliseconds != nil }
     /// A single transient failure remains visible and is eligible for retry.
     public var isConfirmedUnavailable: Bool {
@@ -142,13 +158,15 @@ public struct HarborProxyProbeResult: Codable, Sendable, Equatable {
 
     public init(milliseconds: Int?, checkedAt: Date = .now,
                 realTested: Bool? = nil, realFailureReason: String? = nil,
-                realCheckedAt: Date? = nil, consecutiveRealFailures: Int? = nil) {
+                realCheckedAt: Date? = nil, consecutiveRealFailures: Int? = nil,
+                probeRouteID: String? = nil) {
         self.milliseconds = milliseconds
         self.checkedAt = checkedAt
         self.realTested = realTested ?? (milliseconds != nil)
         self.realFailureReason = realFailureReason
         self.realCheckedAt = realCheckedAt ?? (self.realTested ? checkedAt : nil)
         self.consecutiveRealFailures = consecutiveRealFailures
+        self.probeRouteID = probeRouteID
     }
 
     public var effectiveRealCheckedAt: Date? {

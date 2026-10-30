@@ -142,6 +142,24 @@ if [[ "$(/usr/bin/lipo -archs "$xray_destination/xray")" != *"$host_arch"* ]]; t
 fi
 "$xray_destination/xray" version >/dev/null
 echo "==> 已内置 Xray、GeoIP、GeoSite（$host_arch），安装后无需下载"
+mihomo_source="$project_root/Resources/Mihomo/$host_arch"
+mihomo_destination="$staging_app_path/Contents/Resources/Mihomo/$host_arch"
+if [[ ! -f "$mihomo_source/mihomo" || ! -f "$mihomo_source/SHA256SUMS" ]]; then
+  echo "缺少内置 Mihomo 资源：$mihomo_source" >&2
+  exit 7
+fi
+mihomo_expected="$(/usr/bin/awk '$2 == "mihomo" { print $1 }' "$mihomo_source/SHA256SUMS")"
+mihomo_actual="$(/usr/bin/openssl dgst -sha256 -r "$mihomo_source/mihomo" | /usr/bin/awk '{ print $1 }')"
+if [[ -z "$mihomo_expected" || "$mihomo_actual" != "$mihomo_expected" ]]; then
+  echo "内置 Mihomo 资源校验失败" >&2
+  exit 7
+fi
+mkdir -p "$mihomo_destination"
+cp "$mihomo_source/mihomo" "$mihomo_destination/mihomo"
+cp "$project_root/Resources/Mihomo/LICENSE" "$staging_app_path/Contents/Resources/Mihomo/LICENSE"
+chmod 755 "$mihomo_destination/mihomo"
+"$mihomo_destination/mihomo" -v >/dev/null
+echo "==> 已内置 Mihomo OpenVPN 内核（$host_arch）"
 chmod 755 "$staging_app_path/Contents/MacOS/CodexHarbor" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
 # Sign with the same certificate on every build so the Agent retains its
 # designated requirement (DR) across binary updates. Stable identifiers alone
@@ -196,6 +214,7 @@ if [[ "$sign_identity" == "Developer ID Application:"* ]]; then
   sign_options=(--options runtime --timestamp)
 fi
 codesign --force "${sign_options[@]}" --sign "$sign_identity" --identifier "com.codexharbor.xray" "$xray_destination/xray"
+codesign --force "${sign_options[@]}" --sign "$sign_identity" --identifier "com.codexharbor.mihomo" "$mihomo_destination/mihomo"
 codesign --force "${sign_options[@]}" --sign "$sign_identity" --identifier "com.codexharbor.agent" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
 codesign --force "${sign_options[@]}" --sign "$sign_identity" "$staging_app_path"
 

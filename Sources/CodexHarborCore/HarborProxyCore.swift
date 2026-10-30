@@ -73,6 +73,10 @@ public struct HarborProxyActivationQueue: Sendable {
         pending = Request(nodeID: nodeID, restart: restart, userInitiated: userInitiated)
     }
 
+    /// Allows an in-flight preconnection test to avoid committing an outdated
+    /// node when the user has already requested a different one.
+    public var hasPending: Bool { pending != nil }
+
     public mutating func takeNext() -> Request? {
         defer { pending = nil }
         return pending
@@ -221,6 +225,94 @@ public struct HarborProxySubscription: Codable, Identifiable, Sendable, Hashable
         result.name = name
         result.url = url
         return result
+    }
+}
+
+/// Public, third-party feeds. Their labels describe the publisher's pool,
+/// not a guarantee about a node's current exit IP or reputation.
+public enum HarborProxyCommunitySource: String, CaseIterable, Sendable {
+    case residential
+    case vpnGate
+
+    /// The old one-node residential feed is recognized for existing users,
+    /// but is no longer offered as a built-in source.
+    public static let offered: [Self] = [.vpnGate]
+
+    public var name: String {
+        switch self {
+        case .residential: "免费住宅候选"
+        case .vpnGate: "VPN Gate 志愿节点"
+        }
+    }
+
+    public var url: String {
+        switch self {
+        case .residential: "https://cdn.jsdelivr.net/gh/hezhanleiok/freesub@main/output/residential.txt"
+        case .vpnGate: HarborVPNGate.feedURL
+        }
+    }
+
+    public var fallbackURL: String {
+        switch self {
+        case .residential: "https://raw.githubusercontent.com/hezhanleiok/freesub/main/output/residential.txt"
+        case .vpnGate: HarborVPNGate.feedURL
+        }
+    }
+
+    public var apiURL: String {
+        switch self {
+        case .residential: "https://api.github.com/repos/hezhanleiok/freesub/contents/output/residential.txt?ref=main"
+        case .vpnGate: HarborVPNGate.feedURL
+        }
+    }
+
+    public static func decodedAPIContents(_ data: Data) -> String? {
+        struct Response: Decodable {
+            let content: String
+            let encoding: String
+        }
+        guard let response = try? JSONDecoder().decode(Response.self, from: data),
+              response.encoding == "base64",
+              let decoded = Data(base64Encoded: response.content.filter { !$0.isWhitespace }) else {
+            return nil
+        }
+        return String(data: decoded, encoding: .utf8)
+    }
+
+    public static func matching(_ url: String) -> Self? {
+        let value = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        return allCases.first { value == $0.url || value == $0.fallbackURL }
+    }
+}
+
+/// Third-party network data about the relay's entry IP. It is a screening
+/// hint, never proof of the VPN exit's ownership or reputation.
+public struct HarborProxyNetworkEvidence: Codable, Equatable, Sendable {
+    public enum Kind: String, Codable, Sendable {
+        case residential, cellular, hosting, other
+    }
+
+    public let kind: Kind
+    public let isp: String?
+    public let checkedAt: Date
+
+    public init(kind: Kind, isp: String?, checkedAt: Date = .now) {
+        self.kind = kind
+        self.isp = isp
+        self.checkedAt = checkedAt
+    }
+
+    public static func classify(userType: String?, connectionType: String?,
+                                isAnycast: Bool?) -> Kind {
+        if isAnycast == true { return .hosting }
+        switch userType?.lowercased() {
+        case "hosting": return .hosting
+        case "residential":
+            return connectionType?.lowercased() == "cable/dsl" ? .residential : .other
+        case "cellular": return .cellular
+        // A consumer-looking ISP name or Cable/DSL alone is insufficient.
+        default: return .other
+        }
     }
 }
 
@@ -609,15 +701,33 @@ public enum HarborXrayConfig {
                 ["type": "field", "ip": ["geoip:cn"], "outboundTag": "direct"]
             ]
         }
+        // Keep proxied destination lookups inside Xray instead of inheriting a
+        // potentially poisoned macOS resolver. IP-literal DoH endpoints need
+        // no system-DNS bootstrap; tagged DNS requests are explicitly routed
+        // through the selected proxy outbound. The proxy server's own hostname
+        // is still bootstrapped by macOS before the tunnel exists.
+        let dnsTag = "codexharbor-proxy-dns"
+        let dns: [String: Any] = [
+            "servers": [
+                ["address": "https://1.1.1.1/dns-query", "tag": dnsTag],
+                ["address": "https://8.8.8.8/dns-query", "tag": dnsTag]
+            ],
+            "queryStrategy": "UseIPv4"
+        ]
+        var routingRules: [[String: Any]] = [
+            ["type": "field", "inboundTag": [dnsTag], "outboundTag": "proxy"]
+        ]
+        routingRules.append(contentsOf: rules)
         let configuration: [String: Any] = [
             "log": ["loglevel": "warning"],
+            "dns": dns,
             "inbounds": [
                 ["listen": "127.0.0.1", "port": httpPort, "protocol": "http", "settings": [:] as [String: Any]],
                 ["listen": "127.0.0.1", "port": httpPort + 1, "protocol": "socks",
                  "settings": ["udp": true]]
             ],
             "outbounds": [outbound, ["protocol": "freedom", "tag": "direct"]],
-            "routing": ["domainStrategy": ruleMode ? "IPIfNonMatch" : "AsIs", "rules": rules]
+            "routing": ["domainStrategy": ruleMode ? "IPIfNonMatch" : "AsIs", "rules": routingRules]
         ]
         return try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys])
     }

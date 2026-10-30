@@ -141,6 +141,38 @@ XTLS Xray-core、`geoip.dat` 和 `geosite.dat`。首次启动会把它们复制�
 可通过「新增」导入 HTTPS 订阅或 VLESS、VMess、Trojan、Shadowsocks 分享链接。
 敏感节点、订阅信息保存在系统钥匙串，临时运行配置设为 0600 权限。
 
+**公开候选节点（实验性）**：代理页保留
+[`hezhanleiok/freesub`](https://github.com/hezhanleiok/freesub) 的住宅候选订阅，
+并可一键重新筛选 [`VPN Gate`](https://www.vpngate.net/) 的动态志愿 OpenVPN 节点；
+已移除免费综合节点来源。VPN Gate 的 `public-vpn-*` 明确放在机房候选类；其余入口 IP
+使用 [`IP Info`](https://ip-info.com/docs) 的公开网络类型数据保守筛选，仅明确标记为
+`residential` 且 `Cable/DSL` 的进入住宅候选，其余保留为志愿或机房候选。
+**入口类型不等于实际出口，更不证明 IP 纯净度**。界面可按分类、国家/地区、协议
+和真实请求延迟筛选。VPN Gate 上报的地区明确标为「来源」，真实出口识别成功后才显示出口。
+默认保留失败节点与原因供重试，不把“筛选后为空”误报成没有候选。
+
+住宅订阅每次最多自动测试 20 个节点，VPN Gate 每次最多自动测试 24 个节点，并优先
+测尚未测过的家宽入口；再次筛选会推进到后续候选，不会永远重复第一批。测试使用与当前
+系统代理隔离的 Xray 或内置 Mihomo/OpenVPN 实例，只有经 SOCKS5 完成实际 HTTPS 请求
+才算可用；**刷新和测试不会自动切换节点或接管系统代理**。节点使用后也要再次核验。
+当前版本没有独立的 MITM 与风险评分全套筛选，因此不能承诺住宅出口身份、
+纯净度、节点数量或跨网络可用性。
+
+实现参考：[`xehn/vpngate.go`](https://github.com/hezhanleiok/xehn/blob/main/vpngate.go)
+从 VPN Gate 抓取 OpenVPN 配置，做列表缓存、本机 TCP 延迟检测、住宅/机房分类及
+短期失败记忆。本应用实现了 VPN Gate 获取与 Mihomo 原生 OpenVPN 出站，但**没有实现
+xehn 的 WARP 底层链路或其住宅归类规则**：在 VPN Gate 被本地网络阻断时，仍可能没有
+可用节点。节点真正的运营商类型和风险分须由独立可靠来源核查，不能由 VPN Gate 自报。
+[`freesub/scripts/main_v2.py`](https://github.com/hezhanleiok/freesub/blob/main/scripts/main_v2.py)
+生成适配 V2Ray 的订阅：真实代理出口探测后按 ASN/ISP/CDN/风险信息筛选，再分别导出住宅
+池。其 GitHub Actions 当前只配置手动触发，公开住宅池的更新频率和规模取决于上游。
+这两个项目的实现思路用于设计本模块，未将第三方程序代码复制到应用中。
+
+换一台 **macOS 14+ Apple Silicon Mac** 安装 Codex Harbor 后，可以重新添加这些公开
+来源，并在当地网络重新测速、核对出口；不依赖原电脑或原家宽。自定义订阅、收藏和测速
+记录仍保存在本机钥匙串，当前版本**不会跨设备自动同步**；当前发行包也不支持 Intel Mac
+或 Windows。不同网络可能屏蔽公开来源或节点，因此无法保证所有网络始终可用。
+
 **切换代理的安全前提**：如果 v2rayN 当前仍控制系统代理（例如 127.0.0.1:10808），
 Harbor 拒绝覆盖；请先在 v2rayN 内清除系统代理，然后在 Harbor 内设置。设置前备份
 原代理参数，清除时按所有权检查恢复，避免覆盖其他程序的网络变更。关闭或退出时先恢复

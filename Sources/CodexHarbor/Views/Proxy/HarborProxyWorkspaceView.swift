@@ -10,10 +10,11 @@ struct HarborProxyWorkspaceView: View {
     @State private var favoritesOnly = false
     @State private var favorites: Set<String> = []
     @State private var keyword = ""
+    @State private var category: NodeCategory = .all
     @State private var region = "全部"
     @State private var protocolFilter = "全部"
     @State private var latencyFilter = "全部"
-    @State private var showUnavailable = false
+    @State private var showUnavailable = true
     // The table keeps its last committed ordering while a batch is running.
     @State private var frozenLatencyResults: [String: HarborProxyProbeResult]?
     @State private var page = 1
@@ -49,6 +50,14 @@ struct HarborProxyWorkspaceView: View {
     private struct DeletionTarget: Identifiable { let id: String }
     private struct RenameTarget: Identifiable { let id: String }
 
+    private enum NodeCategory: String, CaseIterable {
+        case all = "全部"
+        case residential = "住宅候选"
+        case volunteer = "志愿节点"
+        case datacenter = "机房候选"
+        case custom = "自定义"
+    }
+
     private enum Editor: String, Identifiable {
         case subscription, editSubscription, links, importChoice, routing, ports
         var id: String { rawValue }
@@ -62,8 +71,30 @@ struct HarborProxyWorkspaceView: View {
     private var sourceGroupNodes: [HarborProxyNode] {
         proxy.nodes.filter { node in
             if let groupID { return node.subscriptionID == groupID }
-            return favorites.contains(node.id)
+            return !favoritesOnly || favorites.contains(node.id)
         }
+    }
+
+    private var availableCategories: [NodeCategory] {
+        [.all] + NodeCategory.allCases.filter { choice in
+            choice != .all && sourceGroupNodes.contains { categoryOf($0) == choice }
+        }
+    }
+
+    private func categoryOf(_ node: HarborProxyNode) -> NodeCategory {
+        guard let subscription = proxy.subscriptions.first(where: { $0.id == node.subscriptionID }),
+              let source = HarborProxyCommunitySource.matching(subscription.url) else {
+            return .custom
+        }
+        if source == .vpnGate {
+            if node.security == "vpngate-datacenter" { return .datacenter }
+            switch proxy.networkEvidence(for: node)?.kind {
+            case .residential: return .residential
+            case .hosting: return .datacenter
+            default: return .volunteer
+            }
+        }
+        return .residential
     }
 
     /// Freeze filtering and ordering during probing; only the cell's live status
@@ -86,8 +117,12 @@ struct HarborProxyWorkspaceView: View {
         }.count
     }
 
+    private var categoryNodes: [HarborProxyNode] {
+        groupNodes.filter { category == .all || categoryOf($0) == category }
+    }
+
     private var shownNodes: [HarborProxyNode] {
-        let result = groupNodes.filter { node in
+        let result = categoryNodes.filter { node in
             if region != "全部" && location(of: node) != region { return false }
             if protocolFilter != "全部" && node.protocolName.uppercased() != protocolFilter { return false }
             if latencyFilter != "全部" {
@@ -117,41 +152,50 @@ struct HarborProxyWorkspaceView: View {
     }
     private var title: String {
         if let groupID { return proxy.subscriptions.first(where: { $0.id == groupID })?.name ?? "订阅节点" }
-        return "我的收藏"
+        return favoritesOnly ? "我的收藏" : "全部节点"
     }
     private var protocols: [String] {
         ["全部"] + Array(Set(groupNodes.map { $0.protocolName.uppercased() })).sorted()
     }
     private var regions: [String] {
-        let actual = Set(groupNodes.map(location))
+        let actual = Set(categoryNodes.map(location))
         let priority = ["香港", "美国", "日本", "新加坡", "台湾", "德国", "韩国", "英国"]
         return ["全部"] + priority.filter(actual.contains)
             + actual.subtracting(Set(priority)).sorted()
+    }
+
+    private var missingCommunitySources: [HarborProxyCommunitySource] {
+        HarborProxyCommunitySource.offered.filter { source in
+            !proxy.subscriptions.contains { HarborProxyCommunitySource.matching($0.url) == source }
+        }
     }
 
     var body: some View {
         GeometryReader { geometry in
             workspaceLayout(size: geometry.size)
         }
-        .task { await proxy.bootstrap() }
+        .task {
+            await proxy.bootstrap()
+            await proxy.refreshCommunitySourcesIfNeeded()
+        }
         .onAppear {
             favorites = Set(UserDefaults.standard.stringArray(forKey: favoritesKey) ?? [])
-            if groupID == nil && !favoritesOnly {
-                groupID = proxy.subscriptions.first?.id
-                favoritesOnly = groupID == nil
-            }
         }
         .onChange(of: proxy.subscriptions.map(\.id)) { _, ids in
             if let groupID, !ids.contains(groupID) {
-                self.groupID = ids.first
-                favoritesOnly = ids.isEmpty
+                self.groupID = nil
+                favoritesOnly = false
                 resetFilters()
-            } else if self.groupID == nil && !favoritesOnly {
-                self.groupID = ids.first
-                favoritesOnly = ids.isEmpty
             }
         }
         .onChange(of: keyword) { _, _ in page = 1 }
+        .onChange(of: category) { _, _ in
+            page = 1
+            if region != "全部" && !regions.contains(region) { region = "全部" }
+        }
+        .onChange(of: availableCategories) { _, choices in
+            if !choices.contains(category) { category = .all }
+        }
         .onChange(of: region) { _, _ in page = 1 }
         .onChange(of: protocolFilter) { _, _ in page = 1 }
         .onChange(of: latencyFilter) { _, _ in page = 1 }
@@ -241,7 +285,7 @@ struct HarborProxyWorkspaceView: View {
             HStack(alignment: .top, spacing: 11) {
                 subscriptionSidebar.frame(width: sidebarWidth)
                 nodeTable(compact: compact, showRegion: tableWidth >= 600,
-                          narrow: tableWidth < 610)
+                          narrow: tableWidth < 940, compactActions: tableWidth < 600)
                     .frame(width: tableWidth)
                     .frame(maxHeight: .infinity)
             }
@@ -293,11 +337,18 @@ struct HarborProxyWorkspaceView: View {
         }
     }
 
+    /// A completed, healthy activation should not keep showing "switching"
+    /// while an overlapping duplicate click is still finishing its queue.
+    private var visibleSwitchingNodeID: String? {
+        guard let id = proxy.switchingNodeID else { return nil }
+        return proxy.running && proxy.healthy && proxy.activeNodeID == id ? nil : id
+    }
+
     /// The header represents what is *actually* active, not a saved selection.
     /// A configured-but-idle node must never be labeled as an active proxy.
     private var proxyStateColor: Color {
         if proxy.requiresRecovery { return HarborColors.red }
-        if proxy.switchingNodeID != nil { return HarborColors.orange }
+        if visibleSwitchingNodeID != nil { return HarborColors.orange }
         if proxy.running && !proxy.healthy { return HarborColors.orange }
         if proxy.running && proxy.activeNodeID != nil && proxy.systemManaged { return HarborColors.green }
         if proxy.running { return HarborColors.blue }
@@ -306,7 +357,7 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private var headerNode: HarborProxyNode? {
-        if let id = proxy.switchingNodeID {
+        if let id = visibleSwitchingNodeID {
             return proxy.nodes.first { $0.id == id }
         }
         if proxy.running, let node = proxy.activeNode { return node }
@@ -319,7 +370,7 @@ struct HarborProxyWorkspaceView: View {
 
     private var proxyConnectionStatus: String {
         if proxy.requiresRecovery { return "请先恢复系统代理设置，避免网络异常" }
-        if proxy.switchingNodeID != nil { return "正在切换 · 启动并验证新节点" }
+        if visibleSwitchingNodeID != nil { return "正在切换 · 启动并验证新节点" }
         if proxy.running && proxy.checkingConnectivity {
             return "正在连接 · 本地端口已就绪，检测真实网络中"
         }
@@ -338,7 +389,7 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private var proxyLatencyText: String? {
-        if proxy.switchingNodeID != nil { return "切换中" }
+        if visibleSwitchingNodeID != nil { return "切换中" }
         if proxy.running && proxy.checkingConnectivity { return "检测中" }
         guard let node = headerNode,
               let result = proxy.probeResults[node.id],
@@ -351,7 +402,7 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private var proxyLatencyColor: Color {
-        if proxy.switchingNodeID != nil || (proxy.running && proxy.checkingConnectivity) {
+        if visibleSwitchingNodeID != nil || (proxy.running && proxy.checkingConnectivity) {
             return HarborColors.orange
         }
         guard let node = headerNode,
@@ -499,6 +550,29 @@ struct HarborProxyWorkspaceView: View {
             .padding(.horizontal, 15)
             .padding(.top, 13)
 
+            if !missingCommunitySources.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("公开候选来源 · 非纯净度保证")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    ForEach(missingCommunitySources, id: \.self) { source in
+                        Button {
+                            addCommunitySource(source)
+                        } label: {
+                            Label("添加 VPN Gate 候选", systemImage: "network")
+                                .font(.system(size: 11, weight: .medium))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .frame(height: 29)
+                        }
+                        .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue,
+                                                             prominence: .secondary))
+                        .disabled(proxy.busy || proxy.latencyTesting)
+                        .help("添加公开候选来源；不会自动连接或更改系统代理")
+                    }
+                }
+                .padding(.horizontal, 15)
+            }
+
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 7) {
                 Button {
                     editor = .importChoice
@@ -524,7 +598,7 @@ struct HarborProxyWorkspaceView: View {
                 .accessibilityLabel("编辑当前订阅")
                 Button {
                     if let groupID {
-                        Task { await proxy.refreshSubscription(groupID) }
+                        Task { await proxy.refreshCommunitySubscription(groupID) }
                     }
                 } label: {
                     subscriptionActionLabel("更新", icon: "arrow.clockwise", tint: HarborColors.blue)
@@ -548,9 +622,14 @@ struct HarborProxyWorkspaceView: View {
             .padding(.horizontal, 15)
             .padding(.bottom, 5)
 
-            // The navigation intentionally contains no “全部节点” category.
+            groupButton("全部节点", icon: "square.stack.3d.up", count: proxy.nodes.count,
+                        selected: groupID == nil && !favoritesOnly) {
+                groupID = nil
+                favoritesOnly = false
+                resetFilters()
+            }
             groupButton("我的收藏", icon: "star", count: proxy.nodes.filter { favorites.contains($0.id) }.count,
-                        selected: groupID == nil) {
+                        selected: groupID == nil && favoritesOnly) {
                 groupID = nil
                 favoritesOnly = true
                 resetFilters()
@@ -687,11 +766,9 @@ struct HarborProxyWorkspaceView: View {
         let selected = groupID == item.id
         let hovered = hoveredSubscriptionID == item.id
         let tint = subscriptionTints[index % subscriptionTints.count]
-        let count = proxy.nodes.filter { node in
-            guard node.subscriptionID == item.id else { return false }
-            guard let result = proxy.probeResults[node.id], result.realTested else { return true }
-            return result.succeeded
-        }.count
+        let members = proxy.nodes.filter { $0.subscriptionID == item.id }
+        let count = members.count
+        let usable = members.filter { proxy.probeResults[$0.id]?.succeeded == true }.count
 
         // One full-width clickable surface. The count belongs inside the
         // Button's hit area, so hover, selection and press never stop halfway.
@@ -712,7 +789,12 @@ struct HarborProxyWorkspaceView: View {
                         .font(.system(size: 11.5, weight: selected ? .semibold : .medium))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
-                    if let updated = proxy.subscriptionUpdatedAt[item.id] {
+                    if HarborProxyCommunitySource.matching(item.url) != nil {
+                        Text("\(count) 候选 · \(usable) 可用")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    } else if let updated = proxy.subscriptionUpdatedAt[item.id] {
                         Text(updated.formatted(date: .omitted, time: .shortened) + " 更新")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
@@ -752,7 +834,7 @@ struct HarborProxyWorkspaceView: View {
         .contextMenu {
             Button("编辑订阅") { beginEditingSubscription(item) }
                 .disabled(proxy.busy || proxy.latencyTesting)
-            Button("更新订阅") { Task { await proxy.refreshSubscription(item.id) } }
+            Button("更新订阅") { Task { await proxy.refreshCommunitySubscription(item.id) } }
                 .disabled(proxy.busy || proxy.latencyTesting)
             Button("删除订阅", role: .destructive) {
                 requestSubscriptionDeletion(item.id)
@@ -760,22 +842,52 @@ struct HarborProxyWorkspaceView: View {
         }
     }
 
+    private var categoryBar: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 5) {
+                ForEach(availableCategories, id: \.self) { choice in
+                    let count = choice == .all ? sourceGroupNodes.count
+                        : sourceGroupNodes.filter { categoryOf($0) == choice }.count
+                    Button {
+                        category = choice
+                    } label: {
+                        Text("\(choice.rawValue) \(count)")
+                            .font(.system(size: 10.5, weight: category == choice ? .semibold : .medium))
+                            .foregroundStyle(category == choice ? HarborColors.blue : Color.secondary)
+                            .padding(.horizontal, 9)
+                            .frame(height: 26)
+                            .background(category == choice ? HarborColors.blue.opacity(0.10) : .clear,
+                                        in: RoundedRectangle(cornerRadius: 7))
+                    }
+                    .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue,
+                                                                    cornerRadius: 7))
+                    .accessibilityAddTraits(category == choice ? .isSelected : [])
+                    .help(choice == .residential
+                          ? "上游住宅标签或公开网络数据标记的家宽入口候选；并非纯净出口保证，真实测速通过后才算可用"
+                          : (choice == .volunteer
+                             ? "VPN Gate 志愿节点，未确认家宽入口，不冒充纯净住宅 IP"
+                             : "按来源与已知特征分类，不代表对出口网络的担保"))
+                }
+            }
+            .padding(.horizontal, 10)
+        }
+        .scrollIndicators(.hidden)
+        .frame(height: 34)
+    }
+
     @ViewBuilder
-    private func regionBar(narrow: Bool) -> some View {
+    private func regionBar(narrow: Bool, compactActions: Bool) -> some View {
         if narrow {
             VStack(spacing: 0) {
                 regionFilters.frame(height: 38)
-                ScrollView(.horizontal) {
-                    regionActions
-                        .padding(.horizontal, 10)
-                }
-                .scrollIndicators(.hidden)
-                .frame(height: 40)
+                regionActions(narrow: true, compact: compactActions)
+                    .frame(height: 40)
             }
         } else {
             HStack(spacing: 7) {
                 regionFilters
-                regionActions
+                regionActions(narrow: false, compact: false)
+                    .fixedSize(horizontal: true, vertical: false)
             }
             .frame(height: 40)
         }
@@ -787,8 +899,8 @@ struct HarborProxyWorkspaceView: View {
                 ForEach(regions, id: \.self) { name in
                     let selected = region == name
                     let count = name == "全部"
-                        ? groupNodes.count
-                        : groupNodes.filter { location(of: $0) == name }.count
+                        ? categoryNodes.count
+                        : categoryNodes.filter { location(of: $0) == name }.count
                     Button { region = name } label: {
                         HStack(spacing: 5) {
                             if name != "全部" {
@@ -825,8 +937,23 @@ struct HarborProxyWorkspaceView: View {
         .frame(minWidth: 0, maxWidth: .infinity)
     }
 
-    private var regionActions: some View {
-        HStack(spacing: 7) {
+    private func regionActions(narrow: Bool, compact: Bool) -> some View {
+        HStack(spacing: 5) {
+            if category == .residential || category == .volunteer || groupID.flatMap({ id in
+                proxy.subscriptions.first(where: { $0.id == id })
+            }).flatMap({ HarborProxyCommunitySource.matching($0.url) }) == .vpnGate {
+                Button {
+                    Task { await proxy.rescanResidentialPool() }
+                } label: {
+                    Label(compact ? "筛选" : "重新筛选", systemImage: "arrow.clockwise.circle")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+                .disabled(proxy.busy || proxy.latencyTesting)
+                .help("重新获取 VPN Gate 志愿候选，识别家宽入口并真实测速；不会自动切换节点")
+            }
             if proxy.latencyTesting {
                 Button { proxy.cancelLatencyTests() } label: {
                     Label("停止 \(proxy.latencyCompleted)/\(proxy.latencyTotal)",
@@ -846,24 +973,42 @@ struct HarborProxyWorkspaceView: View {
                         .fixedSize(horizontal: true, vertical: false)
                 }
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.green, prominence: .secondary))
-                .disabled(sourceGroupNodes.isEmpty || proxy.busy || !proxy.coreInstalled)
-                .help("通过独立 Xray 的 SOCKS5 代理请求测速地址；不改变当前节点或系统代理")
+                .disabled(sourceGroupNodes.isEmpty || proxy.busy
+                          || !sourceGroupNodes.allSatisfy({ proxy.supportsCore(for: $0) }))
+                .help("通过独立代理内核的 SOCKS5 发起真实请求；不改变当前节点或系统代理")
             }
+
+            Button {
+                Task { await proxy.checkActiveWebsites() }
+            } label: {
+                Label(proxy.websiteChecking ? "检测中" : "网站检测",
+                      systemImage: "network")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+            .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+            .disabled(!proxy.running || !proxy.healthy || proxy.busy
+                      || proxy.websiteChecking || proxy.checkingConnectivity)
+            .help("通过当前实际 SOCKS5 出口检查 YouTube 和 ChatGPT 的 HTTPS 返回码；不切换节点")
 
             Button {
                 proxy.refreshExitLocations(for: sourceGroupNodes.map(\.id))
             } label: {
                 Label(proxy.exitGeoUpdating
                       ? "识别 \(proxy.exitGeoCompleted)/\(proxy.exitGeoTotal)"
-                      : "更新出口地区", systemImage: "globe.americas")
+                      : (compact ? "出口地区" : "更新出口地区"), systemImage: "globe.americas")
                     .font(.system(size: 10.5, weight: .medium))
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
             }
             .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
             .disabled(sourceGroupNodes.isEmpty || proxy.busy || proxy.latencyTesting
-                      || proxy.exitGeoUpdating || !proxy.coreInstalled)
+                      || proxy.exitGeoUpdating
+                      || !sourceGroupNodes.allSatisfy({ proxy.supportsCore(for: $0) }))
             .help("独立检测普通网站看到的出口 IP，并更新节点地区与自动名称；不重新测速")
+
+            if narrow { Spacer(minLength: 6) }
 
             if unavailableCount > 0 {
                 Button {
@@ -873,6 +1018,7 @@ struct HarborProxyWorkspaceView: View {
                     Label("不可用 \(unavailableCount)",
                           systemImage: showUnavailable ? "eye.slash" : "eye")
                         .font(.system(size: 10.5, weight: .medium))
+                        .fixedSize(horizontal: true, vertical: false)
                 }
                 .buttonStyle(HarborActionButtonStyle(
                     tint: HarborColors.orange, prominence: .secondary))
@@ -885,8 +1031,9 @@ struct HarborProxyWorkspaceView: View {
             }
             .padding(2)
             .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 8))
-            .padding(.trailing, 10)
+            .padding(.leading, 5)
         }
+        .padding(.horizontal, 10)
     }
 
     private func modeButton(_ symbol: String, selected: Bool,
@@ -905,11 +1052,39 @@ struct HarborProxyWorkspaceView: View {
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
+    @ViewBuilder
+    private func useButton(_ node: HarborProxyNode) -> some View {
+        if proxy.activeNodeID == node.id && proxy.running {
+            Text(proxy.healthy ? "使用中" : (proxy.checkingConnectivity ? "检测中" : "未通过"))
+                .font(.system(size: 9.5, weight: .semibold))
+                .foregroundStyle(proxy.healthy ? HarborColors.green : HarborColors.orange)
+                .frame(width: 44, height: 29)
+                .accessibilityLabel("当前节点：\(node.displayName)")
+        } else {
+            Button {
+                Task { await proxy.activate(node.id) }
+            } label: {
+                Text("使用")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(HarborColors.blue)
+                    .frame(width: 44, height: 29)
+                    .background(HarborColors.blue.opacity(0.09),
+                                in: RoundedRectangle(cornerRadius: 7))
+            }
+            .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue,
+                                                            cornerRadius: 7))
+            .disabled(proxy.switchingNodeID == node.id || proxy.requiresRecovery)
+            .accessibilityLabel("使用节点：\(node.displayName)")
+        }
+    }
+
     /// Only node content scrolls. Controls and pagination stay in view at any
     /// supported window height; there is no outer page scrolling.
-    private func nodeTable(compact: Bool, showRegion: Bool, narrow: Bool) -> some View {
+    private func nodeTable(compact: Bool, showRegion: Bool, narrow: Bool,
+                           compactActions: Bool) -> some View {
         VStack(spacing: 0) {
-            regionBar(narrow: narrow)
+            if availableCategories.count > 2 { categoryBar }
+            regionBar(narrow: narrow, compactActions: compactActions)
             Rectangle().fill(HarborColors.cardBorder).frame(height: 1)
 
             if !gridMode {
@@ -947,7 +1122,7 @@ struct HarborProxyWorkspaceView: View {
                                 .help("拖动调整节点名称列宽")
                         }
                         .frame(width: nodeNameColumnWidth, alignment: .leading)
-                        Text("地址")
+                        Text("类别 / 地址")
                             .lineLimit(1)
                             .frame(maxWidth: .infinity, alignment: .leading)
                         Text("地区").frame(width: 76, alignment: .leading)
@@ -965,6 +1140,7 @@ struct HarborProxyWorkspaceView: View {
                     Image(systemName: "star").frame(width: 29)
                         .help("收藏节点")
                         .accessibilityLabel("收藏")
+                    Text("使用").frame(width: 44)
                 }
                 .font(.system(size: 10.5, weight: .medium))
                 .foregroundStyle(.secondary)
@@ -979,10 +1155,20 @@ struct HarborProxyWorkspaceView: View {
                     VStack(spacing: 9) {
                         Image(systemName: "line.3.horizontal.decrease.circle")
                             .font(.system(size: 24, weight: .ultraLight))
-                        Text(proxy.nodes.isEmpty ? "暂无节点，请先导入订阅"
-                             : (groupID == nil && favorites.isEmpty ? "还没有收藏的节点"
-                             : "没有符合条件的节点"))
+                        Text(unavailableCount > 0 && !showUnavailable
+                             ? "候选节点未通过真实测速，已暂时隐藏"
+                             : (proxy.nodes.isEmpty ? "暂无节点，可添加公开候选来源"
+                                : (groupID == nil && favoritesOnly && favorites.isEmpty
+                                   ? "还没有收藏的节点" : "没有符合条件的节点")))
                             .font(.system(size: 11))
+                        if unavailableCount > 0 && !showUnavailable {
+                            Button("查看失败节点并重试") {
+                                showUnavailable = true
+                                page = 1
+                            }
+                            .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue,
+                                                                 prominence: .secondary))
+                        }
                     }
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
@@ -1039,7 +1225,7 @@ struct HarborProxyWorkspaceView: View {
         let connected = active && proxy.healthy
         let probe = proxy.probeResults[node.id]
         let delay = probe?.milliseconds
-        let connecting = proxy.switchingNodeID == node.id
+        let connecting = visibleSwitchingNodeID == node.id
         let previewed = previewNodeID == node.id
         let rowBackground: Color = connected ? HarborColors.green.opacity(0.105)
             : ((active || connecting) ? HarborColors.orange.opacity(0.07)
@@ -1074,7 +1260,7 @@ struct HarborProxyWorkspaceView: View {
                                 }
                             }
                             HStack(spacing: 5) {
-                                Text(node.host)
+                                Text("\(categoryOf(node).rawValue) · \(node.host)")
                                     .truncationMode(.middle)
                                     .lineLimit(1)
                                 if !showRegion { Text(regionFlag(node)) }
@@ -1107,7 +1293,7 @@ struct HarborProxyWorkspaceView: View {
                                 .foregroundStyle(.secondary)
                                 .help("这是自定义节点名称；右键可修改或恢复订阅名称")
                         }
-                        Text(node.host)
+                        Text("\(categoryOf(node).rawValue) · \(node.host)")
                             .font(.system(size: 9.5))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -1125,18 +1311,21 @@ struct HarborProxyWorkspaceView: View {
                     if compact {
                         Text(realLatencyText(
                             delay: delay, probe: probe, connected: connected,
-                            connecting: connecting, nodeID: node.id))
+                            connecting: connecting, nodeID: node.id,
+                            isOpenVPN: node.protocolName == "openvpn"))
                         .font(.system(size: 9.2, weight: .medium))
                         .monospacedDigit()
                         .foregroundStyle(realLatencyTextColor(
                             delay: delay, probe: probe, connected: connected,
                             connecting: connecting, nodeID: node.id))
                         .lineLimit(1)
+                        .help(probe?.realFailureReason ?? "真实代理请求延迟")
                         .frame(width: 88, alignment: .leading)
                     } else {
                         Text(realLatencyText(
                             delay: delay, probe: probe, connected: connected,
-                            connecting: connecting, nodeID: node.id))
+                            connecting: connecting, nodeID: node.id,
+                            isOpenVPN: node.protocolName == "openvpn"))
                             .font(.system(size: 10.3, weight: connected || delay != nil ? .semibold : .regular))
                             .monospacedDigit()
                             .foregroundStyle(realLatencyTextColor(
@@ -1154,7 +1343,7 @@ struct HarborProxyWorkspaceView: View {
             .simultaneousGesture(TapGesture(count: 2).onEnded {
                 Task { await proxy.activate(node.id) }
             })
-            .help("单击选择，双击连接：\(node.displayName)。右键可以重命名")
+            .help("单击选择，点击右侧“使用”连接：\(node.displayName)。右键可以重命名")
             .accessibilityLabel("选择节点：" + node.displayName)
             .accessibilityAction(named: "连接节点") {
                 Task { await proxy.activate(node.id) }
@@ -1170,9 +1359,9 @@ struct HarborProxyWorkspaceView: View {
                                      ? HarborColors.orange : HarborColors.green)
                     .frame(width: 26, height: 30)
             }
-            .disabled(proxy.latencyTesting || proxy.busy || !proxy.coreInstalled)
+            .disabled(proxy.latencyTesting || proxy.busy || !proxy.supportsCore(for: node))
             .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.green, cornerRadius: 7))
-            .help("真实测速：通过独立 Xray 的 SOCKS5 代理请求测速地址")
+            .help("真实测速：通过独立代理内核的 SOCKS5 请求测速地址")
             Button {
                 toggleFavorite(node.id)
             } label: {
@@ -1183,6 +1372,7 @@ struct HarborProxyWorkspaceView: View {
             }
             .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.orange, cornerRadius: 7))
             .help(favorites.contains(node.id) ? "取消收藏" : "收藏节点")
+            useButton(node)
         }
         .padding(.horizontal, 8)
         .contentShape(RoundedRectangle(cornerRadius: 8))
@@ -1212,7 +1402,7 @@ struct HarborProxyWorkspaceView: View {
     private func gridCard(_ node: HarborProxyNode) -> some View {
         let active = proxy.activeNodeID == node.id && proxy.running
         let connected = active && proxy.healthy
-        let connecting = proxy.switchingNodeID == node.id
+        let connecting = visibleSwitchingNodeID == node.id
         let probe = proxy.probeResults[node.id]
         let delay = probe?.milliseconds
         let previewed = previewNodeID == node.id
@@ -1258,7 +1448,7 @@ struct HarborProxyWorkspaceView: View {
                                 .foregroundStyle(HarborColors.orange)
                         }
                     }
-                    Text(node.host)
+                    Text("\(categoryOf(node).rawValue) · \(node.host)")
                         .font(.system(size: 9.5))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -1269,7 +1459,8 @@ struct HarborProxyWorkspaceView: View {
                         Spacer(minLength: 2)
                         Text(realLatencyText(
                             delay: delay, probe: probe, connected: connected,
-                            connecting: connecting, nodeID: node.id))
+                            connecting: connecting, nodeID: node.id,
+                            isOpenVPN: node.protocolName == "openvpn"))
                             .lineLimit(1)
                             .font(.system(size: 10.5, weight: delay == nil ? .regular : .semibold))
                             .monospacedDigit()
@@ -1309,9 +1500,10 @@ struct HarborProxyWorkspaceView: View {
                         .foregroundStyle(HarborColors.green)
                         .frame(width: 27, height: 27)
                 }
-                .disabled(proxy.latencyTesting || proxy.busy || !proxy.coreInstalled)
+                .disabled(proxy.latencyTesting || proxy.busy || !proxy.supportsCore(for: node))
                 .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.green, cornerRadius: 7))
-                .help("真实测速：通过独立 Xray 的 SOCKS5 代理请求测速地址")
+                .help("真实测速：通过独立代理内核的 SOCKS5 请求测速地址")
+                useButton(node)
             }
         }
         .padding(.trailing, 8)
@@ -1325,7 +1517,7 @@ struct HarborProxyWorkspaceView: View {
             }
         }
         .contextMenu { nodeNameActions(node) }
-        .help("单击选择，双击连接：\(node.displayName)；右键可重命名")
+        .help("单击选择，点击“使用”连接：\(node.displayName)；右键可重命名")
         .accessibilityAddTraits(connected ? .isSelected : [])
         .onHover { hovering in
             if hovering { hoveredNodeID = node.id }
@@ -1424,6 +1616,26 @@ struct HarborProxyWorkspaceView: View {
         editor = .editSubscription
     }
 
+    private func addCommunitySource(_ source: HarborProxyCommunitySource) {
+        guard !proxy.busy, !proxy.latencyTesting else { return }
+        let id: String
+        if let existing = proxy.subscriptions.first(where: {
+            HarborProxyCommunitySource.matching($0.url) == source
+        }) {
+            id = existing.id
+        } else {
+            guard proxy.addSubscription(name: source.name, url: source.url),
+                  let added = proxy.subscriptions.last else { return }
+            id = added.id
+        }
+        editor = nil
+        groupID = id
+        favoritesOnly = false
+        resetFilters()
+        category = .volunteer
+        Task { await proxy.refreshCommunitySubscription(id) }
+    }
+
     private func requestSubscriptionDeletion(_ id: String) {
         deletionError = nil
         deletingSubscription = false
@@ -1454,7 +1666,8 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func realLatencyText(delay: Int?, probe: HarborProxyProbeResult?,
-                                 connected: Bool, connecting: Bool, nodeID: String) -> String {
+                                 connected: Bool, connecting: Bool, nodeID: String,
+                                 isOpenVPN: Bool) -> String {
         if connecting { return "切换中" }
         if proxy.latencyTestingIDs.contains(nodeID) {
             return "测速中"
@@ -1463,6 +1676,11 @@ struct HarborProxyWorkspaceView: View {
             return "\(delay) ms" + (probe?.isStale() == true ? " · 旧" : "")
         }
         guard probe?.realTested == true else { return "未测速" }
+        if isOpenVPN, let reason = probe?.realFailureReason {
+            if reason.contains("握手") { return "握手超时" }
+            if reason.contains("HTTPS") { return "出口验证失败" }
+            if reason.contains("Mihomo") { return "内核启动失败" }
+        }
         return probe?.isConfirmedUnavailable == true ? "不可用" : "待复测"
     }
 
@@ -1492,24 +1710,43 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func regionFlag(_ node: HarborProxyNode) -> String {
-        proxy.serverLocation(for: node)?.flag ?? "🌐"
+        if node.protocolName == "openvpn" {
+            return proxy.exitLocation(for: node)?.flag
+                ?? HarborProxyIPLocation(ip: node.host, countryCode: node.path).flag
+        }
+        if categoryOf(node) == .residential {
+            return proxy.exitLocation(for: node)?.flag ?? "🌐"
+        }
+        return proxy.serverLocation(for: node)?.flag ?? "🌐"
     }
 
     private func resetFilters() {
         page = 1
+        category = .all
         region = "全部"
         protocolFilter = "全部"
         latencyFilter = "全部"
-        showUnavailable = false
+        showUnavailable = true
     }
 
     private func location(of node: HarborProxyNode) -> String {
-        proxy.serverLocation(for: node)?.displayRegion
+        if node.protocolName == "openvpn" {
+            return proxy.exitLocation(for: node)?.displayRegion
+                ?? HarborProxyIPLocation(ip: node.host, countryCode: node.path).displayRegion
+        }
+        if categoryOf(node) == .residential {
+            return proxy.exitLocation(for: node)?.displayRegion
+                ?? HarborProxyAutomaticName.unresolvedRegion
+        }
+        return proxy.serverLocation(for: node)?.displayRegion
             ?? HarborProxyAutomaticName.unresolvedRegion
     }
 
     private func locationLabel(of node: HarborProxyNode) -> String {
         let region = location(of: node)
+        if node.protocolName == "openvpn", proxy.exitLocation(for: node) == nil {
+            return region + "·来源"
+        }
         guard region != HarborProxyAutomaticName.unresolvedRegion,
               proxy.exitLocation(for: node) == nil else { return region }
         return region + "·入口"
@@ -1518,6 +1755,12 @@ struct HarborProxyWorkspaceView: View {
     private func regionHint(_ node: HarborProxyNode) -> String {
         if let exit = proxy.exitLocation(for: node) {
             return "普通网站检测到的出口 IP：\(exit.ip) · 优先显示出口地区"
+        }
+        if node.protocolName == "openvpn" {
+            return "VPN Gate 发布者报告的地区：\(location(of: node))；实际出口尚未确认"
+        }
+        if categoryOf(node) == .residential {
+            return "住宅候选节点的实际出口尚未确认；识别前不按入口地区筛选"
         }
         if let location = proxy.serverLocation(for: node) {
             if location.countryCode == "ZZ" {
@@ -1561,6 +1804,14 @@ struct HarborProxyWorkspaceView: View {
                     .foregroundStyle(.secondary)
                     .padding(.bottom, 13)
                 VStack(spacing: 12) {
+                    ForEach(missingCommunitySources, id: \.self) { source in
+                        importOption("VPN Gate 志愿节点",
+                                     subtitle: "一键导入公开候选；会自动检测真实可用性",
+                                     symbol: "network",
+                                     tint: HarborColors.blue) {
+                            addCommunitySource(source)
+                        }
+                    }
                     importOption("订阅地址", subtitle: "通过 HTTPS 订阅获取并更新节点",
                                  symbol: "link", tint: HarborColors.blue) {
                         editingSubscriptionID = nil

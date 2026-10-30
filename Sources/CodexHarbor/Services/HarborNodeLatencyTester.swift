@@ -481,7 +481,7 @@ enum HarborNodeLatencyTester {
         }
     }
 
-    fileprivate static func reservePortPair() -> Int? {
+    static func reservePortPair() -> Int? {
         portLock.lock()
         defer { portLock.unlock() }
         for port in stride(from: 18200, through: 18480, by: 2)
@@ -493,7 +493,7 @@ enum HarborNodeLatencyTester {
         return nil
     }
 
-    fileprivate static func releasePortPair(_ port: Int) {
+    static func releasePortPair(_ port: Int) {
         portLock.lock()
         reservedPorts.remove(port)
         portLock.unlock()
@@ -543,5 +543,182 @@ enum HarborNodeLatencyTester {
                 Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
             }
         }
+    }
+}
+
+/// A VPN Gate probe runs its own Mihomo instance on temporary localhost ports.
+/// It never changes the selected node or macOS system proxy. Opening the
+/// listener alone is not success: the HTTPS request must traverse SOCKS5.
+enum HarborMihomoLatencyTester {
+    static func checkActiveSOCKS(port: Int) async -> Bool {
+        await warmupAndMeasure(socksPort: port,
+                               cancellation: HarborLatencyCancellation()).milliseconds != nil
+    }
+
+    /// Verify the existing Xray/VLESS SOCKS listener before sending a batch of
+    /// OpenVPN probes through it. If the base has gone dark, keep the relay
+    /// results untouched instead of blaming every remote VPN Gate server.
+    static func underlayReady(socksPort: Int,
+                              cancellation: HarborLatencyCancellation) async -> Bool {
+        guard (1...65_535).contains(socksPort), !cancellation.isCancelled else { return false }
+        let primary = await curlRequest(
+            url: "https://www.gstatic.com/generate_204", socksPort: socksPort,
+            timeout: 6, cancellation: cancellation)
+        if primary?.succeeded == true { return true }
+        let fallback = await curlRequest(
+            url: "https://example.com", socksPort: socksPort,
+            timeout: 6, cancellation: cancellation)
+        return fallback?.succeeded == true
+    }
+
+    static func measure(node: HarborProxyNode, root: URL,
+                        cancellation: HarborLatencyCancellation,
+                        underlaySocksPort: Int? = nil) async -> HarborNodeDelayReport {
+        guard let result = await withProxy(node: node, root: root, cancellation: cancellation,
+                                           underlaySocksPort: underlaySocksPort,
+                                           action: { socksPort in
+            await warmupAndMeasure(socksPort: socksPort, cancellation: cancellation)
+        }) else { return .failed(cancellation.isCancelled ? "测试已取消" : "Mihomo/OpenVPN 无法建立代理") }
+        return result
+    }
+
+    /// A successful 204 probe is not proof that a particular website accepts
+    /// this exit. An explicit user-triggered check targets the actual active
+    /// SOCKS outbound (not the system proxy or a separately selected node).
+    static func websiteReport(socksPort: Int) async -> String {
+        guard (1...65_535).contains(socksPort) else { return "SOCKS5 端口无效" }
+        let cancellation = HarborLatencyCancellation()
+        async let youtube = curlRequest(
+            url: "https://www.youtube.com/", socksPort: socksPort,
+            timeout: 8, cancellation: cancellation)
+        async let chatgpt = curlRequest(
+            url: "https://chatgpt.com/", socksPort: socksPort,
+            timeout: 8, cancellation: cancellation)
+        let (youtubeResult, chatgptResult) = await (youtube, chatgpt)
+
+        func label(_ name: String, _ result: CurlResult?) -> String {
+            guard let result else { return "\(name) 未能发起请求" }
+            if result.succeeded { return "\(name) 首页可访问 (HTTP \(result.status))" }
+            if result.status == 403 { return "\(name) 被网站拒绝 (403)" }
+            if result.status != 0 { return "\(name) HTTP \(result.status)" }
+            if result.exitCode == 28 { return "\(name) 连接超时" }
+            return "\(name) HTTPS 连接失败"
+        }
+        return label("YouTube", youtubeResult) + "；" + label("ChatGPT", chatgptResult)
+    }
+
+    static func exitLocation(node: HarborProxyNode, root: URL,
+                             cancellation: HarborLatencyCancellation) async -> HarborProxyIPLocation? {
+        await withProxy(node: node, root: root, cancellation: cancellation) { socksPort in
+            await HarborNodeGeoIPResolver.exitLocation(socksPort: socksPort)
+        } ?? nil
+    }
+
+    private static func withProxy<T: Sendable>(
+        node: HarborProxyNode, root: URL, cancellation: HarborLatencyCancellation,
+        underlaySocksPort: Int? = nil,
+        action: @escaping @Sendable (Int) async -> T
+    ) async -> T? {
+        guard !cancellation.isCancelled,
+              let port = HarborNodeLatencyTester.reservePortPair() else { return nil }
+        defer { HarborNodeLatencyTester.releasePortPair(port) }
+        let configPath = root.appendingPathComponent("probe-\(UUID().uuidString).json")
+        let binary = root.appendingPathComponent("mihomo")
+        guard FileManager.default.isExecutableFile(atPath: binary.path),
+              let config = try? HarborMihomoConfig.make(
+                node: node, httpPort: port, underlaySocksPort: underlaySocksPort),
+              (try? config.write(to: configPath, options: .atomic)) != nil else { return nil }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configPath.path)
+        defer { try? FileManager.default.removeItem(at: configPath) }
+        let engine = Process()
+        engine.executableURL = binary
+        engine.currentDirectoryURL = root
+        engine.arguments = ["-f", configPath.path]
+        engine.standardOutput = FileHandle.nullDevice
+        engine.standardError = FileHandle.nullDevice
+        guard let observer = cancellation.observe({ [weak engine] in
+            if engine?.isRunning == true { engine?.terminate() }
+        }) else { return nil }
+        defer { cancellation.removeObserver(observer) }
+        do { try engine.run() } catch { return nil }
+        defer {
+            if engine.isRunning { engine.terminate() }
+            engine.waitUntilExit()
+        }
+        guard HarborNodeLatencyTester.waitUntilListening(
+            port: port, process: engine, cancellation: cancellation),
+              HarborNodeLatencyTester.waitUntilListening(
+                port: port + 1, process: engine, cancellation: cancellation),
+              !cancellation.isCancelled else { return nil }
+        return await action(port + 1)
+    }
+
+    private struct CurlResult: Sendable {
+        let exitCode: Int32
+        let status: Int
+        let milliseconds: Int?
+        var succeeded: Bool { exitCode == 0 && (200..<400).contains(status) }
+    }
+
+    /// Mihomo's first client dial can time out while its OpenVPN handshake is
+    /// still running. Trigger it repeatedly before judging the HTTPS exit.
+    private static func warmupAndMeasure(socksPort: Int,
+                                         cancellation: HarborLatencyCancellation) async -> HarborNodeDelayReport {
+        guard !cancellation.isCancelled else { return .failed("测试已取消") }
+        let deadline = Date.now.addingTimeInterval(32)
+        var ready = false
+        while Date.now < deadline && !cancellation.isCancelled {
+            let attempt = await curlRequest(
+                url: "http://www.gstatic.com/generate_204", socksPort: socksPort,
+                timeout: 4, cancellation: cancellation)
+            if attempt?.succeeded == true {
+                ready = true
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(700))
+        }
+        guard !cancellation.isCancelled else { return .failed("测试已取消") }
+        guard ready else { return .failed("OpenVPN 握手预热超时；请换节点或检查底座代理") }
+        guard let result = await curlRequest(
+            url: "https://www.gstatic.com/generate_204",
+            socksPort: socksPort, timeout: 10, cancellation: cancellation) else {
+            return .failed(cancellation.isCancelled ? "测试已取消" : "HTTPS 出口验证未启动")
+        }
+        guard result.succeeded, let milliseconds = result.milliseconds else {
+            return .failed(result.exitCode == 28 ? "HTTPS 出口验证超时" : "HTTPS 出口验证失败")
+        }
+        return .succeeded(milliseconds)
+    }
+
+    private static func curlRequest(url: String, socksPort: Int, timeout: Int,
+                                    cancellation: HarborLatencyCancellation) async -> CurlResult? {
+        guard !cancellation.isCancelled else { return nil }
+        return await Task.detached(priority: .utility) {
+            let curl = Process()
+            let output = Pipe()
+            curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+            curl.arguments = [
+                "--disable", "--silent", "--max-time", String(timeout),
+                "--proxy", "socks5h://127.0.0.1:\(socksPort)", "--noproxy", "",
+                "--output", "/dev/null", "--write-out", "%{http_code} %{time_total}",
+                "--url", url
+            ]
+            curl.standardOutput = output
+            curl.standardError = FileHandle.nullDevice
+            guard let observer = cancellation.observe({ [weak curl] in
+                if curl?.isRunning == true { curl?.terminate() }
+            }) else { return nil as CurlResult? }
+            defer { cancellation.removeObserver(observer) }
+            do { try curl.run() } catch { return nil }
+            let bytes = output.fileHandleForReading.readDataToEndOfFile()
+            curl.waitUntilExit()
+            guard !cancellation.isCancelled else { return nil }
+            let parts = String(decoding: bytes, as: UTF8.self).split(separator: " ")
+            let status = parts.first.flatMap { Int($0) } ?? 0
+            let seconds = parts.dropFirst().first.flatMap { Double($0) }
+            let milliseconds = seconds.flatMap { $0 > 0 ? Int(($0 * 1_000).rounded()) : nil }
+            return CurlResult(exitCode: curl.terminationStatus, status: status,
+                              milliseconds: milliseconds)
+        }.value
     }
 }

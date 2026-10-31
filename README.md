@@ -153,16 +153,22 @@ XTLS Xray-core、`geoip.dat` 和 `geosite.dat`。首次启动会把它们复制�
 
 住宅订阅每次最多自动测试 20 个节点，VPN Gate 每次最多自动测试 24 个节点，并优先
 测尚未测过的家宽入口；再次筛选会推进到后续候选，不会永远重复第一批。测试使用与当前
-系统代理隔离的 Xray 或内置 Mihomo/OpenVPN 实例，只有经 SOCKS5 完成实际 HTTPS 请求
-才算可用；**刷新和测试不会自动切换节点或接管系统代理**。节点使用后也要再次核验。
+系统代理隔离的 Xray 或内置 Mihomo/OpenVPN 实例；VPN Gate 的 TCP 入口先做短时预筛，
+避免把明显无法连接的入口逐个等待 OpenVPN 握手超时。若当前已有健康的普通订阅节点，
+抓取候选、入口预筛和 OpenVPN 测试会走该节点；选用 VPN Gate 节点时也沿用这条底座链路。
+没有底座节点时仍可直连尝试，失败会明确显示，不会把入口连通当作出口可用。
+只有经 SOCKS5 完成实际 HTTPS 请求才算可用；**刷新和测试不会自动切换节点或接管系统代理**。
+节点使用后也要再次核验。
 当前版本没有独立的 MITM 与风险评分全套筛选，因此不能承诺住宅出口身份、
 纯净度、节点数量或跨网络可用性。
 
 实现参考：[`xehn/vpngate.go`](https://github.com/hezhanleiok/xehn/blob/main/vpngate.go)
 从 VPN Gate 抓取 OpenVPN 配置，做列表缓存、本机 TCP 延迟检测、住宅/机房分类及
 短期失败记忆。本应用实现了 VPN Gate 获取与 Mihomo 原生 OpenVPN 出站，但**没有实现
-xehn 的 WARP 底层链路或其住宅归类规则**：在 VPN Gate 被本地网络阻断时，仍可能没有
-可用节点。节点真正的运营商类型和风险分须由独立可靠来源核查，不能由 VPN Gate 自报。
+xehn 的 WARP 底层链路或其住宅归类规则**：当前普通订阅节点只是一条可选底座，
+不是 WARP 的等价替代；若底座或志愿节点本身不稳定，仍可能没有可用节点。
+VPN Gate 出站的域名解析由 Mihomo 通过所选出口的 DoH 完成，避免沿用本机可能错误的 DNS。
+节点真正的运营商类型和风险分须由独立可靠来源核查，不能由 VPN Gate 自报。
 [`freesub/scripts/main_v2.py`](https://github.com/hezhanleiok/freesub/blob/main/scripts/main_v2.py)
 生成适配 V2Ray 的订阅：真实代理出口探测后按 ASN/ISP/CDN/风险信息筛选，再分别导出住宅
 池。其 GitHub Actions 当前只配置手动触发，公开住宅池的更新频率和规模取决于上游。

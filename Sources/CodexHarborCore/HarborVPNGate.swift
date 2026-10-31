@@ -285,8 +285,8 @@ public enum HarborMihomoConfig {
         }
         // Resolve destination domains inside Mihomo instead of inheriting the
         // macOS resolver. The DoH upstreams are explicitly sent through the
-        // selected OpenVPN outbound; bootstrap resolvers are IP literals so
-        // resolving the DoH host never depends on the system DNS or on itself.
+        // selected OpenVPN outbound. IP-literal DoH URLs need no bootstrap
+        // lookup on a local network whose DNS may return poisoned addresses.
         let dns: [String: Any] = [
             "enable": true,
             "ipv6": false,
@@ -297,8 +297,8 @@ public enum HarborMihomoConfig {
             "default-nameserver": ["1.1.1.1", "8.8.8.8"],
             "proxy-server-nameserver": ["1.1.1.1", "8.8.8.8"],
             "nameserver": [
-                "https://cloudflare-dns.com/dns-query#selected",
-                "https://dns.google/dns-query#selected"
+                "https://8.8.8.8/dns-query#selected",
+                "https://8.8.4.4/dns-query#selected"
             ]
         ]
         let config: [String: Any] = [

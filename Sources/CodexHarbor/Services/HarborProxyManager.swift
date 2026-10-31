@@ -237,6 +237,7 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var exitGeoCompleted = 0
     @Published private(set) var exitGeoTotal = 0
     @Published private(set) var latencyTesting = false
+    @Published private(set) var latencyBatchIDs: Set<String> = []
     @Published private(set) var installingCore = false
     @Published private(set) var latencyCurrentID: String?
     @Published private(set) var latencyTestingIDs: Set<String> = []
@@ -337,7 +338,8 @@ final class HarborProxyManager: ObservableObject {
         guard let node = nodes.first(where: { $0.id == id }),
               let path, let data = try? Data(contentsOf: path) else { return false }
         return node.protocolName == "openvpn"
-            ? HarborMihomoConfig.matches(configuration: data, node: node)
+            ? HarborMihomoConfig.matches(configuration: data, node: node,
+                                         underlaySocksPort: underlayPort.map { $0 + 1 })
             : HarborProxyRuntimeIdentity.matches(configuration: data, node: node)
     }
 
@@ -1252,26 +1254,39 @@ final class HarborProxyManager: ObservableObject {
         var request = URLRequest(url: url)
         request.timeoutInterval = url.host == "api.github.com" ? 8 : 20
         if url.host == "api.github.com" { request.setValue("CodexHarbor", forHTTPHeaderField: "User-Agent") }
-        let config = URLSessionConfiguration.ephemeral
-        if url.host == "www.vpngate.net" {
-            // Pool refresh must work with no active subscription proxy. Explicitly
-            // disable inherited macOS HTTP/SOCKS proxies for this source.
-            config.connectionProxyDictionary = [
-                "HTTPEnable": 0, "HTTPSEnable": 0, "SOCKSEnable": 0
-            ]
-        } else if running, healthy, let localPort {
-            config.connectionProxyDictionary = [
-                "HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": localPort,
-                "HTTPSEnable": 1, "HTTPSProxy": "127.0.0.1", "HTTPSPort": localPort
-            ]
+        let gateFeed = url.host == "www.vpngate.net"
+        let activeProxyPort = running && healthy
+            ? (gateFeed && activeNode?.protocolName == "openvpn" ? underlayPort : localPort)
+            : nil
+        let attempts: [Int?] = gateFeed && activeProxyPort != nil
+            ? [activeProxyPort, nil] : [activeProxyPort]
+        var downloaded: Data?
+        var usedProxyPort: Int?
+        var lastError: Error = HarborProxyError.invalid("订阅响应不是有效的 HTTP 200 文本（最大 2 MB）")
+        for proxyPort in attempts {
+            let config = URLSessionConfiguration.ephemeral
+            if let proxyPort {
+                config.connectionProxyDictionary = [
+                    "HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": proxyPort,
+                    "HTTPSEnable": 1, "HTTPSProxy": "127.0.0.1", "HTTPSPort": proxyPort
+                ]
+            } else if gateFeed {
+                config.connectionProxyDictionary = [
+                    "HTTPEnable": 0, "HTTPSEnable": 0, "SOCKSEnable": 0
+                ]
+            }
+            let session = URLSession(configuration: config)
+            defer { session.invalidateAndCancel() }
+            do {
+                let (data, response) = try await session.data(for: request)
+                guard (response as? HTTPURLResponse)?.statusCode == 200,
+                      data.count <= 2_000_000 else { continue }
+                downloaded = data
+                usedProxyPort = proxyPort
+                break
+            } catch { lastError = error }
         }
-        let session = URLSession(configuration: config)
-        defer { session.invalidateAndCancel() }
-        let (data, response) = try await session.data(for: request)
-        guard (response as? HTTPURLResponse)?.statusCode == 200,
-              data.count <= 2_000_000 else {
-            throw HarborProxyError.invalid("订阅响应不是有效的 HTTP 200 文本（最大 2 MB）")
-        }
+        guard let data = downloaded else { throw lastError }
         let text = url.host == "api.github.com"
             ? HarborProxyCommunitySource.decodedAPIContents(data)
             : String(data: data, encoding: .utf8)
@@ -1280,11 +1295,12 @@ final class HarborProxyManager: ObservableObject {
         if HarborProxyCommunitySource.matching(url.absoluteString) == .vpnGate {
             let candidates = HarborVPNGate.parse(text, subscriptionID: id)
             detail = "已获取 \(candidates.count) 个志愿候选，正在预筛入口（入口连通不代表节点可用）"
-            let ranked = await HarborVPNGatePortScanner.rank(candidates)
+            let ranked = await HarborVPNGatePortScanner.rank(
+                candidates, socksPort: usedProxyPort.map { $0 + 1 })
             detail = "正在识别家宽入口类型；只有真实测速通过才算可用"
             let evidence = await HarborVPNGateNetworkClassifier.classify(
                 ranked, cached: nodeNetworkEvidence,
-                proxyPort: nil
+                proxyPort: usedProxyPort
             )
             nodeNetworkEvidence.merge(evidence) { _, latest in latest }
             incoming = ranked
@@ -1418,9 +1434,12 @@ final class HarborProxyManager: ObservableObject {
             detail = "所选节点已不存在"
             return
         }
-        let underlayID = requestedNode.protocolName == "openvpn"
-            ? (healthy && activeNode?.protocolName != "openvpn"
-                ? activeNodeID : vpnGateUnderlayNodeID) : nil
+        let underlayID = requestedNode.protocolName == "openvpn" && healthy
+            ? (activeNode?.protocolName == "openvpn"
+                ? (underlayPort == nil ? nil : vpnGateUnderlayNodeID)
+                : activeNodeID) : nil
+        let previousUnderlayID = activeNode?.protocolName == "openvpn" && underlayPort != nil
+            ? vpnGateUnderlayNodeID : nil
         guard let preserveSystemProxy = prepareSystemProxyForActivation() else { return }
         let previousID = activeNodeID ?? selectedID
         let wasRunning = running
@@ -1454,6 +1473,7 @@ final class HarborProxyManager: ObservableObject {
         }
 
         guard !pendingActivation.hasPending else { return }
+        if latencyTesting { cancelLatencyTests() }
         if wasRunning {
             // Keep the macOS proxy settings and ownership snapshot untouched:
             // Xray's fixed ports do not change when only the remote node changes.
@@ -1478,6 +1498,7 @@ final class HarborProxyManager: ObservableObject {
             if wasRunning, let previousID, previousID != id,
                nodes.contains(where: { $0.id == previousID }) {
                 await start(
+                    underlayNodeID: previousUnderlayID,
                     preservingSystemProxy: wasManaged,
                     systemProxyInteractive: false
                 )
@@ -1570,10 +1591,18 @@ final class HarborProxyManager: ObservableObject {
         do {
             let port = try choosePort()
             let isOpenVPN = node.protocolName == "openvpn"
-            // OpenVPN household nodes are standalone exits. Never chain them
-            // through a subscription node or start a hidden Xray underlay.
+            if isOpenVPN, let underlayNodeID {
+                guard coreInstalled,
+                      let base = nodes.first(where: {
+                          $0.id == underlayNodeID && $0.protocolName != "openvpn"
+                      }) else {
+                    throw HarborProxyError.invalid("住宅节点的底座订阅节点已不存在")
+                }
+                try await startUnderlay(base)
+            }
             let config = try isOpenVPN
-                ? HarborMihomoConfig.make(node: node, httpPort: port)
+                ? HarborMihomoConfig.make(node: node, httpPort: port,
+                                          underlaySocksPort: underlayPort.map { $0 + 1 })
                 : HarborXrayConfig.make(node: node, httpPort: port, ruleMode: routingRules,
                                        forcedProxyDomains: forcedProxyDomains,
                                        routeVerificationViaProxy: true,
@@ -1609,7 +1638,7 @@ final class HarborProxyManager: ObservableObject {
             let record = HarborProxyProcessRecord(
                 pid: process.processIdentifier, configPath: file.path,
                 executablePath: process.executableURL?.path ?? "",
-                underlay: underlayRecord(nodeID: underlayNodeID ?? vpnGateUnderlayNodeID)
+                underlay: underlayRecord(nodeID: underlayNodeID)
             )
             try JSONEncoder().encode(record).write(to: runtimeRecordURL, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: runtimeRecordURL.path)
@@ -1637,9 +1666,7 @@ final class HarborProxyManager: ObservableObject {
             // process and its complete outbound configuration matches the node.
             activeNodeID = node.id
             selectedID = node.id
-            if isOpenVPN, underlayPort != nil {
-                vpnGateUnderlayNodeID = underlayNodeID ?? vpnGateUnderlayNodeID
-            }
+            if isOpenVPN { vpnGateUnderlayNodeID = underlayPort == nil ? nil : underlayNodeID }
             persist()
             running = true
             proxyAudit("listener_ready", nodeID: node.id)
@@ -1685,7 +1712,8 @@ final class HarborProxyManager: ObservableObject {
         systemProxyInteractive: Bool
     ) async {
         let reachable = activeNode?.protocolName == "openvpn"
-            ? await HarborMihomoLatencyTester.checkActiveSOCKS(port: port + 1)
+            ? await HarborMihomoLatencyTester.checkActiveSOCKS(
+                port: port + 1, failureLog: runtimeErrorLogURL)
             : await HarborNodeLatencyTester.checkActiveSOCKS(port: port + 1)
         lastActiveHealthCheckAt = .now
         guard generation == connectionGeneration,
@@ -1818,12 +1846,13 @@ final class HarborProxyManager: ObservableObject {
             return
         }
         let containsOpenVPN = targets.contains { $0.protocolName == "openvpn" }
-        // Household candidates are always probed directly. Their results do
-        // not inherit the current subscription node's health or route identity.
-        let latencyUnderlayPort: Int? = nil
-        let openVPNRouteID = "direct"
+        // Probe the relay over the same healthy base route that will carry it
+        // when selected. Without a base, keep the direct path explicit.
+        let latencyUnderlayPort = containsOpenVPN ? workingUnderlaySocksPort : nil
+        let openVPNRouteID = latencyUnderlayPort == nil ? "direct" : vpnGateProbeRouteID
 
         latencyTesting = true
+        latencyBatchIDs = Set(targets.map(\.id))
         latencyCancellationRequested = false
         let cancellation = HarborLatencyCancellation()
         latencyCancellation = cancellation
@@ -1832,6 +1861,7 @@ final class HarborProxyManager: ObservableObject {
         var succeeded = 0
         defer {
             latencyTesting = false
+            latencyBatchIDs = []
             latencyCurrentID = nil
             latencyTestingIDs = []
             latencyCancellationRequested = false
@@ -1840,18 +1870,27 @@ final class HarborProxyManager: ObservableObject {
         let latencyRoot = root
         let latencyRuleMode = routingRules
         let latencyForcedDomains = forcedProxyDomains
-        let sharedRealBatch = targets.contains(where: { $0.protocolName == "openvpn" })
-            ? nil : await HarborNodeLatencyTester.startRealBatch(
-                nodes: targets, root: latencyRoot, cancellation: cancellation)
+        let tcpRelays = Array(targets.filter {
+            $0.protocolName == "openvpn" && $0.network == "tcp"
+        }.prefix(64))
+        let reachableRelays = await HarborVPNGatePortScanner.reachableIDs(
+            tcpRelays, socksPort: latencyUnderlayPort, cancellation: cancellation)
+        let unreachableRelays = Set(tcpRelays.map(\.id)).subtracting(reachableRelays)
+        let ordinaryTargets = targets.filter { $0.protocolName != "openvpn" }
+        let sharedRealBatch = ordinaryTargets.isEmpty || cancellation.isCancelled ? nil
+            : await HarborNodeLatencyTester.startRealBatch(
+                nodes: ordinaryTargets, root: latencyRoot, cancellation: cancellation)
         // Keep one Xray for all nodes and bound only the HTTP probes. Refill
         // each free slot immediately, so a slow node cannot block the next wave.
         // Failed nodes are retried by a later user test, not immediately here.
         let measureNode: @Sendable (HarborProxyNode) async -> (String, Int?, String?, String?) = { node in
             let report: HarborNodeDelayReport
             if node.protocolName == "openvpn" {
-                report = await HarborMihomoLatencyTester.measure(
-                    node: node, root: latencyRoot, cancellation: cancellation,
-                    underlaySocksPort: latencyUnderlayPort)
+                report = unreachableRelays.contains(node.id)
+                    ? .failed("入口 TCP 连接失败")
+                    : await HarborMihomoLatencyTester.measure(
+                        node: node, root: latencyRoot, cancellation: cancellation,
+                        underlaySocksPort: latencyUnderlayPort)
             } else if let sharedRealBatch {
                 report = await sharedRealBatch.measure(node: node)
             } else {

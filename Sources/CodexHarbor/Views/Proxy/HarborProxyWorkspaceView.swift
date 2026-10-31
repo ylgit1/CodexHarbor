@@ -75,6 +75,12 @@ struct HarborProxyWorkspaceView: View {
         }
     }
 
+    private var currentGroupIsTesting: Bool {
+        proxy.latencyTesting && sourceGroupNodes.contains {
+            proxy.latencyBatchIDs.contains($0.id)
+        }
+    }
+
     private var availableCategories: [NodeCategory] {
         [.all] + NodeCategory.allCases.filter { choice in
             choice != .all && sourceGroupNodes.contains { categoryOf($0) == choice }
@@ -954,7 +960,7 @@ struct HarborProxyWorkspaceView: View {
                 .disabled(proxy.busy || proxy.latencyTesting)
                 .help("重新获取 VPN Gate 志愿候选，识别家宽入口并真实测速；不会自动切换节点")
             }
-            if proxy.latencyTesting {
+            if currentGroupIsTesting {
                 Button { proxy.cancelLatencyTests() } label: {
                     Label("停止 \(proxy.latencyCompleted)/\(proxy.latencyTotal)",
                           systemImage: "stop.circle")
@@ -973,9 +979,11 @@ struct HarborProxyWorkspaceView: View {
                         .fixedSize(horizontal: true, vertical: false)
                 }
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.green, prominence: .secondary))
-                .disabled(sourceGroupNodes.isEmpty || proxy.busy
+                .disabled(sourceGroupNodes.isEmpty || proxy.busy || proxy.latencyTesting
                           || !sourceGroupNodes.allSatisfy({ proxy.supportsCore(for: $0) }))
-                .help("通过独立代理内核的 SOCKS5 发起真实请求；不改变当前节点或系统代理")
+                .help(proxy.latencyTesting
+                      ? "其他订阅正在测速；切回该订阅可查看进度或停止"
+                      : "通过独立代理内核的 SOCKS5 发起真实请求；不改变当前节点或系统代理")
             }
 
             Button {

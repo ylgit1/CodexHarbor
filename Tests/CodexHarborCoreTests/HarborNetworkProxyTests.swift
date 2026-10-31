@@ -514,8 +514,8 @@ struct HarborNetworkProxyTests {
         #expect(dns["default-nameserver"] as? [String] == ["1.1.1.1", "8.8.8.8"])
         #expect(dns["proxy-server-nameserver"] as? [String] == ["1.1.1.1", "8.8.8.8"])
         #expect(dns["nameserver"] as? [String] == [
-            "https://cloudflare-dns.com/dns-query#selected",
-            "https://dns.google/dns-query#selected"
+            "https://8.8.8.8/dns-query#selected",
+            "https://8.8.4.4/dns-query#selected"
         ])
         var legacyConfig = json
         legacyConfig.removeValue(forKey: "dns")
@@ -693,14 +693,19 @@ struct HarborNetworkProxyTests {
         let nodes = HarborVPNGate.parse(feed, subscriptionID: "live")
         let hosts = Set((ProcessInfo.processInfo.environment["CODEX_HARBOR_VPNGATE_LIVE_HOSTS"] ?? "")
             .split(separator: ",").map(String.init))
-        let targets = hosts.isEmpty ? Array(nodes.prefix(8))
-            : Array(nodes.filter { hosts.contains($0.host) }.prefix(8))
+        let limit = min(8, max(1, Int(ProcessInfo.processInfo.environment[
+            "CODEX_HARBOR_VPNGATE_LIVE_LIMIT"] ?? "8") ?? 8))
+        let underlayPort = Int(ProcessInfo.processInfo.environment[
+            "CODEX_HARBOR_VPNGATE_LIVE_UNDERLAY"] ?? "")
+        let targets = hosts.isEmpty ? Array(nodes.prefix(limit))
+            : Array(nodes.filter { hosts.contains($0.host) }.prefix(limit))
         var successful = 0
         for (index, node) in targets.enumerated() {
             let port = 19220 + index * 2
             let path = FileManager.default.temporaryDirectory
                 .appendingPathComponent("codexharbor-probe-\(UUID().uuidString).json")
-            try HarborMihomoConfig.make(node: node, httpPort: port)
+            try HarborMihomoConfig.make(node: node, httpPort: port,
+                                        underlaySocksPort: underlayPort)
                 .write(to: path, options: .atomic)
             defer { try? FileManager.default.removeItem(at: path) }
             let engine = Process()
@@ -712,7 +717,7 @@ struct HarborNetworkProxyTests {
             Thread.sleep(forTimeInterval: 0.5)
             let curl = Process()
             curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-            curl.arguments = ["--disable", "--silent", "--max-time", "7",
+            curl.arguments = ["--disable", "--silent", "--max-time", "35",
                               "--proxy", "socks5h://127.0.0.1:\(port + 1)",
                               "--noproxy", "", "--output", "/dev/null",
                               "--url", "https://www.msftconnecttest.com/connecttest.txt"]
@@ -720,11 +725,35 @@ struct HarborNetworkProxyTests {
             curl.standardError = FileHandle.nullDevice
             try curl.run()
             curl.waitUntilExit()
+            print("VPN Gate live probe \(index + 1): curl=\(curl.terminationStatus) mihomoRunning=\(engine.isRunning)")
             if curl.terminationStatus == 0 { successful += 1 }
             if engine.isRunning { engine.terminate() }
             engine.waitUntilExit()
         }
         print("VPN Gate live probe: \(successful)/\(targets.count) HTTPS exits passed")
+    }
+
+    @Test("Captured VPN Gate profile produces a Mihomo-valid DNS configuration")
+    func capturedVPNGateConfigValidation() throws {
+        guard let feedPath = ProcessInfo.processInfo.environment["CODEX_HARBOR_VPNGATE_CONFIG_FEED"],
+              let binaryPath = ProcessInfo.processInfo.environment["CODEX_HARBOR_MIHOMO_BINARY"] else {
+            return
+        }
+        let feed = try String(contentsOfFile: feedPath, encoding: .utf8)
+        let node = try #require(HarborVPNGate.parse(feed, subscriptionID: "config").first)
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codexharbor-config-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: path) }
+        try HarborMihomoConfig.make(node: node, httpPort: 19220, underlaySocksPort: 19223)
+            .write(to: path, options: .atomic)
+        let engine = Process()
+        engine.executableURL = URL(fileURLWithPath: binaryPath)
+        engine.arguments = ["-t", "-f", path.path]
+        engine.standardOutput = FileHandle.nullDevice
+        engine.standardError = FileHandle.nullDevice
+        try engine.run()
+        engine.waitUntilExit()
+        #expect(engine.terminationStatus == 0)
     }
 
     @Test("Subscription update preserves matching IDs, favorites, and aliases")

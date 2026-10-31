@@ -550,9 +550,10 @@ enum HarborNodeLatencyTester {
 /// It never changes the selected node or macOS system proxy. Opening the
 /// listener alone is not success: the HTTPS request must traverse SOCKS5.
 enum HarborMihomoLatencyTester {
-    static func checkActiveSOCKS(port: Int) async -> Bool {
+    static func checkActiveSOCKS(port: Int, failureLog: URL? = nil) async -> Bool {
         await warmupAndMeasure(socksPort: port,
-                               cancellation: HarborLatencyCancellation()).milliseconds != nil
+                               cancellation: HarborLatencyCancellation(),
+                               failureLog: failureLog).milliseconds != nil
     }
 
     /// Verify the existing Xray/VLESS SOCKS listener before sending a batch of
@@ -576,8 +577,9 @@ enum HarborMihomoLatencyTester {
                         underlaySocksPort: Int? = nil) async -> HarborNodeDelayReport {
         guard let result = await withProxy(node: node, root: root, cancellation: cancellation,
                                            underlaySocksPort: underlaySocksPort,
-                                           action: { socksPort in
-            await warmupAndMeasure(socksPort: socksPort, cancellation: cancellation)
+                                           action: { socksPort, failureLog in
+            await warmupAndMeasure(socksPort: socksPort, cancellation: cancellation,
+                                   failureLog: failureLog)
         }) else { return .failed(cancellation.isCancelled ? "测试已取消" : "Mihomo/OpenVPN 无法建立代理") }
         return result
     }
@@ -609,7 +611,7 @@ enum HarborMihomoLatencyTester {
 
     static func exitLocation(node: HarborProxyNode, root: URL,
                              cancellation: HarborLatencyCancellation) async -> HarborProxyIPLocation? {
-        await withProxy(node: node, root: root, cancellation: cancellation) { socksPort in
+        await withProxy(node: node, root: root, cancellation: cancellation) { socksPort, _ in
             await HarborNodeGeoIPResolver.exitLocation(socksPort: socksPort)
         } ?? nil
     }
@@ -617,12 +619,13 @@ enum HarborMihomoLatencyTester {
     private static func withProxy<T: Sendable>(
         node: HarborProxyNode, root: URL, cancellation: HarborLatencyCancellation,
         underlaySocksPort: Int? = nil,
-        action: @escaping @Sendable (Int) async -> T
+        action: @escaping @Sendable (Int, URL) async -> T
     ) async -> T? {
         guard !cancellation.isCancelled,
               let port = HarborNodeLatencyTester.reservePortPair() else { return nil }
         defer { HarborNodeLatencyTester.releasePortPair(port) }
         let configPath = root.appendingPathComponent("probe-\(UUID().uuidString).json")
+        let failureLog = root.appendingPathComponent("probe-\(UUID().uuidString).log")
         let binary = root.appendingPathComponent("mihomo")
         guard FileManager.default.isExecutableFile(atPath: binary.path),
               let config = try? HarborMihomoConfig.make(
@@ -630,12 +633,17 @@ enum HarborMihomoLatencyTester {
               (try? config.write(to: configPath, options: .atomic)) != nil else { return nil }
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configPath.path)
         defer { try? FileManager.default.removeItem(at: configPath) }
+        let logFD = failureLog.path.withCString {
+            Darwin.open($0, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, mode_t(0o600))
+        }
+        guard logFD >= 0 else { return nil }
+        defer { try? FileManager.default.removeItem(at: failureLog) }
         let engine = Process()
         engine.executableURL = binary
         engine.currentDirectoryURL = root
         engine.arguments = ["-f", configPath.path]
         engine.standardOutput = FileHandle.nullDevice
-        engine.standardError = FileHandle.nullDevice
+        engine.standardError = FileHandle(fileDescriptor: logFD, closeOnDealloc: true)
         guard let observer = cancellation.observe({ [weak engine] in
             if engine?.isRunning == true { engine?.terminate() }
         }) else { return nil }
@@ -650,7 +658,7 @@ enum HarborMihomoLatencyTester {
               HarborNodeLatencyTester.waitUntilListening(
                 port: port + 1, process: engine, cancellation: cancellation),
               !cancellation.isCancelled else { return nil }
-        return await action(port + 1)
+        return await action(port + 1, failureLog)
     }
 
     private struct CurlResult: Sendable {
@@ -663,7 +671,8 @@ enum HarborMihomoLatencyTester {
     /// Mihomo's first client dial can time out while its OpenVPN handshake is
     /// still running. Trigger it repeatedly before judging the HTTPS exit.
     private static func warmupAndMeasure(socksPort: Int,
-                                         cancellation: HarborLatencyCancellation) async -> HarborNodeDelayReport {
+                                         cancellation: HarborLatencyCancellation,
+                                         failureLog: URL? = nil) async -> HarborNodeDelayReport {
         guard !cancellation.isCancelled else { return .failed("测试已取消") }
         let deadline = Date.now.addingTimeInterval(32)
         var ready = false
@@ -674,6 +683,9 @@ enum HarborMihomoLatencyTester {
             if attempt?.succeeded == true {
                 ready = true
                 break
+            }
+            if let failureLog, openVPNAuthenticationFailed(in: failureLog) {
+                return .failed("OpenVPN 认证被入口拒绝")
             }
             try? await Task.sleep(for: .milliseconds(700))
         }
@@ -688,6 +700,15 @@ enum HarborMihomoLatencyTester {
             return .failed(result.exitCode == 28 ? "HTTPS 出口验证超时" : "HTTPS 出口验证失败")
         }
         return .succeeded(milliseconds)
+    }
+
+    private static func openVPNAuthenticationFailed(in log: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: log) else { return false }
+        defer { try? handle.close() }
+        guard let length = try? handle.seekToEnd() else { return false }
+        try? handle.seek(toOffset: length > 16_384 ? length - 16_384 : 0)
+        guard let tail = try? handle.readToEnd() else { return false }
+        return String(decoding: tail, as: UTF8.self).contains("AUTH_FAILED")
     }
 
     private static func curlRequest(url: String, socksPort: Int, timeout: Int,

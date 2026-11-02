@@ -1,0 +1,28 @@
+name: Publish verified v0.1.26 installer
+on:
+  push:
+    branches: [publish/v0.1.26]
+    paths: [release-upload/manifest.json]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: release-assets
+          fetch-depth: 1
+      - name: Reassemble and verify the tested installer
+        run: |
+          git fetch origin publish/v0.1.26:refs/remotes/origin/publish/v0.1.26
+          git show origin/publish/v0.1.26:release-upload/publish.py > /tmp/publish-installer.py
+          python3 /tmp/publish-installer.py
+      - name: Publish latest and versioned downloads
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add latest v0.1.26 SHA256SUMS INSTALLER.md
+          git diff --cached --quiet && exit 0
+          git commit -m 'release: publish v0.1.26 arm64 installer'
+          git push origin HEAD:release-assets

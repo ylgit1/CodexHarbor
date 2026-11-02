@@ -1,19 +1,21 @@
 # Codex Harbor installers
 
-Current release: `v0.1.24` (Apple Silicon / arm64)
+Current release: `v0.1.26` (Apple Silicon / arm64)
 
-- Versioned installer: `v0.1.24/Codex-Harbor-v0.1.24-arm64.dmg`
+- Source commit: `458f118ad1c452d9b79eaa05ccba3abba3a7e903`
+- Versioned installer: `v0.1.26/Codex-Harbor-v0.1.26-arm64.dmg`
 - Latest installer: `latest/Codex-Harbor-arm64.dmg`
-- SHA-256: `7fbfa0236a6dca6c78639e928ea49c7762679a97031d1153bde023b6a2fd86b0`
+- SHA-256: `4a2a2536a7083dc109979032ca51d15c8761dbf8b5ea4d26c5babb5cdbacebbd`
 
 Download:
-- Gitee (large raw files may require a Gitee login):
-  https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg
-- GitHub Release:
-  https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.24/Codex-Harbor-v0.1.24-arm64.dmg
+- GitHub: https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg
+- Gitee: https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg
 
-The DMG contains the signed Codex Harbor app, an Applications shortcut,
-and bundled Xray, geoip.dat and geosite.dat.
-Requires Apple Silicon and macOS 14 or newer. This locally self-signed app is
-not Apple-notarized; first launch may require Gatekeeper approval in
-Privacy & Security. No Homebrew, Xcode or separate Xray install is required.
+This release adds the active proxy node connection type and built-in browser
+OAuth login without an external Codex CLI. All 230 tests passed. The DMG was
+mounted and its drag-install copy, signatures, app version and source revision
+were verified before publication.
+
+Requires Apple Silicon and macOS 14 or newer. Xray, Mihomo and their required
+resources are bundled. The app uses ad-hoc signing and is not Apple-notarized.
+First launch on another Mac may require approval in Privacy & Security.

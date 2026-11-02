@@ -96,9 +96,8 @@ if [[ -n "$(git -C "$project_root" status --porcelain 2>/dev/null)" ]]; then
 fi
 release_tag="$(git -C "$project_root" describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null || true)"
 version_tag="$release_tag"
-if [[ ! "$version_tag" =~ '^v[0-9]+\.[0-9]+\.[0-9]+$' ]]; then
-  version_tag="$(git -C "$project_root" describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
-fi
+# Without an exact release tag, retain the version declared in Info.plist.
+# A previous tag must not downgrade a newly prepared installer.
 if [[ "$build_number" == <-> ]]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build_number" "$staging_app_path/Contents/Info.plist"
 fi

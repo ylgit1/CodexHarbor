@@ -14,7 +14,7 @@ struct HarborAccountSetupSheet: View {
                 step(
                     number: 1,
                     title: "保护当前账户",
-                    detail: "已创建隔离登录环境",
+                    detail: "新增账户不会覆盖当前登录",
                     state: .complete,
                     drawsLine: true
                 )

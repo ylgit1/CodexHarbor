@@ -374,6 +374,15 @@ struct HarborProxyWorkspaceView: View {
         headerNode?.displayName ?? "未选择代理节点"
     }
 
+    private var proxyConnectionType: HarborProxyConnectionType? {
+        guard let node = headerNode else { return nil }
+        return HarborProxyConnectionType.classify(
+            node: node,
+            subscription: proxy.subscriptions.first { $0.id == node.subscriptionID },
+            evidence: proxy.networkEvidence(for: node)
+        )
+    }
+
     private var proxyConnectionStatus: String {
         if proxy.requiresRecovery { return "请先恢复系统代理设置，避免网络异常" }
         if visibleSwitchingNodeID != nil { return "正在切换 · 启动并验证新节点" }
@@ -442,6 +451,17 @@ struct HarborProxyWorkspaceView: View {
                     }
                 }
                 HStack(spacing: 6) {
+                    if let connectionType = proxyConnectionType {
+                        Text("连接类型：\(connectionType.title)")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(HarborColors.blue)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(HarborColors.blue.opacity(0.08), in: Capsule())
+                            .fixedSize(horizontal: true, vertical: false)
+                            .help(connectionType.detail)
+                            .accessibilityLabel("连接类型：\(connectionType.title)")
+                    }
                     Circle().fill(proxyStateColor).frame(width: 6, height: 6)
                     Text(proxyConnectionStatus)
                         .font(.system(size: 10.5))

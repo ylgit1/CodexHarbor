@@ -48,16 +48,16 @@ private struct HarborProxyUnderlayRecord: Codable {
 }
 
 private actor HarborProxyPersistence {
-    private static let legacyQuery: [String: Any] = [
+    private static var legacyQuery: [String: Any] { [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: "com.codexharbor.v2rayn-replacement",
         kSecAttrAccount as String: "settings"
-    ]
-    private static let keyQuery: [String: Any] = [
+    ] }
+    private static var keyQuery: [String: Any] { [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: "com.codexharbor.proxy-state-key",
         kSecAttrAccount as String: "v2"
-    ]
+    ] }
 
     private let stateURL: URL
     private var newestGeneration = 0

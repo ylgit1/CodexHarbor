@@ -427,12 +427,12 @@ final class AppModel: ObservableObject {
             try await profileCatalog.synchronizeCurrentAccountIfPresent()
             try await refreshCatalog()
 
-            activity = "正在创建隔离登录环境…"
-            try accountLoginSession.start(previousAccountID: selectedAccountProfileID)
+            activity = "正在准备官方登录…"
+            try await accountLoginSession.start(previousAccountID: selectedAccountProfileID)
             detectedAccountName = nil
             isAwaitingAccountLogin = true
             activity = "等待 Codex 官方登录完成"
-            appendLog("已在隔离环境打开 Codex 官方登录，当前账户保持不变")
+            appendLog("已打开浏览器进行 Codex 官方授权，当前账户保持不变")
         }
     }
 

@@ -2,5 +2,6 @@
   "version": "0.1.26",
   "giteeCommit": "1eead3590ff6ccd971443e97f66c7bb3ee21cfda",
   "size": 49616542,
-  "sha256": "4a2a2536a7083dc109979032ca51d15c8761dbf8b5ea4d26c5babb5cdbacebbd"
+  "sha256": "4a2a2536a7083dc109979032ca51d15c8761dbf8b5ea4d26c5babb5cdbacebbd",
+  "publishGitHubRelease": true
 }

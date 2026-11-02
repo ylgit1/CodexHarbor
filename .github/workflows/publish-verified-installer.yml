@@ -26,3 +26,9 @@ jobs:
           git diff --cached --quiet && exit 0
           git commit -m 'release: publish v0.1.26 arm64 installer'
           git push origin HEAD:release-assets
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v0.1.26 >/dev/null 2>&1; then exit 0; fi
+          gh release create v0.1.26 v0.1.26/Codex-Harbor-v0.1.26-arm64.dmg --target 458f118ad1c452d9b79eaa05ccba3abba3a7e903 --title 'Codex Harbor v0.1.26' --notes-file INSTALLER.md --latest

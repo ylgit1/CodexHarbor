@@ -1,7 +1,7 @@
-name: Publish verified v0.1.26 installer
+name: Publish verified v0.1.27 installer
 on:
   push:
-    branches: [publish/v0.1.26]
+    branches: [publish/v0.1.27]
     paths: [release-upload/manifest.json]
 permissions:
   contents: write
@@ -13,22 +13,29 @@ jobs:
         with:
           ref: release-assets
           fetch-depth: 1
+      - name: Mirror verified source commit to GitHub main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=2 https://gitee.com/yangxiaoyong01/CodexHarbor.git main:refs/remotes/gitee/main
+          test "$(git rev-parse refs/remotes/gitee/main)" = "a2f35f190fc45a63fa9ef1bc5ccba6d0071295b1"
+          git push origin refs/remotes/gitee/main:refs/heads/main
       - name: Reassemble and verify the tested installer
         run: |
-          git fetch origin publish/v0.1.26:refs/remotes/origin/publish/v0.1.26
-          git show origin/publish/v0.1.26:release-upload/publish.py > /tmp/publish-installer.py
+          git fetch origin publish/v0.1.27:refs/remotes/origin/publish/v0.1.27
+          git show origin/publish/v0.1.27:release-upload/publish.py > /tmp/publish-installer.py
           python3 /tmp/publish-installer.py
       - name: Publish latest and versioned downloads
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add latest v0.1.26 SHA256SUMS INSTALLER.md
+          git add latest v0.1.27 SHA256SUMS INSTALLER.md
           git diff --cached --quiet && exit 0
-          git commit -m 'release: publish v0.1.26 arm64 installer'
+          git commit -m 'release: publish v0.1.27 arm64 installer'
           git push origin HEAD:release-assets
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view v0.1.26 >/dev/null 2>&1; then exit 0; fi
-          gh release create v0.1.26 v0.1.26/Codex-Harbor-v0.1.26-arm64.dmg --target 458f118ad1c452d9b79eaa05ccba3abba3a7e903 --title 'Codex Harbor v0.1.26' --notes-file INSTALLER.md --latest
+          if gh release view v0.1.27 >/dev/null 2>&1; then exit 0; fi
+          gh release create v0.1.27 v0.1.27/Codex-Harbor-v0.1.27-arm64.dmg --target a2f35f190fc45a63fa9ef1bc5ccba6d0071295b1 --title 'Codex Harbor v0.1.27' --notes-file INSTALLER.md --latest

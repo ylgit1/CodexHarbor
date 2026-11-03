@@ -128,59 +128,227 @@ struct HarborTechDashboardContent: View {
         return latest.formatted(date: .numeric, time: .shortened)
     }
 
+    // Quiet Native dashboard: value updates are live, presentation is static.
+    // Neither polling nor mouse movement drives a frame-by-frame view animation.
     var body: some View {
         GeometryReader { geometry in
-            let space = geometry.size
-            let sizing = HarborDashboardSizing.resolve(
-                width: Double(space.width), height: Double(space.height)
-            )
-            let gap = CGFloat(sizing.gap)
+            let compact = geometry.size.width < 920
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: gap) {
-                    pageHeader(compact: sizing.compact)
-                    pathPanel(compact: sizing.compact)
-                        .frame(height: CGFloat(sizing.flowHeight))
-                    ViewThatFits(in: .horizontal) {
-                        HStack(alignment: .top, spacing: gap) {
-                            codexCard(compact: sizing.compact).frame(maxWidth: .infinity)
-                            proxyCard(compact: sizing.compact).frame(maxWidth: .infinity)
-                            chatGPTCard(compact: sizing.compact).frame(maxWidth: .infinity)
+                VStack(alignment: .leading, spacing: 18) {
+                    pageHeader(compact: compact)
+
+                    HStack(spacing: 12) {
+                        quietSummary(
+                            title: "Codex",
+                            status: codexVerificationState,
+                            detail: activeDisplayName,
+                            symbol: "terminal",
+                            ready: activeCodexVerified,
+                            action: onManageCodex
+                        )
+                        quietSummary(
+                            title: "网络代理",
+                            status: proxyState,
+                            detail: proxy.running ? (proxy.activeNode?.displayName ?? "本地网络") : "未开启",
+                            symbol: "network",
+                            ready: systemProxyAvailable,
+                            action: onOpenNetworkProxy
+                        )
+                        quietSummary(
+                            title: "ChatGPT 接入",
+                            status: bridgeState,
+                            detail: bridge.configuration.enabled
+                                ? bridge.configuration.transportMode.displayName : "未配置",
+                            symbol: "desktopcomputer",
+                            ready: bridgeConnected,
+                            action: onOpenLocalAccess
+                        )
+                    }
+
+                    quietServiceList
+
+                    HStack(alignment: .top, spacing: 12) {
+                        HarborCard(padding: 18) {
+                            VStack(alignment: .leading, spacing: 13) {
+                                Text("当前开发环境")
+                                    .font(.system(size: 13, weight: .semibold))
+                                quietDetail("活动连接", activeDisplayName)
+                                quietDetail("Codex 模型", codexModel)
+                                if let accountExpiryText {
+                                    quietDetail("账户有效期", accountExpiryText)
+                                }
+                                Divider().opacity(0.5)
+                                HStack(spacing: 9) {
+                                    Button("切换连接", action: onSwitchCodex)
+                                        .buttonStyle(HarborActionButtonStyle(
+                                            tint: HarborColors.blue, prominence: .prominent))
+                                    Button("管理连接", action: onManageCodex)
+                                        .buttonStyle(HarborActionButtonStyle(
+                                            tint: HarborColors.blue, prominence: .secondary))
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        VStack(spacing: gap) {
-                            codexCard(compact: sizing.compact)
-                            proxyCard(compact: sizing.compact)
-                            chatGPTCard(compact: sizing.compact)
+
+                        HarborCard(padding: 18) {
+                            VStack(alignment: .leading, spacing: 13) {
+                                Text("本地服务")
+                                    .font(.system(size: 13, weight: .semibold))
+                                quietDetail("HTTP 端口", proxy.running
+                                    ? proxy.localPort.map(String.init) ?? "—" : "未启用")
+                                quietDetail("工具数量", bridge.runtime.toolCatalogCount.map {
+                                    "\($0) 项"
+                                } ?? "待检测")
+                                quietDetail("最近活动", latestActivityText)
+                                Divider().opacity(0.5)
+                                HStack(spacing: 9) {
+                                    Button("检测 MCP", action: checkMCPConnection)
+                                        .buttonStyle(HarborActionButtonStyle(
+                                            tint: HarborColors.blue, prominence: .secondary))
+                                        .disabled(isCheckingMCP || isRefreshing || bridge.isDiagnosing)
+                                    Button("接入设置", action: onOpenLocalAccess)
+                                        .buttonStyle(HarborActionButtonStyle(
+                                            tint: HarborColors.blue, prominence: .secondary))
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
-                    .frame(minHeight: CGFloat(sizing.cardHeight), alignment: .top)
+
+                    if let dashboardFeedback {
+                        Label(dashboardFeedback,
+                              systemImage: dashboardFeedbackIsError
+                                  ? "exclamationmark.circle" : "checkmark.circle")
+                            .font(.system(size: 11))
+                            .foregroundStyle(dashboardFeedbackIsError
+                                ? HarborColors.orange : Color.secondary)
+                            .padding(.vertical, 6)
+                    }
                 }
-                .frame(maxWidth: .infinity, alignment: .topLeading)
-                .padding(.horizontal, max(20, min(48, space.width * 0.025)))
-                .padding(.top, CGFloat(sizing.topInset))
-                .padding(.bottom, CGFloat(sizing.bottomInset))
+                .frame(maxWidth: 1160, alignment: .topLeading)
+                .padding(.horizontal, 28)
+                .padding(.top, 24)
+                .padding(.bottom, 28)
+                .frame(maxWidth: .infinity, alignment: .top)
             }
             .scrollIndicators(.automatic)
-            .overlay(alignment: .topTrailing) {
-                if let dashboardFeedback {
-                    Label(dashboardFeedback,
-                          systemImage: dashboardFeedbackIsError
-                              ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(dashboardFeedbackIsError ? HarborColors.orange : teal)
-                        .padding(.horizontal, 14)
-                        .frame(minHeight: 36)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 10)
-                                .stroke(HarborColors.cardBorder)
-                        )
-                        .shadow(color: .black.opacity(0.09), radius: 12, y: 4)
-                        .padding(.trailing, 24)
-                        .padding(.top, 73)
-                        .accessibilityAddTraits(.updatesFrequently)
+        }
+    }
+
+    private func quietSummary(
+        title: String, status: String, detail: String,
+        symbol: String, ready: Bool, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    Image(systemName: symbol)
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(HarborColors.blue)
+                    Spacer()
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
                 }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(title)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    Text(detail)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                HarborStatusBadge(
+                    title: status,
+                    color: ready ? HarborColors.green : HarborColors.orange,
+                    pulses: false
+                )
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(18)
+            .frame(height: 155, alignment: .topLeading)
+            .background(HarborColors.cardBackground,
+                        in: RoundedRectangle(cornerRadius: 11))
+            .overlay(RoundedRectangle(cornerRadius: 11).stroke(HarborColors.cardBorder))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
+    }
+
+    private var quietServiceList: some View {
+        HarborCard(padding: 0) {
+            VStack(spacing: 0) {
+                HStack {
+                    Text("连接与服务")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    Text("当前状态")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.horizontal, 18)
+                .frame(height: 47)
+
+                Divider().opacity(0.5)
+                quietServiceRow("Codex 连接", detail: activeDisplayName,
+                                status: codexVerificationState,
+                                ready: activeCodexVerified, action: onManageCodex)
+                Divider().opacity(0.45).padding(.leading, 18)
+                quietServiceRow("系统网络", detail: proxy.running
+                                ? (proxy.activeNode?.displayName ?? "本地代理") : "直连",
+                                status: proxyState,
+                                ready: systemProxyAvailable, action: onOpenNetworkProxy)
+                Divider().opacity(0.45).padding(.leading, 18)
+                quietServiceRow("MCP 通道",
+                                detail: bridge.configuration.enabled
+                                    ? bridge.configuration.transportMode.displayName : "未配置",
+                                status: bridgeState,
+                                ready: bridgeConnected, action: onOpenLocalAccess)
             }
         }
+    }
+
+    private func quietServiceRow(
+        _ title: String, detail: String, status: String,
+        ready: Bool, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Circle().fill(ready ? HarborColors.green : HarborColors.orange)
+                    .frame(width: 7, height: 7)
+                Text(title)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .frame(width: 103, alignment: .leading)
+                Text(detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 10)
+                Text(status)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+            }
+            .frame(height: 51)
+            .padding(.horizontal, 18)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func quietDetail(_ title: String, _ value: String) -> some View {
+        HStack(spacing: 8) {
+            Text(title).foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text(value).lineLimit(1).truncationMode(.middle)
+        }
+        .font(.system(size: 11))
     }
 
     @MainActor

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import CodexHarborCore
 
 /// Compact, high-fidelity macOS proxy workspace.
@@ -34,8 +35,7 @@ struct HarborProxyWorkspaceView: View {
     @State private var listenPortError: String?
     @State private var portUpdating = false
     @State private var copiedProxyURL: String?
-    @State private var hoveredSubscriptionID: String?
-    @State private var hoveredNodeID: String?
+    // Hover highlights are owned by individual cells, not the entire workspace.
     @State private var previewNodeID: String?
     @State private var deletionTargetID: DeletionTarget?
     @State private var deletionError: String?
@@ -46,6 +46,34 @@ struct HarborProxyWorkspaceView: View {
     private var nodeNameColumnWidth = 230.0
     @State private var nodeNameDragStart: Double?
     @FocusState private var nodeSearchFocused: Bool
+
+    // Heavy catalog work is consolidated into a single cached presentation.
+    // While a latency or GeoIP batch publishes individual progress updates,
+    // the scroll view keeps using the previous stable snapshot.
+    @State private var catalog = CatalogPresentation.empty
+    @State private var refreshScheduler = CatalogRefreshScheduler()
+
+    @MainActor
+    private final class CatalogRefreshScheduler {
+        var task: Task<Void, Never>?
+    }
+
+    private struct CatalogPresentation {
+        var sourceNodes: [HarborProxyNode] = []
+        var groupNodes: [HarborProxyNode] = []
+        var categoryNodes: [HarborProxyNode] = []
+        var shownNodes: [HarborProxyNode] = []
+        var categoryByID: [String: NodeCategory] = [:]
+        var categoryCounts: [NodeCategory: Int] = [:]
+        var regionCounts: [String: Int] = [:]
+        var subscriptionCounts: [String: Int] = [:]
+        var subscriptionUsableCounts: [String: Int] = [:]
+        var unavailableCount = 0
+        var protocols: [String] = ["全部"]
+        var regions: [String] = ["全部"]
+
+        static var empty: Self { Self() }
+    }
 
     private struct DeletionTarget: Identifiable { let id: String }
     private struct RenameTarget: Identifiable { let id: String }
@@ -68,106 +96,153 @@ struct HarborProxyWorkspaceView: View {
         HarborColors.blue, HarborColors.green, HarborColors.orange, HarborColors.purple
     ]
 
-    private var sourceGroupNodes: [HarborProxyNode] {
-        proxy.nodes.filter { node in
-            if let groupID { return node.subscriptionID == groupID }
-            return !favoritesOnly || favorites.contains(node.id)
-        }
-    }
+    private var sourceGroupNodes: [HarborProxyNode] { catalog.sourceNodes }
+    private var groupNodes: [HarborProxyNode] { catalog.groupNodes }
+    private var categoryNodes: [HarborProxyNode] { catalog.categoryNodes }
+    private var shownNodes: [HarborProxyNode] { catalog.shownNodes }
+    private var unavailableCount: Int { catalog.unavailableCount }
+    private var protocols: [String] { catalog.protocols }
+    private var regions: [String] { catalog.regions }
 
     private var currentGroupIsTesting: Bool {
-        proxy.latencyTesting && sourceGroupNodes.contains {
+        proxy.latencyTesting && catalog.sourceNodes.contains {
             proxy.latencyBatchIDs.contains($0.id)
         }
     }
 
     private var availableCategories: [NodeCategory] {
-        [.all] + NodeCategory.allCases.filter { choice in
-            choice != .all && sourceGroupNodes.contains { categoryOf($0) == choice }
+        [.all] + NodeCategory.allCases.filter {
+            $0 != .all && (catalog.categoryCounts[$0] ?? 0) > 0
         }
     }
 
     private func categoryOf(_ node: HarborProxyNode) -> NodeCategory {
-        guard let subscription = proxy.subscriptions.first(where: { $0.id == node.subscriptionID }),
-              let source = HarborProxyCommunitySource.matching(subscription.url) else {
-            return .custom
-        }
-        if source == .vpnGate {
-            if node.security == "vpngate-datacenter" { return .datacenter }
-            switch proxy.networkEvidence(for: node)?.kind {
-            case .residential: return .residential
-            case .hosting: return .datacenter
-            default: return .volunteer
-            }
-        }
-        return .residential
+        catalog.categoryByID[node.id] ?? .custom
     }
 
-    /// Freeze filtering and ordering during probing; only the cell's live status
-    /// changes until the whole batch completes.
     private var displayedProbeResults: [String: HarborProxyProbeResult] {
         proxy.latencyTesting ? (frozenLatencyResults ?? proxy.probeResults) : proxy.probeResults
     }
 
-    private var groupNodes: [HarborProxyNode] {
-        sourceGroupNodes.filter { node in
-            guard let result = displayedProbeResults[node.id], result.realTested else { return true }
-            return !result.isConfirmedUnavailable || showUnavailable
-        }
-    }
-
-    private var unavailableCount: Int {
-        sourceGroupNodes.filter {
-            guard let result = displayedProbeResults[$0.id] else { return false }
-            return result.isConfirmedUnavailable
-        }.count
-    }
-
-    private var categoryNodes: [HarborProxyNode] {
-        groupNodes.filter { category == .all || categoryOf($0) == category }
-    }
-
-    private var shownNodes: [HarborProxyNode] {
-        let result = categoryNodes.filter { node in
-            if region != "全部" && location(of: node) != region { return false }
-            if protocolFilter != "全部" && node.protocolName.uppercased() != protocolFilter { return false }
-            if latencyFilter != "全部" {
-                guard let delay = displayedProbeResults[node.id]?.milliseconds else { return false }
-                if latencyFilter == "快速"
-                    && delay >= HarborProxyLatencyPolicy.goodUpperBoundMilliseconds { return false }
-                if latencyFilter == "一般"
-                    && (delay < HarborProxyLatencyPolicy.goodUpperBoundMilliseconds
-                        || delay >= HarborProxyLatencyPolicy.warningUpperBoundMilliseconds) { return false }
-                if latencyFilter == "较慢"
-                    && delay < HarborProxyLatencyPolicy.warningUpperBoundMilliseconds { return false }
-            }
-            let text = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
-            return text.isEmpty || node.displayName.localizedCaseInsensitiveContains(text)
-                || node.name.localizedCaseInsensitiveContains(text)
-                || node.host.localizedCaseInsensitiveContains(text)
-                || node.protocolName.localizedCaseInsensitiveContains(text)
-        }
-        return HarborProxySubscriptionRefreshPolicy.initialLatencyOrder(
-            result, results: displayedProbeResults
-        )
-    }
-    private var maxPage: Int { max(1, (shownNodes.count + pageSize - 1) / pageSize) }
-    private var currentPage: Int { min(max(1, page), maxPage) }
-    private var visibleNodes: [HarborProxyNode] {
-        Array(shownNodes.dropFirst((currentPage - 1) * pageSize).prefix(pageSize))
-    }
     private var title: String {
         if let groupID { return proxy.subscriptions.first(where: { $0.id == groupID })?.name ?? "订阅节点" }
         return favoritesOnly ? "我的收藏" : "全部节点"
     }
-    private var protocols: [String] {
-        ["全部"] + Array(Set(groupNodes.map { $0.protocolName.uppercased() })).sorted()
+
+    /// Deliberately coalesce noisy progress publications (hundreds of results
+    /// in a batch) without delaying direct user actions such as filter changes.
+    private func scheduleCatalogRefresh() {
+        refreshScheduler.task?.cancel()
+        refreshScheduler.task = Task { @MainActor in
+            do { try await Task.sleep(for: .milliseconds(140)) }
+            catch { return }
+            rebuildCatalog()
+        }
     }
-    private var regions: [String] {
-        let actual = Set(categoryNodes.map(location))
+
+    private func rebuildCatalog() {
+        refreshScheduler.task?.cancel()
+        refreshScheduler.task = nil
+        let nodes = proxy.nodes
+        let results = displayedProbeResults
+        let sources = Dictionary(uniqueKeysWithValues: proxy.subscriptions.map {
+            ($0.id, HarborProxyCommunitySource.matching($0.url))
+        })
+        let evidence = proxy.nodeNetworkEvidence
+        let serverLocations = proxy.nodeServerLocations
+        let exitLocations = proxy.nodeExitLocations
+        let query = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        var snapshot = CatalogPresentation.empty
+
+        // One O(N) traversal builds classifications and per-subscription counts;
+        // no repeated subscriptions.first(where:) during row creation or scroll.
+        for node in nodes {
+            snapshot.subscriptionCounts[node.subscriptionID, default: 0] += 1
+            if results[node.id]?.succeeded == true {
+                snapshot.subscriptionUsableCounts[node.subscriptionID, default: 0] += 1
+            }
+            let kind: NodeCategory
+            switch sources[node.subscriptionID] ?? nil {
+            case .vpnGate:
+                if node.security == "vpngate-datacenter" {
+                    kind = .datacenter
+                } else {
+                    switch evidence[node.host]?.kind {
+                    case .residential: kind = .residential
+                    case .hosting: kind = .datacenter
+                    default: kind = .volunteer
+                    }
+                }
+            case .none: kind = .custom
+            default: kind = .residential
+            }
+            snapshot.categoryByID[node.id] = kind
+            guard groupID == nil || node.subscriptionID == groupID else { continue }
+            guard groupID != nil || !favoritesOnly || favorites.contains(node.id) else { continue }
+            snapshot.sourceNodes.append(node)
+            snapshot.categoryCounts[kind, default: 0] += 1
+            if results[node.id]?.isConfirmedUnavailable == true {
+                snapshot.unavailableCount += 1
+                if !showUnavailable { continue }
+            }
+            snapshot.groupNodes.append(node)
+        }
+
+        snapshot.protocols = ["全部"] +
+            Array(Set(snapshot.groupNodes.map { $0.protocolName.uppercased() })).sorted()
+        let categoryIndex = snapshot.categoryByID
+        snapshot.categoryNodes = snapshot.groupNodes.filter {
+            category == .all || categoryIndex[$0.id] == category
+        }
+
+        // Resolve displayed region once per node. Keep the same verified-exit
+        // preference as HarborProxyManager.exitLocation(for:).
+        var nodeRegions: [String: String] = [:]
+        for node in snapshot.categoryNodes {
+            let server = serverLocations[node.host.lowercased()]
+            let exit = exitLocations[node.id]?.verifiedLocation(
+                for: node, resolvedServerIP: server?.ip
+            )
+            let location: String
+            if node.protocolName == "openvpn" {
+                location = exit?.displayRegion ??
+                    HarborProxyIPLocation(ip: node.host, countryCode: node.path).displayRegion
+            } else if snapshot.categoryByID[node.id] == .residential {
+                location = exit?.displayRegion ?? HarborProxyAutomaticName.unresolvedRegion
+            } else {
+                location = (exit ?? server)?.displayRegion ?? HarborProxyAutomaticName.unresolvedRegion
+            }
+            nodeRegions[node.id] = location
+            snapshot.regionCounts[location, default: 0] += 1
+        }
         let priority = ["香港", "美国", "日本", "新加坡", "台湾", "德国", "韩国", "英国"]
-        return ["全部"] + priority.filter(actual.contains)
-            + actual.subtracting(Set(priority)).sorted()
+        let names = Set(snapshot.regionCounts.keys)
+        snapshot.regions = ["全部"] + priority.filter(names.contains)
+            + names.subtracting(Set(priority)).sorted()
+
+        let candidates = snapshot.categoryNodes.filter { node in
+            if region != "全部" && nodeRegions[node.id] != region { return false }
+            if protocolFilter != "全部" && node.protocolName.uppercased() != protocolFilter { return false }
+            if latencyFilter != "全部" {
+                guard let delay = results[node.id]?.milliseconds else { return false }
+                if latencyFilter == "快速" &&
+                    delay >= HarborProxyLatencyPolicy.goodUpperBoundMilliseconds { return false }
+                if latencyFilter == "一般" &&
+                    (delay < HarborProxyLatencyPolicy.goodUpperBoundMilliseconds ||
+                     delay >= HarborProxyLatencyPolicy.warningUpperBoundMilliseconds) { return false }
+                if latencyFilter == "较慢" &&
+                    delay < HarborProxyLatencyPolicy.warningUpperBoundMilliseconds { return false }
+            }
+            return query.isEmpty ||
+                node.displayName.localizedCaseInsensitiveContains(query) ||
+                node.name.localizedCaseInsensitiveContains(query) ||
+                node.host.localizedCaseInsensitiveContains(query) ||
+                node.protocolName.localizedCaseInsensitiveContains(query)
+        }
+        snapshot.shownNodes = HarborProxySubscriptionRefreshPolicy.initialLatencyOrder(
+            candidates, results: results
+        )
+        catalog = snapshot
     }
 
     private var missingCommunitySources: [HarborProxyCommunitySource] {
@@ -177,16 +252,37 @@ struct HarborProxyWorkspaceView: View {
     }
 
     var body: some View {
-        GeometryReader { geometry in
+        let layout = GeometryReader { geometry in
             workspaceLayout(size: geometry.size)
         }
+        return presentSheets(observeRuntimeChanges(observeFilterChanges(observeCatalogChanges(layout))))
+    }
+
+    private func observeCatalogChanges<Content: View>(_ content: Content) -> some View {
+        content
         .task {
             await proxy.bootstrap()
             await proxy.refreshCommunitySourcesIfNeeded()
         }
         .onAppear {
             favorites = Set(UserDefaults.standard.stringArray(forKey: favoritesKey) ?? [])
+            rebuildCatalog()
         }
+        .onDisappear { refreshScheduler.task?.cancel() }
+        .onReceive(proxy.$nodes) { _ in scheduleCatalogRefresh() }
+        .onReceive(proxy.$subscriptions) { _ in scheduleCatalogRefresh() }
+        .onReceive(proxy.$probeResults) { _ in scheduleCatalogRefresh() }
+        .onReceive(proxy.$nodeServerLocations) { _ in scheduleCatalogRefresh() }
+        .onReceive(proxy.$nodeExitLocations) { _ in scheduleCatalogRefresh() }
+        .onReceive(proxy.$nodeNetworkEvidence) { _ in scheduleCatalogRefresh() }
+    }
+
+    private func observeFilterChanges<Content: View>(_ content: Content) -> some View {
+        content
+        .onChange(of: groupID) { _, _ in rebuildCatalog() }
+        .onChange(of: favoritesOnly) { _, _ in rebuildCatalog() }
+        .onChange(of: favorites) { _, _ in rebuildCatalog() }
+        .onChange(of: showUnavailable) { _, _ in rebuildCatalog() }
         .onChange(of: proxy.subscriptions.map(\.id)) { _, ids in
             if let groupID, !ids.contains(groupID) {
                 self.groupID = nil
@@ -194,17 +290,36 @@ struct HarborProxyWorkspaceView: View {
                 resetFilters()
             }
         }
-        .onChange(of: keyword) { _, _ in page = 1 }
+        .onChange(of: keyword) { _, _ in
+            page = 1
+            // User input remains immediate. Only asynchronous probe/GeoIP
+            // updates are coalesced in the background.
+            rebuildCatalog()
+        }
         .onChange(of: category) { _, _ in
             page = 1
+            rebuildCatalog()
             if region != "全部" && !regions.contains(region) { region = "全部" }
         }
         .onChange(of: availableCategories) { _, choices in
             if !choices.contains(category) { category = .all }
         }
-        .onChange(of: region) { _, _ in page = 1 }
-        .onChange(of: protocolFilter) { _, _ in page = 1 }
-        .onChange(of: latencyFilter) { _, _ in page = 1 }
+        .onChange(of: region) { _, _ in
+            page = 1
+            rebuildCatalog()
+        }
+        .onChange(of: protocolFilter) { _, _ in
+            page = 1
+            rebuildCatalog()
+        }
+        .onChange(of: latencyFilter) { _, _ in
+            page = 1
+            rebuildCatalog()
+        }
+    }
+
+    private func observeRuntimeChanges<Content: View>(_ content: Content) -> some View {
+        content
         .onChange(of: proxy.latencyTesting) { _, testing in
             if testing {
                 frozenLatencyResults = proxy.probeResults
@@ -212,6 +327,7 @@ struct HarborProxyWorkspaceView: View {
                 frozenLatencyResults = nil
                 page = 1
             }
+            rebuildCatalog()
         }
         .onChange(of: pageSize) { _, _ in page = 1 }
         .onChange(of: proxy.localPort) { _, _ in copiedProxyURL = nil }
@@ -221,6 +337,10 @@ struct HarborProxyWorkspaceView: View {
         .onChange(of: proxy.nodeExitLocations) { _, _ in
             if region != "全部" && !regions.contains(region) { region = "全部" }
         }
+    }
+
+    private func presentSheets<Content: View>(_ content: Content) -> some View {
+        content
         .sheet(item: $editor) { mode in editorSheet(mode) }
         .sheet(item: $renameTarget) { target in
             if let node = proxy.nodes.first(where: { $0.id == target.id }) {
@@ -674,7 +794,7 @@ struct HarborProxyWorkspaceView: View {
                 }
                 .padding(.horizontal, 9)
             }
-            .scrollIndicators(.hidden)
+            .scrollIndicators(.never)
             .frame(minHeight: 0, maxHeight: .infinity)
 
             if !proxy.coreInstalled {
@@ -790,11 +910,9 @@ struct HarborProxyWorkspaceView: View {
 
     private func subscriptionRow(_ item: HarborProxySubscription, index: Int) -> some View {
         let selected = groupID == item.id
-        let hovered = hoveredSubscriptionID == item.id
         let tint = subscriptionTints[index % subscriptionTints.count]
-        let members = proxy.nodes.filter { $0.subscriptionID == item.id }
-        let count = members.count
-        let usable = members.filter { proxy.probeResults[$0.id]?.succeeded == true }.count
+        let count = catalog.subscriptionCounts[item.id, default: 0]
+        let usable = catalog.subscriptionUsableCounts[item.id, default: 0]
 
         // One full-width clickable surface. The count belongs inside the
         // Button's hit area, so hover, selection and press never stop halfway.
@@ -842,9 +960,12 @@ struct HarborProxyWorkspaceView: View {
             .padding(.horizontal, 10)
             .frame(maxWidth: .infinity, minHeight: 61)
             .contentShape(RoundedRectangle(cornerRadius: 9))
-            .background(selected ? HarborColors.blue.opacity(0.085)
-                : (hovered ? HarborColors.blue.opacity(0.055) : .clear),
-                in: RoundedRectangle(cornerRadius: 9))
+            .modifier(HarborStableHoverBackground(
+                baseColor: selected ? HarborColors.blue.opacity(0.085) : .clear,
+                highlightedColor: selected ? HarborColors.blue.opacity(0.085)
+                    : HarborColors.blue.opacity(0.055),
+                cornerRadius: 9
+            ))
             .overlay(alignment: .leading) {
                 if selected {
                     Capsule().fill(HarborColors.blue)
@@ -853,10 +974,6 @@ struct HarborProxyWorkspaceView: View {
             }
         }
         .buttonStyle(.plain)
-        .onHover { hovering in
-            if hovering { hoveredSubscriptionID = item.id }
-            else if hoveredSubscriptionID == item.id { hoveredSubscriptionID = nil }
-        }
         .contextMenu {
             Button("编辑订阅") { beginEditingSubscription(item) }
                 .disabled(proxy.busy || proxy.latencyTesting)
@@ -873,7 +990,7 @@ struct HarborProxyWorkspaceView: View {
             HStack(spacing: 5) {
                 ForEach(availableCategories, id: \.self) { choice in
                     let count = choice == .all ? sourceGroupNodes.count
-                        : sourceGroupNodes.filter { categoryOf($0) == choice }.count
+                        : catalog.categoryCounts[choice, default: 0]
                     Button {
                         category = choice
                     } label: {
@@ -897,7 +1014,7 @@ struct HarborProxyWorkspaceView: View {
             }
             .padding(.horizontal, 10)
         }
-        .scrollIndicators(.hidden)
+        .scrollIndicators(.never)
         .frame(height: 34)
     }
 
@@ -926,7 +1043,7 @@ struct HarborProxyWorkspaceView: View {
                     let selected = region == name
                     let count = name == "全部"
                         ? categoryNodes.count
-                        : categoryNodes.filter { location(of: $0) == name }.count
+                        : catalog.regionCounts[name, default: 0]
                     Button { region = name } label: {
                         HStack(spacing: 5) {
                             if name != "全部" {
@@ -958,8 +1075,8 @@ struct HarborProxyWorkspaceView: View {
             .padding(.horizontal, 10)
             .background(HarborHorizontalWheelBridge())
         }
-        .scrollIndicators(.hidden)
-        .help("在地区栏上滚动鼠标滚轮，可查看更多地区")
+        .scrollIndicators(.never)
+        .help("在地区栏内使用滚轮横向浏览，或用触控板左右滑动")
         .frame(minWidth: 0, maxWidth: .infinity)
     }
 
@@ -1110,7 +1227,13 @@ struct HarborProxyWorkspaceView: View {
     /// supported window height; there is no outer page scrolling.
     private func nodeTable(compact: Bool, showRegion: Bool, narrow: Bool,
                            compactActions: Bool) -> some View {
-        VStack(spacing: 0) {
+        // Snapshot filtering and latency sorting once per render, not again
+        // for each pagination label, row and empty-state check.
+        let filteredNodes = shownNodes
+        let lastPage = max(1, (filteredNodes.count + pageSize - 1) / pageSize)
+        let selectedPage = min(max(1, page), lastPage)
+        let pageNodes = Array(filteredNodes.dropFirst((selectedPage - 1) * pageSize).prefix(pageSize))
+        return VStack(spacing: 0) {
             if availableCategories.count > 2 { categoryBar }
             regionBar(narrow: narrow, compactActions: compactActions)
             Rectangle().fill(HarborColors.cardBorder).frame(height: 1)
@@ -1179,7 +1302,7 @@ struct HarborProxyWorkspaceView: View {
 
             GeometryReader { available in
                 ScrollView(.vertical) {
-                if visibleNodes.isEmpty {
+                if pageNodes.isEmpty {
                     VStack(spacing: 9) {
                         Image(systemName: "line.3.horizontal.decrease.circle")
                             .font(.system(size: 24, weight: .ultraLight))
@@ -1209,13 +1332,13 @@ struct HarborProxyWorkspaceView: View {
                     let cellHeight = max(88, min(128,
                         (available.size.height - 18 - CGFloat(max(0, rowCount - 1)) * 8) / CGFloat(rowCount)))
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 9), count: columnCount), spacing: 8) {
-                        ForEach(visibleNodes) { node in gridCard(node).frame(height: cellHeight) }
+                        ForEach(pageNodes) { node in gridCard(node).frame(height: cellHeight) }
                     }
                     .padding(9)
                     .frame(maxWidth: .infinity, minHeight: available.size.height, alignment: .top)
                 } else {
                     LazyVStack(spacing: 2) {
-                        ForEach(visibleNodes) { node in
+                        ForEach(pageNodes) { node in
                             row(node, compact: compact, showRegion: showRegion)
                         }
                     }
@@ -1223,7 +1346,7 @@ struct HarborProxyWorkspaceView: View {
                     .padding(.vertical, 5)
                 }
                 }
-                .scrollIndicators(.automatic)
+                .scrollIndicators(.never)
             }
             .frame(minHeight: 0, maxHeight: .infinity)
 
@@ -1239,7 +1362,7 @@ struct HarborProxyWorkspaceView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            pagination
+            pagination(totalCount: filteredNodes.count, currentPage: selectedPage, maxPage: lastPage)
                 .fixedSize(horizontal: false, vertical: true)
                 .layoutPriority(2)
         }
@@ -1257,7 +1380,7 @@ struct HarborProxyWorkspaceView: View {
         let previewed = previewNodeID == node.id
         let rowBackground: Color = connected ? HarborColors.green.opacity(0.105)
             : ((active || connecting) ? HarborColors.orange.opacity(0.07)
-               : ((previewed || hoveredNodeID == node.id) ? HarborColors.blue.opacity(0.055) : .clear))
+               : (previewed ? HarborColors.blue.opacity(0.055) : .clear))
         let rowStroke: Color = connected ? HarborColors.green.opacity(0.34)
             : ((active || connecting) ? HarborColors.orange.opacity(0.24)
                : (previewed ? HarborColors.blue.opacity(0.28) : .clear))
@@ -1404,11 +1527,12 @@ struct HarborProxyWorkspaceView: View {
         }
         .padding(.horizontal, 8)
         .contentShape(RoundedRectangle(cornerRadius: 8))
-        .background(rowBackground, in: RoundedRectangle(cornerRadius: 8))
-        .onHover { hovering in
-            if hovering { hoveredNodeID = node.id }
-            else if hoveredNodeID == node.id { hoveredNodeID = nil }
-        }
+        .modifier(HarborStableHoverBackground(
+            baseColor: rowBackground,
+            highlightedColor: connected || active || connecting || previewed
+                ? rowBackground : HarborColors.blue.opacity(0.055),
+            cornerRadius: 8
+        ))
         .overlay(alignment: .bottom) {
             Rectangle().fill(HarborColors.cardBorder.opacity(0.6))
                 .frame(height: 0.5)
@@ -1436,8 +1560,7 @@ struct HarborProxyWorkspaceView: View {
         let previewed = previewNodeID == node.id
         let cardBackground: Color = connected ? HarborColors.green.opacity(0.105)
             : ((active || connecting) ? HarborColors.orange.opacity(0.07)
-               : ((previewed || hoveredNodeID == node.id)
-                  ? HarborColors.blue.opacity(0.055) : Color.primary.opacity(0.018)))
+               : (previewed ? HarborColors.blue.opacity(0.055) : Color.primary.opacity(0.018)))
         let cardStroke: Color = connected ? HarborColors.green.opacity(0.36)
             : ((active || connecting) ? HarborColors.orange.opacity(0.25)
                : (previewed ? HarborColors.blue.opacity(0.28) : HarborColors.cardBorder))
@@ -1536,7 +1659,12 @@ struct HarborProxyWorkspaceView: View {
         }
         .padding(.trailing, 8)
         .contentShape(RoundedRectangle(cornerRadius: 10))
-        .background(cardBackground, in: RoundedRectangle(cornerRadius: 10))
+        .modifier(HarborStableHoverBackground(
+            baseColor: cardBackground,
+            highlightedColor: connected || active || connecting || previewed
+                ? cardBackground : HarborColors.blue.opacity(0.055),
+            cornerRadius: 10
+        ))
         .overlay(RoundedRectangle(cornerRadius: 10)
             .stroke(cardStroke))
         .overlay(alignment: .leading) {
@@ -1547,10 +1675,6 @@ struct HarborProxyWorkspaceView: View {
         .contextMenu { nodeNameActions(node) }
         .help("单击选择，点击“使用”连接：\(node.displayName)；右键可重命名")
         .accessibilityAddTraits(connected ? .isSelected : [])
-        .onHover { hovering in
-            if hovering { hoveredNodeID = node.id }
-            else if hoveredNodeID == node.id { hoveredNodeID = nil }
-        }
     }
 
     @ViewBuilder
@@ -1571,9 +1695,9 @@ struct HarborProxyWorkspaceView: View {
         }
     }
 
-    private var pagination: some View {
+    private func pagination(totalCount: Int, currentPage: Int, maxPage: Int) -> some View {
         HStack(spacing: 4) {
-            Text("共 \(shownNodes.count) 条")
+            Text("共 \(totalCount) 条")
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
             Spacer(minLength: 0)
@@ -1588,9 +1712,12 @@ struct HarborProxyWorkspaceView: View {
                         Text("\(value)")
                             .font(.system(size: 10, weight: value == currentPage ? .semibold : .medium))
                             .foregroundStyle(value == currentPage ? Color.white : Color.primary)
-                            .frame(width: 27, height: 27)
+                            .frame(width: 34, height: 32)
                             .background(value == currentPage ? HarborColors.blue : .clear,
                                         in: RoundedRectangle(cornerRadius: 7))
+                            // Hit testing covers the whole cell, including the
+                            // empty space around the single-digit label.
+                            .contentShape(RoundedRectangle(cornerRadius: 7))
                     }
                     .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue))
                 }
@@ -1616,22 +1743,12 @@ struct HarborProxyWorkspaceView: View {
         }
     }
 
-    private var pageChoices: [Int] {
-        if maxPage <= 5 { return Array(1...maxPage) }
-        let middle = min(max(2, currentPage), maxPage - 1)
-        var values = [1]
-        if middle > 2 { values.append(0) }
-        if middle != 1 && middle != maxPage { values.append(middle) }
-        if middle < maxPage - 1 { values.append(0) }
-        values.append(maxPage)
-        return values
-    }
-
     private func pageButton(_ icon: String, to index: Int) -> some View {
         Button { page = index } label: {
             Image(systemName: icon)
                 .font(.system(size: 10))
-                .frame(width: 24, height: 27)
+                .frame(width: 34, height: 32)
+                .contentShape(RoundedRectangle(cornerRadius: 7))
         }
         .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue))
     }
@@ -2114,41 +2231,99 @@ struct HarborProxyWorkspaceView: View {
 
 }
 
-/// SwiftUI's hidden indicator can still leave a visible NSScroller when the
-/// macOS preference is "Always". Keep the horizontal content scrollable and
-/// translate vertical wheel motion only while the pointer is over this bar.
+/// Limit pointer highlight invalidations to the individual row or card.
+/// A workspace-level @State hover ID causes all node filters and sorters to
+/// recompute on every enter/leave while the user scrolls.
+private struct HarborStableHoverBackground: ViewModifier {
+    let baseColor: Color
+    let highlightedColor: Color
+    let cornerRadius: CGFloat
+
+    @State private var hovering = false
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                hovering ? highlightedColor : baseColor,
+                in: RoundedRectangle(cornerRadius: cornerRadius)
+            )
+            .onHover { isInside in
+                if hovering != isInside { hovering = isInside }
+            }
+    }
+}
+
+/// No scrolling timer, SwiftUI animation or window-wide wheel interception.
+/// The single local wheel listener only exists while the pointer is within
+/// the region strip. Native horizontal gestures continue through unchanged.
 private struct HarborHorizontalWheelBridge: NSViewRepresentable {
     func makeNSView(context: Context) -> WheelView { WheelView() }
-    func updateNSView(_ nsView: WheelView, context: Context) { nsView.hideScroller() }
+
+    func updateNSView(_ nsView: WheelView, context: Context) {
+        nsView.hideScroller()
+    }
 
     final class WheelView: NSView {
         nonisolated(unsafe) private var monitor: Any?
+        private var wheelTrackingArea: NSTrackingArea?
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
-            guard window != nil else { return }
+            if window == nil { stopMonitoring() }
             hideScroller()
+        }
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let wheelTrackingArea { removeTrackingArea(wheelTrackingArea) }
+            let area = NSTrackingArea(
+                rect: .zero,
+                options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+                owner: self,
+                userInfo: nil
+            )
+            addTrackingArea(area)
+            wheelTrackingArea = area
+        }
+
+        override func mouseEntered(with event: NSEvent) {
+            super.mouseEntered(with: event)
+            guard monitor == nil else { return }
             monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-                guard let self, let scroll = enclosingScrollView,
-                      event.window === window,
+                guard let self, let scroll = self.enclosingScrollView,
+                      event.window === self.window,
                       abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX),
                       let document = scroll.documentView else { return event }
+
                 let clip = scroll.contentView
                 let point = clip.convert(event.locationInWindow, from: nil)
                 guard clip.bounds.contains(point) else { return event }
+
                 let maxX = max(0, document.frame.width - clip.bounds.width)
-                let step: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 20
-                let nextX = min(maxX, max(0, clip.bounds.origin.x - event.scrollingDeltaY * step))
+                guard maxX > 0 else { return event }
+                let delta = event.hasPreciseScrollingDeltas
+                    ? event.scrollingDeltaY : event.scrollingDeltaY * 20
+                let nextX = min(maxX, max(0, clip.bounds.origin.x - delta))
                 guard nextX != clip.bounds.origin.x else { return event }
+
                 clip.scroll(to: NSPoint(x: nextX, y: clip.bounds.origin.y))
                 scroll.reflectScrolledClipView(clip)
                 return nil
             }
         }
 
+        override func mouseExited(with event: NSEvent) {
+            super.mouseExited(with: event)
+            stopMonitoring()
+        }
+
         func hideScroller() {
-            enclosingScrollView?.hasHorizontalScroller = false
+            guard let scroll = enclosingScrollView, scroll.hasHorizontalScroller else { return }
+            scroll.hasHorizontalScroller = false
+        }
+
+        private func stopMonitoring() {
+            if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
         }
 
         deinit {

@@ -11,8 +11,6 @@ struct HarborLocalAccessView: View {
     @State private var selectedMode: BridgeTransportMode = .secureTunnel
     @State private var deletionTarget: BridgeTransportMode?
     @State private var copiedHTTPSAddress = false
-    @State private var lastManualCheckAt: Date?
-    @State private var expandedDiagnosticID: String?
     @State private var operation: ConnectionOperationContext?
     @State private var testFeedback: ConnectionTestFeedback?
     @State private var showCloseConfirmation = false
@@ -20,16 +18,18 @@ struct HarborLocalAccessView: View {
     var body: some View {
         ZStack {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 18) {
                     headerSection
-                    connectionPathCard
-                    allowedRootsSection
+                    connectionOverview
+                    actionBar
                     transportSection
+                    allowedRootsSection
                 }
-                    .frame(maxWidth: .infinity)
-                .padding(.horizontal, 26)
-                .padding(.top, 24)
-                .padding(.bottom, 24)
+                .frame(maxWidth: 1240, alignment: .topLeading)
+                .padding(.horizontal, 28)
+                .padding(.top, 25)
+                .padding(.bottom, 32)
+                .frame(maxWidth: .infinity, alignment: .top)
             }
             .scrollIndicators(.automatic)
 
@@ -43,9 +43,7 @@ struct HarborLocalAccessView: View {
                 ConnectionOperationModal(
                     operation: operation,
                     onDismissFailure: {
-                        withAnimation(.easeOut(duration: 0.16)) {
-                            self.operation = nil
-                        }
+                        self.operation = nil
                     }
                 )
                 .zIndex(2)
@@ -56,12 +54,10 @@ struct HarborLocalAccessView: View {
                 ConnectionTestToast(feedback: testFeedback)
                     .padding(.top, 78)
                     .padding(.trailing, 28)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+
                     .zIndex(3)
             }
         }
-        .animation(.easeOut(duration: 0.22), value: operation != nil)
-        .animation(.easeOut(duration: 0.18), value: testFeedback)
         .onAppear {
             selectedMode = bridge.configuration.transportMode
         }
@@ -103,31 +99,143 @@ struct HarborLocalAccessView: View {
     }
 
     private var headerSection: some View {
-        // Prefer a single row, but let controls wrap into two compact rows
-        // before the window becomes too narrow to show every action.
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .center, spacing: 12) {
-                headerHeading
-                Spacer(minLength: 8)
-                headerControls
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("ChatGPT 接入").font(.system(size: 23, weight: .semibold))
+                Text("管理接入服务、连接方式与授权目录")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
             }
-            VStack(alignment: .leading, spacing: 10) {
-                headerHeading
-                headerControls
-            }
+            Spacer(minLength: 8)
+            HarborStatusBadge(
+                title: bridge.agentRunning ? (bridge.overallReady ? "连接正常" : "等待连接") : "未启动",
+                color: bridge.overallReady ? HarborColors.green : HarborColors.orange,
+                pulses: false
+            )
         }
-        .frame(minHeight: 46)
+        .frame(minHeight: 48)
     }
 
-    private var headerHeading: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("ChatGPT 接入")
-                .font(.system(size: 22, weight: .bold, design: .rounded))
-            Text("查看真实链路状态，管理授权目录与连接方式。")
-                .font(.system(size: 10.5))
+    private var connectionOverview: some View {
+        let running = bridge.agentRunning || bridge.runtime.agent == .starting
+        let ready = running && bridge.overallReady
+        let locked = operation != nil || bridge.isWorking ||
+            bridge.isSwitchingTransport || bridge.isDiagnosing
+
+        return VStack(alignment: .leading, spacing: 17) {
+            HStack(alignment: .center, spacing: 15) {
+                Image(systemName: ready ? "checkmark.shield.fill" : "network")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(ready ? HarborColors.green : HarborColors.blue)
+                    .frame(width: 52, height: 52)
+                    .background(
+                        (ready ? HarborColors.green : HarborColors.blue).opacity(0.075),
+                        in: RoundedRectangle(cornerRadius: 12)
+                    )
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(ready ? "服务已就绪" : (running ? "正在建立连接" : "服务尚未启动"))
+                        .font(.system(size: 16, weight: .semibold))
+                    Text(running
+                        ? "正在使用 \(bridge.configuration.transportMode.displayName)"
+                        : "选择连接方式并启动，向 ChatGPT 提供本地工具")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 12)
+
+                // The existing configuration action lives here instead of
+                // competing with routine controls in the toolbar.
+                chatGPTSettingsButton(enabled: !locked)
+            }
+
+            Divider().opacity(0.48)
+
+            HStack(spacing: 18) {
+                overviewState(
+                    "本地 Agent",
+                    title: bridge.runtime.agent == .running ? "运行中" :
+                        (bridge.runtime.agent == .starting ? "启动中" : "未运行"),
+                    ready: bridge.runtime.agent == .running
+                )
+                overviewState(
+                    "MCP 服务",
+                    title: bridge.runtime.mcp == .ready ? "已就绪" :
+                        (bridge.runtime.mcp == .starting ? "启动中" : "未就绪"),
+                    ready: bridge.runtime.mcp == .ready
+                )
+                overviewState(
+                    "连接通道",
+                    title: bridge.runtime.tunnel == .connected ? "已连接" :
+                        (bridge.runtime.tunnel == .connecting ? "连接中" : "未连接"),
+                    ready: bridge.runtime.tunnel == .connected
+                )
+
+                Spacer(minLength: 0)
+
+                overviewMetric("授权目录", "\(bridge.configuration.allowedRoots.count)")
+                overviewMetric("工具数量", bridge.runtime.toolCatalogCount.map(String.init) ?? "—")
+            }
+        }
+        .padding(19)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            HarborColors.cardBackground,
+            in: RoundedRectangle(cornerRadius: 12)
+        )
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(HarborColors.cardBorder))
+    }
+
+    private func overviewState(_ label: String, title: String, ready: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(label)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(ready ? HarborColors.green : HarborColors.orange)
+                    .frame(width: 6, height: 6)
+                Text(title)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+            }
+        }
+        .frame(minWidth: 86, alignment: .leading)
+    }
+
+    private func overviewMetric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .trailing, spacing: 5) {
+            Text(value)
+                .font(.system(size: 17, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+            Text(title)
+                .font(.system(size: 10))
                 .foregroundStyle(.secondary)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .frame(minWidth: 54, alignment: .trailing)
+    }
+
+    private var actionBar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) {
+                Label("连接控制", systemImage: "slider.horizontal.3")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer(minLength: 0)
+                headerControls
+            }
+            VStack(alignment: .leading, spacing: 12) {
+                Label("连接控制", systemImage: "slider.horizontal.3")
+                    .font(.system(size: 12, weight: .semibold))
+                headerControls
+            }
+        }
+        .padding(.horizontal, 17)
+        .padding(.vertical, 13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(HarborColors.cardBackground, in: RoundedRectangle(cornerRadius: 11))
+        .overlay(RoundedRectangle(cornerRadius: 11).stroke(HarborColors.cardBorder))
     }
 
     private var headerControls: some View {
@@ -141,34 +249,16 @@ struct HarborLocalAccessView: View {
         let canSwitch = serviceRunning && !selectedIsActive && selectedIsConfigured && hasRoots
         let canToggleService = serviceRunning || (selectedIsConfigured && hasRoots)
         let targetName = selectedMode == .secureTunnel ? "本地管道" : "公网 HTTPS"
-        let statusTitle = serviceRunning
-            ? (bridge.overallReady ? "服务运行中" : "服务连接中")
-            : "服务已关闭"
-        let statusColor = serviceRunning
-            ? (bridge.overallReady ? HarborColors.green : HarborColors.orange)
-            : Color.secondary
-
         return ViewThatFits(in: .horizontal) {
             HStack(spacing: 7) {
-                HarborStatusBadge(
-                    title: statusTitle,
-                    color: statusColor,
-                    pulses: serviceRunning && bridge.overallReady
-                )
                 serviceToggleButton(serviceRunning: serviceRunning, enabled: canToggleService && !busy)
                 detectButton(enabled: canDetect && !busy)
                 reconnectButton(enabled: canReconnect && !busy)
                 switchButton(targetName: targetName, enabled: canSwitch && !busy,
                              isCurrent: selectedIsActive, configured: selectedIsConfigured)
-                chatGPTSettingsButton(enabled: !busy)
             }
-            VStack(alignment: .trailing, spacing: 7) {
+            VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 7) {
-                    HarborStatusBadge(
-                        title: statusTitle,
-                        color: statusColor,
-                        pulses: serviceRunning && bridge.overallReady
-                    )
                     serviceToggleButton(serviceRunning: serviceRunning, enabled: canToggleService && !busy)
                     detectButton(enabled: canDetect && !busy)
                     reconnectButton(enabled: canReconnect && !busy)
@@ -176,8 +266,7 @@ struct HarborLocalAccessView: View {
                 HStack(spacing: 7) {
                     switchButton(targetName: targetName, enabled: canSwitch && !busy,
                                  isCurrent: selectedIsActive, configured: selectedIsConfigured)
-                    chatGPTSettingsButton(enabled: !busy)
-                }
+                    }
             }
         }
     }
@@ -343,214 +432,18 @@ struct HarborLocalAccessView: View {
 
     private var transportSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text("连接方式")
                     .font(.system(size: 14, weight: .semibold))
-                Text("点击卡片只选择要操作的方式；“配置”按钮才会打开对应配置弹窗。")
-                    .font(.system(size: 9.5))
+                Text("选择连接方式；配置和删除操作位于对应卡片中。")
+                    .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }
 
-            HStack(spacing: 12) {
+            HStack(alignment: .top, spacing: 14) {
                 transportCard(.secureTunnel)
                 transportCard(.httpsCompatibility)
             }
-        }
-    }
-
-    private var connectionPathCard: some View {
-        let serviceRunning = bridge.agentRunning || bridge.runtime.agent == .starting
-        let mode = serviceRunning
-            ? bridge.configuration.transportMode
-            : selectedMode
-        let diagnostics = bridge.runtime.pipelineDiagnostics
-        let nodes = diagnostics.nodes
-        let failedNode = nodes.first { $0.state == .failed }
-        let recoveryNode = nodes.first { $0.state == .recovering || $0.state == .connecting }
-        let chatGPTNode = diagnostics.node("chatgpt-mcp")
-        let endpointReady = diagnostics.node("openai-tunnel")?.state == .ready
-        let chatGPTWaiting = serviceRunning && endpointReady && chatGPTNode?.state == .waiting
-
-        return HarborCard(padding: 16) {
-            VStack(alignment: .leading, spacing: 15) {
-                HStack(alignment: .center, spacing: 10) {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(mode == .secureTunnel ? "本地管道" : "公网 HTTPS")
-                            .font(.system(size: 14, weight: .semibold))
-
-                        Text(
-                            serviceRunning
-                                ? "按本机服务到 ChatGPT 的真实连接顺序展示。"
-                                : "启动后将在这里显示实时连接过程。"
-                        )
-                        .font(.system(size: 9.5))
-                        .foregroundStyle(.secondary)
-                    }
-
-                    Spacer()
-
-                    if let lastManualCheckAt {
-                        Text("最近检测 \(lastManualCheckAt, style: .relative)")
-                            .font(.system(size: 9.5, weight: .medium))
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Button(action: exportDiagnosticBundle) {
-                        if bridge.isExportingDiagnostics {
-                            ProgressView().controlSize(.mini)
-                        } else {
-                            Image(systemName: "square.and.arrow.up")
-                        }
-                    }
-                    .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-                    .disabled(bridge.isExportingDiagnostics)
-                    .help("导出脱敏诊断包")
-                }
-
-                Divider().opacity(0.32)
-
-                if !serviceRunning {
-                    HStack(spacing: 9) {
-                        Image(systemName: "pause.circle")
-                            .font(.system(size: 15))
-                            .foregroundStyle(.secondary)
-                        Text("服务已关闭，启动后显示真实链路诊断")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, minHeight: 88)
-                } else if nodes.isEmpty {
-                    let reading = bridge.isDiagnosing || bridge.runtime.agent == .starting
-                    HStack(spacing: 9) {
-                        if reading {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Image(systemName: "info.circle")
-                                .font(.system(size: 15))
-                                .foregroundStyle(.secondary)
-                        }
-                        Text(reading ? "正在读取链路诊断…" : "尚未获得链路诊断，请点击上方「检测」重试")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, minHeight: 88)
-                } else {
-                    HStack(spacing: 0) {
-                        ForEach(Array(nodes.enumerated()), id: \.element.id) { index, node in
-                            stage(node, icon: icon(for: node.id))
-
-                            if index < nodes.count - 1 {
-                                flowConnector(state: nodes[index + 1].state)
-                            }
-                        }
-                    }
-                    .frame(minHeight: 88)
-                }
-
-                if let expandedDiagnosticID,
-                   let node = diagnostics.node(expandedDiagnosticID) {
-                    diagnosticDetails(node)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                }
-
-                chainSummary(
-                    serviceRunning: serviceRunning,
-                    failedNode: failedNode,
-                    recoveryNode: recoveryNode,
-                    chatGPTWaiting: chatGPTWaiting
-                )
-            }
-            .animation(.easeOut(duration: 0.24), value: bridge.overallReady)
-            .animation(.easeOut(duration: 0.24), value: bridge.runtime.tunnel.rawValue)
-        }
-    }
-
-    private func exportDiagnosticBundle() {
-        let panel = NSSavePanel()
-        panel.canCreateDirectories = true
-        panel.nameFieldStringValue = "CodexHarbor-Diagnostics-\(Date().formatted(.iso8601.year().month().day())).zip"
-        panel.message = "导出脱敏诊断信息，不包含 Runtime Key、API Key 或访问令牌。"
-
-        guard panel.runModal() == .OK, var destination = panel.url else { return }
-        if destination.pathExtension.lowercased() != "zip" {
-            destination.appendPathExtension("zip")
-        }
-        Task {
-            await bridge.exportDiagnosticBundle(to: destination)
-        }
-    }
-
-    private func chainNotice(icon: String, color: Color, text: String) -> some View {
-        HStack(alignment: .top, spacing: 7) {
-            Image(systemName: icon)
-                .foregroundStyle(color)
-            Text(text)
-                .font(.system(size: 9.5, weight: .medium))
-                .foregroundStyle(Color.primary.opacity(0.72))
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(color.opacity(0.065), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .stroke(color.opacity(0.14), lineWidth: 1)
-        )
-        .frame(height: 40)
-    }
-
-    @ViewBuilder
-    private func chainSummary(
-        serviceRunning: Bool,
-        failedNode: BridgeNodeDiagnostic?,
-        recoveryNode: BridgeNodeDiagnostic?,
-        chatGPTWaiting: Bool
-    ) -> some View {
-        if let failedNode {
-            chainNotice(
-                icon: "exclamationmark.triangle.fill",
-                color: HarborColors.red,
-                text: "\(failedNode.title)：\(failedNode.message)"
-            )
-        } else if let recoveryNode {
-            chainNotice(
-                icon: "arrow.triangle.2.circlepath",
-                color: HarborColors.blue,
-                text: "\(recoveryNode.title)：\(recoveryNode.message)"
-            )
-        } else if serviceRunning && bridge.toolCatalogRefreshRequired,
-                  let warning = bridge.toolCatalogWarningText {
-            chainNotice(
-                icon: "arrow.triangle.2.circlepath.circle.fill",
-                color: HarborColors.orange,
-                text: warning
-            )
-        } else if chatGPTWaiting {
-            chainNotice(
-                icon: "clock.badge.questionmark",
-                color: HarborColors.orange,
-                text: "链路已经就绪，等待 ChatGPT MCP 首次调用。"
-            )
-        } else if serviceRunning,
-                  let warning = bridge.toolCatalogWarningText {
-            chainNotice(
-                icon: "questionmark.circle.fill",
-                color: HarborColors.orange,
-                text: warning
-            )
-        } else if serviceRunning {
-            chainNotice(
-                icon: "checkmark.circle.fill",
-                color: HarborColors.green,
-                text: "本地链路健康，所有可检测节点均已就绪。"
-            )
-        } else {
-            chainNotice(
-                icon: "pause.circle.fill",
-                color: .secondary,
-                text: "ChatGPT 接入当前已关闭。"
-            )
         }
     }
 
@@ -675,83 +568,6 @@ struct HarborLocalAccessView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private func stage(
-        _ node: BridgeNodeDiagnostic,
-        icon: String
-    ) -> some View {
-        Button {
-            withAnimation(.easeOut(duration: 0.2)) {
-                expandedDiagnosticID = expandedDiagnosticID == node.id ? nil : node.id
-            }
-        } label: {
-            HarborConnectionStage(
-                title: node.title,
-                icon: icon,
-                detail: node.message,
-                state: node.state
-            )
-        }
-        .buttonStyle(.plain)
-        .help("点击查看 \(node.title) 诊断详情")
-    }
-
-    private func flowConnector(state: BridgeNodeState) -> some View {
-        HarborAnimatedFlowConnector(
-            ready: state == .ready,
-            active: state == .connecting || state == .recovering,
-            failed: state == .failed
-        )
-        .frame(width: 52, height: 30)
-        .offset(y: -10)
-    }
-
-    private func icon(for id: String) -> String {
-        switch id {
-        case "agent": "cube.fill"
-        case "mcp": "desktopcomputer"
-        case "network-proxy": "network"
-        case "tunnel-client": "link"
-        case "openai-tunnel": "icloud.fill"
-        case "chatgpt-mcp": "circle.hexagongrid.fill"
-        default: "circle"
-        }
-    }
-
-    private func diagnosticDetails(_ node: BridgeNodeDiagnostic) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: icon(for: node.id))
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(node.state.harborColor)
-                .frame(width: 28, height: 28)
-                .background(node.state.harborColor.opacity(0.09), in: Circle())
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text("\(node.title) · \(node.state.displayTitle)")
-                    .font(.system(size: 10.5, weight: .semibold))
-                Text(node.details.isEmpty ? node.message : node.details.joined(separator: "  ·  "))
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-
-            Spacer(minLength: 8)
-
-            if let latency = node.latency {
-                Text("\(latency) ms")
-                    .font(.system(size: 9, weight: .medium).monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-            if let date = node.lastCheckAt {
-                Text(date, style: .relative)
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(node.state.harborColor.opacity(0.045), in: RoundedRectangle(cornerRadius: 9))
-    }
-
     private func beginConnectionTest() {
         guard operation == nil, !bridge.isDiagnosing else { return }
         testFeedback = ConnectionTestFeedback(
@@ -763,10 +579,8 @@ struct HarborLocalAccessView: View {
         Task { @MainActor in
             let startedAt = Date()
             await bridge.runPipelineDiagnostics()
-            lastManualCheckAt = Date()
 
             let duration = max(1, Int(Date().timeIntervalSince(startedAt) * 1_000))
-            // 检测期间链路图保持冻结；这里只使用检测完成后的最终完整结果。
             let failures = bridge.diagnosticResults.filter { $0.status == .failed }
             let warnings = bridge.diagnosticResults.filter { $0.status == .warning }
             if let failure = failures.first {
@@ -790,9 +604,7 @@ struct HarborLocalAccessView: View {
             }
 
             try? await Task.sleep(for: .seconds(2.2))
-            withAnimation(.easeOut(duration: 0.18)) {
-                testFeedback = nil
-            }
+            testFeedback = nil
         }
     }
 
@@ -991,9 +803,7 @@ struct HarborLocalAccessView: View {
         if let operationState {
             current.state = operationState
         }
-        withAnimation(.easeOut(duration: 0.18)) {
-            operation = current
-        }
+        operation = current
     }
 
     @MainActor
@@ -1003,9 +813,7 @@ struct HarborLocalAccessView: View {
         current.steps[step].state = .failed
         current.steps[step].detail = "失败"
         current.footer = message
-        withAnimation(.easeOut(duration: 0.18)) {
-            operation = current
-        }
+        operation = current
     }
 
     @MainActor
@@ -1013,13 +821,9 @@ struct HarborLocalAccessView: View {
         guard var current = operation else { return }
         current.state = .success
         current.footer = footer
-        withAnimation(.easeOut(duration: 0.18)) {
-            operation = current
-        }
+        operation = current
         try? await Task.sleep(for: .milliseconds(500))
-        withAnimation(.easeOut(duration: 0.18)) {
-            operation = nil
-        }
+        operation = nil
     }
 
     private func copyHTTPSAddress(_ url: URL) {

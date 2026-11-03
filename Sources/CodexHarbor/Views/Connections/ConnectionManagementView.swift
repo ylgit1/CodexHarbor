@@ -178,12 +178,10 @@ struct HarborConnectionManagementView: View {
         let collapsed = collapsedSections.contains(section)
 
         return Button {
-            withAnimation(reduceMotion ? .linear(duration: 0.01) : .easeInOut(duration: 0.18)) {
-                if collapsed {
-                    collapsedSections.remove(section)
-                } else {
-                    collapsedSections.insert(section)
-                }
+            if collapsed {
+                collapsedSections.remove(section)
+            } else {
+                collapsedSections.insert(section)
             }
         } label: {
             HStack(spacing: 7) {

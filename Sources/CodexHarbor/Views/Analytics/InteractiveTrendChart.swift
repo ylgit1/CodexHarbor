@@ -124,64 +124,8 @@ struct HarborInteractiveTrendChart: View {
                     )
                 )
             }
-            .chartOverlay { proxy in
-                GeometryReader { geometry in
-                    let plotFrame = proxy.plotFrame.map { geometry[$0] }
-
-                    ZStack(alignment: .topLeading) {
-                        Rectangle()
-                            .fill(Color.clear)
-                            .contentShape(Rectangle())
-                            .onContinuousHover { phase in
-                                guard let plotFrame else { return }
-                                switch phase {
-                                case let .active(location):
-                                    updateSelection(locationX: location.x, plotFrame: plotFrame)
-                                case .ended:
-                                    selectedIndex = nil
-                                }
-                            }
-                            .gesture(
-                                DragGesture(minimumDistance: 0)
-                                    .onChanged { value in
-                                        guard let plotFrame else { return }
-                                        updateSelection(locationX: value.location.x, plotFrame: plotFrame)
-                                    }
-                                    .onEnded { _ in
-                                        selectedIndex = nil
-                                    }
-                            )
-
-                        if let selectedIndex,
-                           let plotFrame,
-                           labels.indices.contains(selectedIndex) {
-                            let x = selectionX(index: selectedIndex, plotFrame: plotFrame)
-
-                            Rectangle()
-                                .fill(HarborColors.blue.opacity(0.24))
-                                .frame(width: 1, height: plotFrame.height)
-                                .offset(x: x, y: plotFrame.minY)
-                                .allowsHitTesting(false)
-
-                            selectionDots(index: selectedIndex, proxy: proxy, plotFrame: plotFrame)
-                                .allowsHitTesting(false)
-
-                            tooltip(index: selectedIndex)
-                                .fixedSize()
-                                .offset(
-                                    x: tooltipX(selectionX: x, plotFrame: plotFrame),
-                                    y: plotFrame.minY + 8
-                                )
-                                .allowsHitTesting(false)
-                        }
-                    }
-                }
-            }
             .frame(height: height)
-            .animation(
-                reduceMotion ? nil : .easeOut(duration: 0.16),
-                value: hiddenSeries
-            )
+
         }
     }
 
@@ -209,12 +153,10 @@ struct HarborInteractiveTrendChart: View {
         let hidden = hiddenSeries.contains(item.id)
 
         return Button {
-            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.16)) {
-                if hidden {
-                    hiddenSeries.remove(item.id)
-                } else if visibleSeries.count > 1 {
-                    hiddenSeries.insert(item.id)
-                }
+            if hidden {
+                hiddenSeries.remove(item.id)
+            } else if visibleSeries.count > 1 {
+                hiddenSeries.insert(item.id)
             }
         } label: {
             HStack(spacing: 5) {

@@ -4,7 +4,6 @@ struct HarborAccountSetupSheet: View {
     @ObservedObject var model: AppModel
     let onClose: () -> Void
 
-    @State private var pulse = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -71,10 +70,6 @@ struct HarborAccountSetupSheet: View {
         )
         .onAppear {
             model.resetAccountLoginFlow()
-            pulse = false
-            withAnimation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true)) {
-                pulse = true
-            }
         }
         .onExitCommand {
             close()
@@ -148,8 +143,7 @@ struct HarborAccountSetupSheet: View {
                         Circle()
                             .stroke(Color.accentColor.opacity(0.28), lineWidth: 2)
                             .frame(width: 30, height: 30)
-                            .scaleEffect(pulse ? 1.24 : 0.92)
-                            .opacity(pulse ? 0.15 : 0.75)
+                            .opacity(0.35)
                     }
 
                     Circle()

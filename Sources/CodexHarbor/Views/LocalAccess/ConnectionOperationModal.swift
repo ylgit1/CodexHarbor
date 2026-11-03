@@ -184,7 +184,7 @@ struct ConnectionOperationModal: View {
                 .frame(width: 88, alignment: .trailing)
         }
         .frame(height: 46)
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: step.state)
+
     }
 
     private var accentColor: Color {

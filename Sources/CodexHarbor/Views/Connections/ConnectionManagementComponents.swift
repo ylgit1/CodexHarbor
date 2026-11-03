@@ -101,11 +101,6 @@ struct HarborConnectionCatalogRow: View {
         .overlay(alignment: .bottom) {
             Divider().padding(.leading, 68)
         }
-        .offset(y: hovering && !active && !reduceMotion ? -0.5 : 0)
-        .animation(
-            reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.16),
-            value: hovering
-        )
         .onHover { hovering = $0 }
         .accessibilityIdentifier("connection-\(id.uuidString)")
     }

@@ -20,178 +20,54 @@ enum HarborRadius {
 }
 
 enum HarborColors {
-    // macOS resolves a dynamic NSColor when the app's appearance changes.
-    // Keep the restrained light-mode blue, but brighten the foreground tint
-    // on charcoal backgrounds so outline buttons remain easy to identify.
-    static let blue = Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
-        if appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
-            return NSColor(srgbRed: 0.43, green: 0.70, blue: 1.0, alpha: 1)
-        }
-        return NSColor(srgbRed: 0.105, green: 0.405, blue: 0.94, alpha: 1)
-    }))
-    static let green = Color(red: 0.095, green: 0.69, blue: 0.36)
-    static let purple = Color(red: 0.49, green: 0.29, blue: 0.90)
-    static let orange = Color(red: 0.98, green: 0.49, blue: 0.16)
-    static let red = Color(red: 0.93, green: 0.24, blue: 0.28)
+    static let blue = Color.accentColor
+    static let green = Color(nsColor: .systemGreen)
+    static let purple = Color(nsColor: .systemPurple)
+    static let orange = Color(nsColor: .systemOrange)
+    static let red = Color(nsColor: .systemRed)
     static let background = Color(nsColor: .windowBackgroundColor)
     static let sidebarBackground = Color(nsColor: .controlBackgroundColor)
     static let cardBackground = Color(nsColor: .textBackgroundColor)
-    static let cardBorder = Color.primary.opacity(0.075)
+    static let cardBorder = Color.primary.opacity(0.085)
 }
 
+/// Unified flat container. It never repaints for hover or starts animations.
 struct HarborCard<Content: View>: View {
     var padding: CGFloat = HarborSpacing.lg
     var interactive: Bool = true
     @ViewBuilder var content: Content
 
-    @State private var hovering = false
-
     var body: some View {
         content
             .padding(padding)
             .background(
-                ZStack {
-                    RoundedRectangle(cornerRadius: HarborRadius.card, style: .continuous)
-                        .fill(HarborColors.cardBackground)
-                    if interactive {
-                        RoundedRectangle(cornerRadius: HarborRadius.card, style: .continuous)
-                            .fill(
-                                LinearGradient(
-                                    colors: [
-                                        HarborColors.blue.opacity(hovering ? 0.045 : 0),
-                                        HarborColors.purple.opacity(hovering ? 0.018 : 0)
-                                    ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                    }
-                }
+                HarborColors.cardBackground,
+                in: RoundedRectangle(cornerRadius: 11, style: .continuous)
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: HarborRadius.card, style: .continuous)
-                    .stroke(
-                        interactive && hovering
-                            ? HarborColors.blue.opacity(0.18)
-                            : HarborColors.cardBorder,
-                        lineWidth: 1
-                    )
-            )
-            // Stable geometry while a card passes beneath the mouse on scroll:
-            // no hover scaling, shifting, animated shadows or layout changes.
-            .shadow(color: .black.opacity(0.025), radius: 7, y: 2)
-            .onHover { isOver in
-                let next = interactive && isOver
-                if hovering != next { hovering = next }
+            .overlay {
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .stroke(HarborColors.cardBorder, lineWidth: 1)
             }
     }
 }
 
+/// Statuses are static. Live values still update when their model changes.
 struct HarborStatusBadge: View {
     let title: String
     let color: Color
     var pulses: Bool? = nil
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.scenePhase) private var scenePhase
-
-    private var shouldPulse: Bool {
-        if let pulses { return pulses }
-        return title.contains("当前使用")
-            || title == "已连接"
-            || title == "运行中"
-            || title == "连接中"
-    }
-
     var body: some View {
-        HStack(spacing: 5) {
-            ZStack {
-                if shouldPulse && !reduceMotion {
-                    // Core Animation handles this perpetual pulse in the
-                    // compositor, without invalidating SwiftUI layout frames.
-                    HarborCompositedPulseRing(color: color, active: scenePhase == .active)
-                        .frame(width: 10, height: 10)
-                }
-                Circle()
-                    .fill(color)
-                    .frame(width: 6, height: 6)
-            }
-            .frame(width: 10, height: 10)
-
-            Text(title)
+        HStack(spacing: 6) {
+            Circle().fill(color).frame(width: 6, height: 6)
+            Text(title).lineLimit(1)
         }
-        .font(.system(size: 10, weight: .semibold))
-        .foregroundStyle(color)
-        .padding(.horizontal, 7)
-        .frame(height: 21)
-        .background(
-            LinearGradient(
-                colors: [color.opacity(0.12), color.opacity(0.065)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            ),
-            in: Capsule()
-        )
-        .overlay(Capsule().stroke(color.opacity(0.10)))
+        .font(.system(size: 10, weight: .medium))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 9)
+        .frame(height: 25)
+        .background(Color.primary.opacity(0.035), in: Capsule())
         .accessibilityElement(children: .combine)
-    }
-}
-
-/// A compositor-driven 10-point pulse. Never schedules a SwiftUI timeline or
-/// an infinite SwiftUI state animation for a static status badge.
-private struct HarborCompositedPulseRing: NSViewRepresentable {
-    let color: Color
-    let active: Bool
-
-    func makeNSView(context: Context) -> HarborPulseLayerView {
-        HarborPulseLayerView(frame: NSRect(x: 0, y: 0, width: 10, height: 10))
-    }
-
-    func updateNSView(_ nsView: HarborPulseLayerView, context: Context) {
-        nsView.update(color: NSColor(color), active: active)
-    }
-}
-
-private final class HarborPulseLayerView: NSView {
-    private let ring = CAShapeLayer()
-    private var isAnimating = false
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        ring.frame = CGRect(x: 0, y: 0, width: 10, height: 10)
-        ring.path = CGPath(ellipseIn: CGRect(x: 1, y: 1, width: 8, height: 8), transform: nil)
-        ring.fillColor = NSColor.clear.cgColor
-        ring.lineWidth = 1.5
-        ring.opacity = 0
-        layer?.addSublayer(ring)
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("HarborPulseLayerView is created programmatically")
-    }
-
-    func update(color: NSColor, active: Bool) {
-        ring.strokeColor = color.withAlphaComponent(0.30).cgColor
-        guard active != isAnimating else { return }
-        isAnimating = active
-        ring.removeAnimation(forKey: "harborPulse")
-        guard active else { return }
-
-        let scale = CABasicAnimation(keyPath: "transform.scale")
-        scale.fromValue = 0.7
-        scale.toValue = 1.7
-        let fade = CABasicAnimation(keyPath: "opacity")
-        fade.fromValue = 0.7
-        fade.toValue = 0
-        let animation = CAAnimationGroup()
-        animation.animations = [scale, fade]
-        animation.duration = 1.45
-        // Preserve the connected-state breathing indicator. Core Animation
-        // composites it without driving SwiftUI's view/layout update loop.
-        animation.repeatCount = .infinity
-        animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        ring.add(animation, forKey: "harborPulse")
     }
 }
 
@@ -217,70 +93,26 @@ private struct HarborActionButtonBody: View {
     let configuration: ButtonStyle.Configuration
     let tint: Color
     let prominence: HarborActionButtonStyle.Prominence
-
-    @State private var hovering = false
     @Environment(\.isEnabled) private var enabled
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         configuration.label
-            .font(.system(size: 11, weight: prominence == .prominent ? .semibold : .medium))
-            .foregroundStyle(foregroundColor)
-            .padding(.horizontal, prominence == .prominent ? 13 : 11)
-            .frame(minHeight: prominence == .prominent ? 34 : 32)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(prominence == .prominent ? Color.white : tint)
+            .padding(.horizontal, 12)
+            .frame(minHeight: 32)
             .background(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(backgroundColor)
+                prominence == .prominent ? tint : Color.primary.opacity(0.035),
+                in: RoundedRectangle(cornerRadius: 8)
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .stroke(borderColor, lineWidth: 1)
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .scaleEffect(
-                reduceMotion || !enabled
-                    ? 1
-                    : (configuration.isPressed ? 0.982 : 1)
-            )
-            .opacity(enabled ? 1 : 0.62)
-            .animation(
-                reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.14),
-                value: hovering
-            )
-            .animation(
-                reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.09),
-                value: configuration.isPressed
-            )
-            .onHover { hovering = enabled && $0 }
-    }
-
-    private var backgroundColor: Color {
-        guard enabled else { return tint.opacity(0.055) }
-        if configuration.isPressed {
-            return prominence == .prominent ? tint.opacity(0.84) : tint.opacity(0.15)
-        }
-        if hovering {
-            return tint.opacity(0.16)
-        }
-        return .clear
-    }
-
-    private var borderColor: Color {
-        guard enabled else { return tint.opacity(0.10) }
-        if configuration.isPressed {
-            return tint.opacity(prominence == .prominent ? 0.88 : 0.34)
-        }
-        if hovering {
-            return tint.opacity(prominence == .prominent ? 0.72 : 0.26)
-        }
-        return prominence == .prominent
-            ? tint.opacity(0.90)
-            : tint.opacity(0.16)
-    }
-
-    private var foregroundColor: Color {
-        guard enabled else { return tint.opacity(0.64) }
-        return tint
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(
+                        prominence == .prominent ? Color.clear : HarborColors.cardBorder,
+                        lineWidth: 1
+                    )
+            }
+            .opacity(enabled ? (configuration.isPressed ? 0.76 : 1) : 0.42)
     }
 }
 
@@ -301,75 +133,37 @@ private struct HarborInteractivePlainButtonBody: View {
     let configuration: ButtonStyle.Configuration
     let tint: Color
     let cornerRadius: CGFloat
-
-    @State private var hovering = false
     @Environment(\.isEnabled) private var enabled
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         configuration.label
             .background(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(
-                        tint.opacity(
-                            !enabled
-                                ? 0
-                                : (configuration.isPressed ? 0.10 : (hovering ? 0.055 : 0))
-                        )
-                    )
+                configuration.isPressed ? tint.opacity(0.09) : Color.clear,
+                in: RoundedRectangle(cornerRadius: cornerRadius)
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(
-                        tint.opacity(hovering && enabled ? 0.16 : 0),
-                        lineWidth: 1
-                    )
-            )
-            .scaleEffect(
-                reduceMotion || !enabled
-                    ? 1
-                    : (configuration.isPressed ? 0.988 : 1)
-            )
-            .opacity(enabled ? 1 : 0.40)
-            .animation(
-                reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.15),
-                value: hovering
-            )
-            .animation(
-                reduceMotion ? .linear(duration: 0.01) : .easeOut(duration: 0.10),
-                value: configuration.isPressed
-            )
-            .onHover { hovering = enabled && $0 }
+            .opacity(enabled ? 1 : 0.42)
     }
 }
 
 struct HarborSegmentControl<Value: Hashable>: View {
     let options: [(Value, String)]
     @Binding var selection: Value
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Namespace private var namespace
 
     var body: some View {
         HStack(spacing: 2) {
             ForEach(options.indices, id: \.self) { index in
                 let option = options[index]
                 Button {
-                    withAnimation(reduceMotion ? .linear(duration: 0.01) : .spring(response: 0.25, dampingFraction: 0.86)) {
-                        selection = option.0
-                    }
+                    selection = option.0
                 } label: {
                     Text(option.1)
                         .font(.system(size: 11, weight: selection == option.0 ? .semibold : .medium))
-                        .foregroundStyle(selection == option.0 ? HarborColors.blue : Color.secondary)
-                        .frame(minWidth: 48, maxWidth: .infinity, minHeight: 27)
-                        .background {
-                            if selection == option.0 {
-                                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                    .fill(HarborColors.cardBackground)
-                                    .shadow(color: .black.opacity(0.055), radius: 2, y: 1)
-                                    .matchedGeometryEffect(id: "segment", in: namespace)
-                            }
-                        }
+                        .foregroundStyle(selection == option.0 ? Color.primary : Color.secondary)
+                        .frame(minWidth: 48, maxWidth: .infinity, minHeight: 28)
+                        .background(
+                            selection == option.0 ? HarborColors.cardBackground : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 7)
+                        )
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -377,7 +171,7 @@ struct HarborSegmentControl<Value: Hashable>: View {
             }
         }
         .padding(3)
-        .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-        .frame(height: 32)
+        .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 9))
+        .frame(height: 34)
     }
 }

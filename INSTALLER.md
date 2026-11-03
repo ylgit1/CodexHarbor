@@ -1,21 +1,12 @@
-# Codex Harbor installers
+# Codex Harbor v0.1.27
 
-Current release: `v0.1.26` (Apple Silicon / arm64)
+Apple Silicon (arm64), macOS 14 or newer.
 
-- Source commit: `458f118ad1c452d9b79eaa05ccba3abba3a7e903`
-- Versioned installer: `v0.1.26/Codex-Harbor-v0.1.26-arm64.dmg`
-- Latest installer: `latest/Codex-Harbor-arm64.dmg`
-- SHA-256: `4a2a2536a7083dc109979032ca51d15c8761dbf8b5ea4d26c5babb5cdbacebbd`
+- Source commit: a2f35f190fc45a63fa9ef1bc5ccba6d0071295b1
+- Verified SHA-256: ba92ae9447ca54234e084e15465fd907bd1e871e15a3d2dc888cd12bae5f15f2
+- Versioned DMG: v0.1.27/Codex-Harbor-v0.1.27-arm64.dmg
+- Latest DMG: latest/Codex-Harbor-arm64.dmg
 
-Download:
-- GitHub: https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg
-- Gitee: https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg
-
-This release adds the active proxy node connection type and built-in browser
-OAuth login without an external Codex CLI. All 230 tests passed. The DMG was
-mounted and its drag-install copy, signatures, app version and source revision
-were verified before publication.
-
-Requires Apple Silicon and macOS 14 or newer. Xray, Mihomo and their required
-resources are bundled. The app uses ad-hoc signing and is not Apple-notarized.
-First launch on another Mac may require approval in Privacy & Security.
+This release updates the Quiet Native macOS interface, ChatGPT connection
+status, proxy scrolling, pagination and scrollbar behavior.
+The app includes Xray/Mihomo and is ad-hoc signed, not Apple-notarized.

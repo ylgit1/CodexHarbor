@@ -31,6 +31,8 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/codexharbor-source"
+          mkdir -p .build
+          swift test --parallel
           ./Scripts/build-app.sh fast --no-install
           ./Scripts/create-dmg.sh
           ./Scripts/verify-dmg.sh dist/Codex-Harbor-v0.1.27-arm64.dmg

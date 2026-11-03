@@ -4,5 +4,7 @@
   "localVerifiedDMGSHA256": "f0d695e0fb99052552059011af2d84250ae827c2e36fcc941bddfbd2e4c3ca4b",
   "localVerifiedDMGSize": 49873860,
   "publishGitHubRelease": true,
-  "buildOnGitHubMacOS": true
+  "buildOnGitHubMacOS": true,
+  "publishAttempt": 2,
+  "validation": "Run Swift Testing on GitHub macOS runner; initialize clean .build directory"
 }

@@ -7,35 +7,83 @@ permissions:
   contents: write
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: macos-15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
         with:
           ref: release-assets
           fetch-depth: 1
-      - name: Mirror verified source commit to GitHub main
+      - name: Fetch and mirror the exact v0.1.27 source
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=2 https://gitee.com/yangxiaoyong01/CodexHarbor.git main:refs/remotes/gitee/main
-          test "$(git rev-parse refs/remotes/gitee/main)" = "a2f35f190fc45a63fa9ef1bc5ccba6d0071295b1"
+          SOURCE=a2f35f190fc45a63fa9ef1bc5ccba6d0071295b1
+          git fetch --no-tags --depth=2 https://gitee.com/yangxiaoyong01/CodexHarbor.git             main:refs/remotes/gitee/main tag v0.1.27
+          test "$(git rev-parse refs/remotes/gitee/main)" = "$SOURCE"
+          test "$(git rev-parse refs/tags/v0.1.27^{commit})" = "$SOURCE"
           git push origin refs/remotes/gitee/main:refs/heads/main
-      - name: Reassemble and verify the tested installer
+          git worktree add --detach "$RUNNER_TEMP/codexharbor-source" "$SOURCE"
+      - name: Build and verify the arm64 app and DMG
+        shell: bash
+        env:
+          CODEX_HARBOR_BUILD_JOBS: "4"
         run: |
-          git fetch origin publish/v0.1.27:refs/remotes/origin/publish/v0.1.27
-          git show origin/publish/v0.1.27:release-upload/publish.py > /tmp/publish-installer.py
-          python3 /tmp/publish-installer.py
-      - name: Publish latest and versioned downloads
+          set -euo pipefail
+          cd "$RUNNER_TEMP/codexharbor-source"
+          ./Scripts/build-app.sh fast --no-install
+          ./Scripts/create-dmg.sh
+          ./Scripts/verify-dmg.sh dist/Codex-Harbor-v0.1.27-arm64.dmg
+          test "$(plutil -extract HarborGitCommit raw -o - 'dist/Codex Harbor.app/Contents/Info.plist')" = "a2f35f190fc4"
+          cp dist/Codex-Harbor-v0.1.27-arm64.dmg "$GITHUB_WORKSPACE/v0.1.27-installer.dmg"
+      - name: Update latest and versioned GitHub downloads
+        shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p latest v0.1.27
+          cp v0.1.27-installer.dmg v0.1.27/Codex-Harbor-v0.1.27-arm64.dmg
+          cp v0.1.27-installer.dmg latest/Codex-Harbor-arm64.dmg
+          SHA="$(shasum -a 256 v0.1.27-installer.dmg | awk '{print $1}')"
+          SIZE="$(stat -f '%z' v0.1.27-installer.dmg)"
+          printf '%s  Codex-Harbor-v0.1.27-arm64.dmg\n' "$SHA" > v0.1.27/SHA256SUMS
+          {
+            printf '%s  latest/Codex-Harbor-arm64.dmg\n' "$SHA"
+            grep -v '  latest/Codex-Harbor-arm64.dmg' SHA256SUMS |
+              grep -v '  v0.1.27/Codex-Harbor-v0.1.27-arm64.dmg' || true
+            printf '%s  v0.1.27/Codex-Harbor-v0.1.27-arm64.dmg\n' "$SHA"
+          } > SHA256SUMS.new
+          mv SHA256SUMS.new SHA256SUMS
+          printf '{ "version": "0.1.27", "sourceCommit": "a2f35f190fc45a63fa9ef1bc5ccba6d0071295b1", "sha256": "%s", "size": %s, "architecture": "arm64", "notarized": false }\n' "$SHA" "$SIZE" > latest/build-info.json
+          cat > INSTALLER.md <<EOF
+          # Codex Harbor v0.1.27
+
+          Apple Silicon (arm64), macOS 14 or newer.
+
+          - Source commit: a2f35f190fc45a63fa9ef1bc5ccba6d0071295b1
+          - Verified SHA-256: $SHA
+          - Versioned DMG: v0.1.27/Codex-Harbor-v0.1.27-arm64.dmg
+          - Latest DMG: latest/Codex-Harbor-arm64.dmg
+
+          This release updates the Quiet Native macOS interface, ChatGPT connection
+          status, proxy scrolling, pagination and scrollbar behavior.
+          The app includes Xray/Mihomo and is ad-hoc signed, not Apple-notarized.
+          EOF
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add latest v0.1.27 SHA256SUMS INSTALLER.md
-          git diff --cached --quiet && exit 0
-          git commit -m 'release: publish v0.1.27 arm64 installer'
-          git push origin HEAD:release-assets
-      - name: Publish GitHub release
+          git diff --cached --quiet || {
+            git commit -m 'release: publish v0.1.27 arm64 installer'
+            git push origin HEAD:refs/heads/release-assets
+          }
+      - name: Publish GitHub Release as latest
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          if gh release view v0.1.27 >/dev/null 2>&1; then exit 0; fi
-          gh release create v0.1.27 v0.1.27/Codex-Harbor-v0.1.27-arm64.dmg --target a2f35f190fc45a63fa9ef1bc5ccba6d0071295b1 --title 'Codex Harbor v0.1.27' --notes-file INSTALLER.md --latest
+          set -euo pipefail
+          if gh release view v0.1.27 >/dev/null 2>&1; then
+            gh release upload v0.1.27 v0.1.27/Codex-Harbor-v0.1.27-arm64.dmg v0.1.27/SHA256SUMS --clobber
+            gh release edit v0.1.27 --latest
+          else
+            gh release create v0.1.27               v0.1.27/Codex-Harbor-v0.1.27-arm64.dmg v0.1.27/SHA256SUMS               --target a2f35f190fc45a63fa9ef1bc5ccba6d0071295b1               --title 'Codex Harbor v0.1.27' --notes-file INSTALLER.md --latest
+          fi

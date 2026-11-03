@@ -1,7 +1,8 @@
 {
-  "version": "0.1.26",
-  "giteeCommit": "1eead3590ff6ccd971443e97f66c7bb3ee21cfda",
-  "size": 49616542,
-  "sha256": "4a2a2536a7083dc109979032ca51d15c8761dbf8b5ea4d26c5babb5cdbacebbd",
-  "publishGitHubRelease": true
+  "version": "0.1.27",
+  "giteeSourceCommit": "a2f35f190fc45a63fa9ef1bc5ccba6d0071295b1",
+  "localVerifiedDMGSHA256": "f0d695e0fb99052552059011af2d84250ae827c2e36fcc941bddfbd2e4c3ca4b",
+  "localVerifiedDMGSize": 49873860,
+  "publishGitHubRelease": true,
+  "buildOnGitHubMacOS": true
 }

@@ -1,15 +1,13 @@
 {
-  "version": "0.1.29",
-  "giteeSourceCommit": "61fbc78cbcb27a2577ee59a1efe864a5e640e4f8",
+  "version": "0.1.30",
+  "giteeSourceCommit": "25c0f7e63b97aa3e5bd9037f49566fdc742eee97",
   "buildOnGitHubMacOS": true,
   "publishGitHubRelease": true,
-  "validation": "Swift Testing; verify-probe-stop.sh process SIGKILL and active process isolation; Release app; signed DMG install",
+  "validation": "Swift Testing; probe-stop process termination regression; Release build; DMG mount and drag-install",
   "fixes": [
-    "Stop kills owned curl Xray Mihomo child processes",
-    "Partial results retained; untested and unidentified nodes labeled",
-    "GeoIP async curl cancellation propagated and cleanup bounded",
-    "SOCKS preflight connect timeout bounded"
-  ],
-  "publishAttempt": 2,
-  "retryNote": "Retry Gitee source fetch after RPC early EOF"
+    "VPN Gate published country used in auto names when egress GeoIP unavailable",
+    "Actual verified exit country overrides source",
+    "Backup IP echo over isolated SOCKS and independent observed-IP geolocation",
+    "VPN Gate region labels distinguish source from observed exit"
+  ]
 }

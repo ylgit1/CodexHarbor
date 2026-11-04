@@ -1,12 +1,12 @@
-# Codex Harbor v0.1.28
+# Codex Harbor v0.1.29
 
 Apple Silicon (arm64), macOS 14 or newer.
 
-- Source commit: b59517dda3fe7f36507b4c6f0132b09a804cd880
-- Verified SHA-256: b5665e881595c1140bda32b384426edd242b8abe64476d565380fc944f4238da
-- Versioned DMG: v0.1.28/Codex-Harbor-v0.1.28-arm64.dmg
+- Source commit: 61fbc78cbcb27a2577ee59a1efe864a5e640e4f8
+- Verified SHA-256: 33776f02e12a555cfce1fdbb67bc3c6dd918a7a2fc263036ee83bef106e7e290
+- Versioned DMG: v0.1.29/Codex-Harbor-v0.1.29-arm64.dmg
 - Latest DMG: latest/Codex-Harbor-arm64.dmg
 
-This release updates the Quiet Native macOS interface, ChatGPT connection
-status, proxy scrolling, pagination and scrollbar behavior.
+This hotfix cancels real curl/Xray/Mihomo test processes with bounded SIGKILL,
+preserves completed measurements, and marks unfinished GeoIP/probe nodes unknown.
 The app includes Xray/Mihomo and is ad-hoc signed, not Apple-notarized.

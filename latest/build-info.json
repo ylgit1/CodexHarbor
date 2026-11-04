@@ -1,1 +1,1 @@
-{ "version": "0.1.28", "sourceCommit": "b59517dda3fe7f36507b4c6f0132b09a804cd880", "sha256": "b5665e881595c1140bda32b384426edd242b8abe64476d565380fc944f4238da", "size": 50064821, "architecture": "arm64", "notarized": false }
+{ "version": "0.1.29", "sourceCommit": "61fbc78cbcb27a2577ee59a1efe864a5e640e4f8", "sha256": "33776f02e12a555cfce1fdbb67bc3c6dd918a7a2fc263036ee83bef106e7e290", "size": 49389171, "architecture": "arm64", "notarized": false }

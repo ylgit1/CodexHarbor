@@ -151,6 +151,7 @@ struct HarborProxyWorkspaceView: View {
         let evidence = proxy.nodeNetworkEvidence
         let serverLocations = proxy.nodeServerLocations
         let exitLocations = proxy.nodeExitLocations
+        let unknownExits = proxy.exitGeoUnrecognizedIDs
         let query = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
         var snapshot = CatalogPresentation.empty
 
@@ -204,7 +205,9 @@ struct HarborProxyWorkspaceView: View {
                 for: node, resolvedServerIP: server?.ip
             )
             let location: String
-            if node.protocolName == "openvpn" {
+            if unknownExits.contains(node.id) {
+                location = "未识别"
+            } else if node.protocolName == "openvpn" {
                 location = exit?.displayRegion ??
                     HarborProxyIPLocation(ip: node.host, countryCode: node.path).displayRegion
             } else if snapshot.categoryByID[node.id] == .residential {
@@ -274,6 +277,7 @@ struct HarborProxyWorkspaceView: View {
         .onReceive(proxy.$probeResults) { _ in scheduleCatalogRefresh() }
         .onReceive(proxy.$nodeServerLocations) { _ in scheduleCatalogRefresh() }
         .onReceive(proxy.$nodeExitLocations) { _ in scheduleCatalogRefresh() }
+        .onReceive(proxy.$exitGeoUnrecognizedIDs) { _ in scheduleCatalogRefresh() }
         .onReceive(proxy.$nodeNetworkEvidence) { _ in scheduleCatalogRefresh() }
     }
 
@@ -1138,20 +1142,28 @@ struct HarborProxyWorkspaceView: View {
             .help("通过当前实际 SOCKS5 出口检查 YouTube 和 ChatGPT 的 HTTPS 返回码；不切换节点")
 
             Button {
-                proxy.refreshExitLocations(for: sourceGroupNodes.map(\.id))
+                if proxy.exitGeoUpdating {
+                    proxy.cancelExitGeoRefresh()
+                } else {
+                    proxy.refreshExitLocations(for: sourceGroupNodes.map(\.id))
+                }
             } label: {
                 Label(proxy.exitGeoUpdating
-                      ? "识别 \(proxy.exitGeoCompleted)/\(proxy.exitGeoTotal)"
-                      : (compact ? "出口地区" : "更新出口地区"), systemImage: "globe.americas")
+                      ? "停止识别 \(proxy.exitGeoCompleted)/\(proxy.exitGeoTotal)"
+                      : (compact ? "出口地区" : "更新出口地区"),
+                      systemImage: proxy.exitGeoUpdating ? "stop.circle" : "globe.americas")
                     .font(.system(size: 10.5, weight: .medium))
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
             }
             .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-            .disabled(sourceGroupNodes.isEmpty || proxy.busy || proxy.latencyTesting
-                      || proxy.exitGeoUpdating
-                      || !sourceGroupNodes.allSatisfy({ proxy.supportsCore(for: $0) }))
-            .help("独立检测普通网站看到的出口 IP，并更新节点地区与自动名称；不重新测速")
+            .disabled(!proxy.exitGeoUpdating && (
+                sourceGroupNodes.isEmpty || proxy.busy || proxy.latencyTesting
+                || !sourceGroupNodes.allSatisfy({ proxy.supportsCore(for: $0) })
+            ))
+            .help(proxy.exitGeoUpdating
+                  ? "立即停止本次出口地区识别；未完成节点标记为未识别"
+                  : "独立检测真实出口 IP；最多等待 75 秒，超时标记为未识别")
 
             if narrow { Spacer(minLength: 6) }
 
@@ -1875,6 +1887,7 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func location(of node: HarborProxyNode) -> String {
+        if proxy.exitGeoUnrecognizedIDs.contains(node.id) { return "未识别" }
         if node.protocolName == "openvpn" {
             return proxy.exitLocation(for: node)?.displayRegion
                 ?? HarborProxyIPLocation(ip: node.host, countryCode: node.path).displayRegion
@@ -1888,6 +1901,7 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func locationLabel(of node: HarborProxyNode) -> String {
+        if proxy.exitGeoUnrecognizedIDs.contains(node.id) { return "未识别" }
         let region = location(of: node)
         if node.protocolName == "openvpn", proxy.exitLocation(for: node) == nil {
             return region + "·来源"
@@ -1898,6 +1912,9 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func regionHint(_ node: HarborProxyNode) -> String {
+        if proxy.exitGeoUnrecognizedIDs.contains(node.id) {
+            return "实际出口地区未识别（请求超时或识别失败）；可手动重新识别"
+        }
         if let exit = proxy.exitLocation(for: node) {
             return "普通网站检测到的出口 IP：\(exit.ip) · 优先显示出口地区"
         }
@@ -2109,7 +2126,12 @@ struct HarborProxyWorkspaceView: View {
                         do {
                             let changed = domains != proxy.forcedProxyDomains
                             try proxy.updateForcedProxyDomains(domains)
-                            let reconnectID = changed && proxy.running ? proxy.selectedID : nil
+                            // A running batch has its own rule snapshot.
+                            // Save immediately without forcing a node switch
+                            // while an isolated probe is still cleaning up.
+                            let reconnectID = changed && proxy.running &&
+                                !proxy.latencyTesting
+                                ? proxy.selectedID : nil
                             editor = nil
                             if let reconnectID {
                                 Task { await proxy.select(reconnectID) }
@@ -2122,7 +2144,7 @@ struct HarborProxyWorkspaceView: View {
                     }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(HarborActionButtonStyle(tint: .blue, prominence: .prominent))
-                    .disabled(proxy.busy || proxy.latencyTesting)
+                    .disabled(proxy.busy)
                 } else if mode != .importChoice {
                     Button {
                         if mode == .subscription {

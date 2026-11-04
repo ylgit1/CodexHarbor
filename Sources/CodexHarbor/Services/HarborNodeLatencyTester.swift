@@ -48,6 +48,40 @@ final class HarborLatencyCancellation: @unchecked Sendable {
     }
 }
 
+/// A failed OpenVPN handshake can leave Mihomo/Xray alive after SIGTERM.
+/// Never make a probe task wait indefinitely for a child process to exit.
+private enum HarborProbeProcessReaper {
+    /// Wait at most the curl limit plus a small grace period. Reading the
+    /// output pipe before the process exits can otherwise block indefinitely
+    /// even after the user presses Stop.
+    static func awaitExit(_ process: Process, timeout: TimeInterval,
+                          cancellation: HarborLatencyCancellation) {
+        let deadline = Date.now.addingTimeInterval(timeout)
+        while process.isRunning && !cancellation.isCancelled && Date.now < deadline {
+            Thread.sleep(forTimeInterval: 0.04)
+        }
+        stop(process)
+    }
+
+    static func stop(_ process: Process) {
+        guard process.processIdentifier > 0 else { return }
+        if process.isRunning { process.terminate() }
+        let graceDeadline = Date.now.addingTimeInterval(0.8)
+        while process.isRunning && Date.now < graceDeadline {
+            Thread.sleep(forTimeInterval: 0.04)
+        }
+        if process.isRunning {
+            _ = Darwin.kill(process.processIdentifier, SIGKILL)
+        }
+        let hardDeadline = Date.now.addingTimeInterval(1.2)
+        while process.isRunning && Date.now < hardDeadline {
+            Thread.sleep(forTimeInterval: 0.04)
+        }
+        // Do not call blocking waitUntilExit unless termination was observed.
+        if !process.isRunning { process.waitUntilExit() }
+    }
+}
+
 /// Safe summaries of probe failures, not raw Xray stderr or credentials.
 struct HarborNodeDelayReport: Sendable {
     let milliseconds: Int?
@@ -120,8 +154,7 @@ private final class HarborRealDelayAttempt: @unchecked Sendable {
         }
         if isCancelled, engine.isRunning { engine.terminate() }
         defer {
-            if engine.isRunning { engine.terminate() }
-            engine.waitUntilExit()
+            HarborProbeProcessReaper.stop(engine)
             clear(engine)
         }
 
@@ -309,8 +342,7 @@ final class HarborRealDelayBatch: @unchecked Sendable {
         stopped = true
         lock.unlock()
         cancellation.removeObserver(cancellationObserver)
-        if engine.isRunning { engine.terminate() }
-        if engine.processIdentifier != 0 { engine.waitUntilExit() }
+        HarborProbeProcessReaper.stop(engine)
         try? FileManager.default.removeItem(at: configPath)
         HarborNodeLatencyTester.releasePortRange(basePort, count: portsByNodeID.count)
     }
@@ -649,10 +681,7 @@ enum HarborMihomoLatencyTester {
         }) else { return nil }
         defer { cancellation.removeObserver(observer) }
         do { try engine.run() } catch { return nil }
-        defer {
-            if engine.isRunning { engine.terminate() }
-            engine.waitUntilExit()
-        }
+        defer { HarborProbeProcessReaper.stop(engine) }
         guard HarborNodeLatencyTester.waitUntilListening(
             port: port, process: engine, cancellation: cancellation),
               HarborNodeLatencyTester.waitUntilListening(
@@ -731,8 +760,9 @@ enum HarborMihomoLatencyTester {
             }) else { return nil as CurlResult? }
             defer { cancellation.removeObserver(observer) }
             do { try curl.run() } catch { return nil }
+            HarborProbeProcessReaper.awaitExit(
+                curl, timeout: TimeInterval(timeout) + 2, cancellation: cancellation)
             let bytes = output.fileHandleForReading.readDataToEndOfFile()
-            curl.waitUntilExit()
             guard !cancellation.isCancelled else { return nil }
             let parts = String(decoding: bytes, as: UTF8.self).split(separator: " ")
             let status = parts.first.flatMap { Int($0) } ?? 0

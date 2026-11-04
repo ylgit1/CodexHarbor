@@ -25,12 +25,12 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 
 - [最新 DMG · GitHub 公共下载（无需登录）](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg)
 - [最新 DMG · Gitee 下载（访问大文件可能需要登录）](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg)
-- [v0.1.27 固定版本 · GitHub](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/v0.1.27/Codex-Harbor-v0.1.27-arm64.dmg)
-- [v0.1.27 固定版本 · Gitee](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/v0.1.27/Codex-Harbor-v0.1.27-arm64.dmg)
+- [v0.1.28 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.28/Codex-Harbor-v0.1.28-arm64.dmg)
+- Gitee 的安装包镜像可能落后于 GitHub；新版本请优先使用 GitHub 公共下载。
 
-v0.1.27 DMG 可通过 [SHA-256 校验清单](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/SHA256SUMS) 核验下载完整性。
+v0.1.28 DMG 可通过 [SHA-256 校验清单](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/SHA256SUMS) 核验下载完整性。
 
-**v0.1.27 更新**：重构轻量原生 UI 与 ChatGPT 接入状态概览；移除持续动画及连接诊断大区块；网络代理列表通过目录快照及合并后台更新减少滚动时的重复计算；扩大分页按钮命中区域，地区与节点列表隐藏粗滚动条，地区栏滚轮仅在鼠标悬停时生效。保留原生滚动惯性、连接切换和 MCP 检测功能。
+**v0.1.28 更新**：修复网络代理自动触发 VPN Gate 批量测速、测速停止后卡在“停止中”、地区识别卡在最后一个节点的问题。停止测速立即清空当前批次，旧任务不能覆盖新结果；地区识别新增 75 秒整批截止时间、进程级超时、手动停止和“未识别”标识。保留 v0.1.27 的静态 UI、滚动、分页和 ChatGPT 接入优化。
 Gitee Raw 大文件可能要求登录，无法直接下载时可使用 GitHub 公共文件下载地址。
 要求 macOS 14 或更新版本及 Apple Silicon；Xray、`geoip.dat`、`geosite.dat`
 已内置，首次启动不需要下载代理内核。
@@ -415,7 +415,7 @@ Transport Installer 当前同时包含 Apple Silicon（arm64）与 Intel（x86_6
 
 ## 下载与安装
 
-从上方「下载安装」下载 v0.1.27 DMG，双击打开后将 `Codex Harbor.app` 拖入 `Applications`。Gitee Raw 大文件可能要求登录，无法直接下载时使用 GitHub 公共文件下载地址；安装前建议校验 SHA-256。当前安装包尚未经过 Apple 公证，其他 Mac 首次打开时可能需要在「系统设置 → 隐私与安全性」中手动允许。
+从上方「下载安装」下载 v0.1.28 DMG，双击打开后将 `Codex Harbor.app` 拖入 `Applications`。Gitee Raw 大文件可能要求登录，无法直接下载时使用 GitHub 公共文件下载地址；安装前建议校验 SHA-256。当前安装包尚未经过 Apple 公证，其他 Mac 首次打开时可能需要在「系统设置 → 隐私与安全性」中手动允许。
 
 构建脚本会优先沿用已安装 Agent 的签名证书，并自动识别有效的 **Apple Development / Developer ID Application** 证书或本机固定名称的自签名证书；`HarborChatGPTAgent` 使用 `com.codexharbor.agent` 代码签名标识。
 

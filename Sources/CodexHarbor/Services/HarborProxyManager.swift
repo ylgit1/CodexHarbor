@@ -234,6 +234,7 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var nodeNetworkEvidence: [String: HarborProxyNetworkEvidence] = [:]
     @Published private(set) var nodeExitLocations: [String: HarborProxyExitLocation] = [:]
     @Published private(set) var exitGeoUpdating = false
+    @Published private(set) var exitGeoUnrecognizedIDs: Set<String> = []
     @Published private(set) var exitGeoCompleted = 0
     @Published private(set) var exitGeoTotal = 0
     @Published private(set) var latencyTesting = false
@@ -243,7 +244,8 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var latencyTestingIDs: Set<String> = []
     @Published private(set) var latencyCompleted = 0
     @Published private(set) var latencyTotal = 0
-    private var latencyCancellationRequested = false
+    // A canceled batch must not update progress or clear a newer batch.
+    private var latencyBatchGeneration: UUID?
     private var latencyCancellation: HarborLatencyCancellation?
     @Published private(set) var subscriptionUpdatedAt: [String: Date] = [:]
     @Published var routingRules = true {
@@ -262,6 +264,11 @@ final class HarborProxyManager: ObservableObject {
     private var persistenceTask: Task<Void, Never>?
     private var geoRefreshTask: Task<Void, Never>?
     private var exitGeoTask: Task<Void, Never>?
+    private var exitGeoBatchGeneration: UUID?
+    private var exitGeoCancellation: HarborLatencyCancellation?
+    private var exitGeoManualGeneration: UUID?
+    private var exitGeoWatchdog: Task<Void, Never>?
+    private let exitGeoBatchDeadlineSeconds = 75
     private var exitGeoPendingIDs = Set<String>()
     private var exitGeoForcedIDs = Set<String>()
     private var exitGeoManualIDs = Set<String>()
@@ -877,7 +884,9 @@ final class HarborProxyManager: ObservableObject {
     }
 
     func updateForcedProxyDomains(_ domains: [String]) throws {
-        guard !busy, !latencyTesting else {
+        // Tests keep a snapshot of the routing rules, so editing the next
+        // connection's rules is safe even while a probe batch is winding down.
+        guard !busy else {
             throw HarborProxyError.invalid("代理正在执行其他操作，请稍后修改规则")
         }
         forcedProxyDomains = try HarborProxyDomainRules.normalized(domains)
@@ -1166,7 +1175,9 @@ final class HarborProxyManager: ObservableObject {
             if let updated = subscriptionUpdatedAt[subscription.id],
                Date.now.timeIntervalSince(updated) < 6 * 60 * 60 { continue }
             guard !busy, !latencyTesting else { return }
-            await refreshCommunitySubscription(subscription.id)
+            // Refresh feed metadata only. Never start a 24-node VPN Gate probe
+            // merely because the user opened the network proxy workspace.
+            await refreshSubscription(subscription.id)
         }
     }
 
@@ -1851,21 +1862,24 @@ final class HarborProxyManager: ObservableObject {
         let latencyUnderlayPort = containsOpenVPN ? workingUnderlaySocksPort : nil
         let openVPNRouteID = latencyUnderlayPort == nil ? "direct" : vpnGateProbeRouteID
 
+        let generation = UUID()
+        latencyBatchGeneration = generation
         latencyTesting = true
         latencyBatchIDs = Set(targets.map(\.id))
-        latencyCancellationRequested = false
         let cancellation = HarborLatencyCancellation()
         latencyCancellation = cancellation
         latencyCompleted = 0
         latencyTotal = targets.count
         var succeeded = 0
         defer {
-            latencyTesting = false
-            latencyBatchIDs = []
-            latencyCurrentID = nil
-            latencyTestingIDs = []
-            latencyCancellationRequested = false
-            latencyCancellation = nil
+            if latencyBatchGeneration == generation {
+                latencyBatchGeneration = nil
+                latencyTesting = false
+                latencyBatchIDs = []
+                latencyCurrentID = nil
+                latencyTestingIDs = []
+                latencyCancellation = nil
+            }
         }
         let latencyRoot = root
         let latencyRuleMode = routingRules
@@ -1875,11 +1889,16 @@ final class HarborProxyManager: ObservableObject {
         }.prefix(64))
         let reachableRelays = await HarborVPNGatePortScanner.reachableIDs(
             tcpRelays, socksPort: latencyUnderlayPort, cancellation: cancellation)
+        guard latencyBatchGeneration == generation, !cancellation.isCancelled else { return }
         let unreachableRelays = Set(tcpRelays.map(\.id)).subtracting(reachableRelays)
         let ordinaryTargets = targets.filter { $0.protocolName != "openvpn" }
         let sharedRealBatch = ordinaryTargets.isEmpty || cancellation.isCancelled ? nil
             : await HarborNodeLatencyTester.startRealBatch(
                 nodes: ordinaryTargets, root: latencyRoot, cancellation: cancellation)
+        guard latencyBatchGeneration == generation, !cancellation.isCancelled else {
+            if let sharedRealBatch { Task.detached(priority: .utility) { sharedRealBatch.close() } }
+            return
+        }
         // Keep one Xray for all nodes and bound only the HTTP probes. Refill
         // each free slot immediately, so a slow node cannot block the next wave.
         // Failed nodes are retried by a later user test, not immediately here.
@@ -1904,7 +1923,7 @@ final class HarborProxyManager: ObservableObject {
             return (node.id, report.milliseconds, report.failure,
                     node.protocolName == "openvpn" ? openVPNRouteID : nil)
         }
-        if !latencyCancellationRequested && !Task.isCancelled {
+        if latencyBatchGeneration == generation && !cancellation.isCancelled && !Task.isCancelled {
             let openVPNConcurrency = HarborProxyLatencyPolicy.openVPNParallelCount(
                 processors: ProcessInfo.processInfo.activeProcessorCount,
                 physicalMemory: ProcessInfo.processInfo.physicalMemory)
@@ -1922,7 +1941,7 @@ final class HarborProxyManager: ObservableObject {
                 }
                 latencyCurrentID = targets.first?.id
                 while let (id, result, failure, routeID) = await group.next() {
-                    guard !latencyCancellationRequested, !Task.isCancelled else {
+                    guard latencyBatchGeneration == generation, !cancellation.isCancelled, !Task.isCancelled else {
                         group.cancelAll()
                         break
                     }
@@ -1971,9 +1990,10 @@ final class HarborProxyManager: ObservableObject {
         if let sharedRealBatch {
             await Task.detached(priority: .utility) { sharedRealBatch.close() }.value
         }
+        guard latencyBatchGeneration == generation, !cancellation.isCancelled else { return }
         proxyAudit("real_probe_batch_done",
                    note: "tested=\(latencyCompleted) successes=\(succeeded)")
-        if !latencyCancellationRequested && !Task.isCancelled {
+        if !Task.isCancelled {
             if let finalization {
                 finalizeSubscriptionProbes(finalization)
             }
@@ -1987,12 +2007,12 @@ final class HarborProxyManager: ObservableObject {
         let confirmedUnavailable = targets.filter { node in
             probeResults[node.id]?.isConfirmedUnavailable == true
         }.count
-        detail = latencyCancellationRequested || Task.isCancelled
+        detail = Task.isCancelled
             ? "已停止测速，完成 \(latencyCompleted)/\(latencyTotal) 个节点"
             : "真实测速完成：可用 \(succeeded)，待复测 \(latencyCompleted - succeeded - confirmedUnavailable)，不可用 \(confirmedUnavailable)"
         if targets.count == 1,
            let reason = probeResults[targets[0].id]?.realFailureReason,
-           !latencyCancellationRequested {
+           !Task.isCancelled {
             detail += " · " + reason
         }
     }
@@ -2005,7 +2025,17 @@ final class HarborProxyManager: ObservableObject {
         let candidates = nodes.filter { requested.contains($0.id) }
         guard !candidates.isEmpty else { return }
         exitGeoManualIDs = Set(candidates.map(\.id))
+        exitGeoUnrecognizedIDs.subtract(exitGeoManualIDs)
         exitGeoForcedIDs.formUnion(exitGeoManualIDs)
+        let manualGeneration = UUID()
+        exitGeoManualGeneration = manualGeneration
+        exitGeoWatchdog?.cancel()
+        let timeoutSeconds = exitGeoBatchDeadlineSeconds
+        exitGeoWatchdog = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(timeoutSeconds)) }
+            catch { return }
+            self?.finishExitGeoRefreshEarly(generation: manualGeneration, reason: "超时")
+        }
         exitGeoUpdating = true
         exitGeoCompleted = 0
         exitGeoTotal = candidates.count
@@ -2033,13 +2063,17 @@ final class HarborProxyManager: ObservableObject {
             exitGeoPendingIDs.insert(current.id)
         }
         guard !exitGeoPendingIDs.isEmpty, exitGeoTask == nil, coreInstalled else { return }
+        let generation = UUID()
+        exitGeoBatchGeneration = generation
         exitGeoTask = Task(priority: .utility) { [weak self] in
-            await self?.runExitGeoQueue()
+            await self?.runExitGeoQueue(generation: generation)
         }
     }
 
-    private func runExitGeoQueue() async {
-        while !Task.isCancelled, !exitGeoPendingIDs.isEmpty {
+    /// A canceled or timed-out batch must not modify state owned by the next.
+    private func runExitGeoQueue(generation: UUID) async {
+        while !Task.isCancelled, exitGeoBatchGeneration == generation,
+              !exitGeoPendingIDs.isEmpty {
             let ids = exitGeoPendingIDs
             exitGeoPendingIDs.subtract(ids)
             let candidates = nodes.filter { ids.contains($0.id) }
@@ -2059,6 +2093,7 @@ final class HarborProxyManager: ObservableObject {
             guard !due.isEmpty else { continue }
             for node in due { exitGeoAttemptedAt[node.id] = now }
             let cancellation = HarborLatencyCancellation()
+            exitGeoCancellation = cancellation
             // A lone automatic refresh can reuse the active listener. Manual
             // batches always use isolated inbounds so node switches cannot
             // attribute an exit IP to the wrong profile.
@@ -2073,6 +2108,11 @@ final class HarborProxyManager: ObservableObject {
                 )
             } else {
                 batch = nil
+            }
+            guard exitGeoBatchGeneration == generation, !Task.isCancelled else {
+                cancellation.cancel()
+                if let batch { Task.detached(priority: .utility) { batch.close() } }
+                return
             }
             let geoRoot = root
             let inspect: @Sendable (HarborProxyNode) async
@@ -2095,7 +2135,11 @@ final class HarborProxyManager: ObservableObject {
                     group.addTask { await inspect(target) }
                 }
                 while let (target, observed) = await group.next() {
-                    guard !Task.isCancelled else { group.cancelAll(); break }
+                    guard exitGeoBatchGeneration == generation,
+                          !Task.isCancelled, !cancellation.isCancelled else {
+                        group.cancelAll()
+                        break
+                    }
                     if let index = queue.nextIndex() {
                         let next = due[index]
                         group.addTask { await inspect(next) }
@@ -2111,8 +2155,10 @@ final class HarborProxyManager: ObservableObject {
                     }
                     guard let observed else {
                         exitGeoFailureCounts[target.id, default: 0] += 1
+                        if manuallyRequested { exitGeoUnrecognizedIDs.insert(target.id) }
                         continue
                     }
+                    exitGeoUnrecognizedIDs.remove(target.id)
                     if manuallyRequested { exitGeoManualSucceeded += 1 }
                     exitGeoFailureCounts.removeValue(forKey: target.id)
                     exitGeoAttemptedAt.removeValue(forKey: target.id)
@@ -2126,19 +2172,65 @@ final class HarborProxyManager: ObservableObject {
                     persist()
                 }
             }
-            if Task.isCancelled { cancellation.cancel() }
+            if Task.isCancelled || exitGeoBatchGeneration != generation {
+                cancellation.cancel()
+            }
             if let batch {
                 await Task.detached(priority: .utility) { batch.close() }.value
             }
         }
+        guard exitGeoBatchGeneration == generation else { return }
+        exitGeoBatchGeneration = nil
+        exitGeoCancellation = nil
         exitGeoTask = nil
         if exitGeoUpdating {
+            // If a node was skipped or disappeared, count it as unresolved
+            // rather than leaving the UI in an unending "23/24" state.
+            exitGeoUnrecognizedIDs.formUnion(exitGeoManualIDs)
+            exitGeoCompleted = exitGeoTotal
+            exitGeoWatchdog?.cancel()
+            exitGeoWatchdog = nil
+            exitGeoManualGeneration = nil
             detail = "出口地区识别完成：确认 \(exitGeoManualSucceeded)/\(exitGeoTotal) 个；未确认的节点仍显示入口"
             exitGeoUpdating = false
             exitGeoManualIDs.removeAll()
             exitGeoForcedIDs.removeAll()
         }
         scheduleExitGeoRetry()
+    }
+
+    /// Called by the manual batch watchdog or the Stop button. This is a
+    /// presentation deadline, not a claim that a network request succeeded.
+    /// Remaining nodes are explicitly marked "未识别" and can be retried.
+    private func finishExitGeoRefreshEarly(generation: UUID, reason: String) {
+        guard exitGeoManualGeneration == generation, exitGeoUpdating else { return }
+        let unresolved = exitGeoManualIDs
+        exitGeoUnrecognizedIDs.formUnion(unresolved)
+        for id in unresolved {
+            exitGeoFailureCounts[id, default: 0] += 1
+        }
+        exitGeoForcedIDs.subtract(unresolved)
+        exitGeoPendingIDs.subtract(unresolved)
+        exitGeoManualIDs.removeAll()
+        exitGeoUpdating = false
+        exitGeoCompleted = exitGeoTotal
+        exitGeoManualGeneration = nil
+        exitGeoWatchdog?.cancel()
+        exitGeoWatchdog = nil
+        exitGeoBatchGeneration = nil
+        exitGeoTask?.cancel()
+        exitGeoTask = nil
+        if let cancellation = exitGeoCancellation {
+            Task.detached(priority: .utility) { cancellation.cancel() }
+        }
+        exitGeoCancellation = nil
+        let pendingCount = unresolved.count
+        detail = "出口地区识别\(reason)：确认 \(exitGeoManualSucceeded)/\(exitGeoTotal)；未识别 \(pendingCount)，可重新识别"
+    }
+
+    func cancelExitGeoRefresh() {
+        guard let generation = exitGeoManualGeneration else { return }
+        finishExitGeoRefreshEarly(generation: generation, reason: "已停止")
     }
 
     /// One sleeping task at most; retries only the currently connected exit,
@@ -2202,9 +2294,21 @@ final class HarborProxyManager: ObservableObject {
     }
 
     func cancelLatencyTests() {
-        latencyCancellationRequested = true
-        latencyCancellation?.cancel()
+        guard latencyTesting, let cancellation = latencyCancellation else { return }
+        let completed = latencyCompleted
+        let total = latencyTotal
+        // Detach the canceled batch from the view before terminating processes.
+        // Reaper tasks may finish later but cannot write into the new generation.
+        latencyBatchGeneration = nil
+        latencyCancellation = nil
+        latencyTesting = false
+        latencyBatchIDs = []
         latencyTestingIDs = []
+        latencyCurrentID = nil
+        latencyCompleted = 0
+        latencyTotal = 0
+        detail = "已停止测速（之前完成 \(completed)/\(total)）；可以重新测速"
+        Task.detached(priority: .utility) { cancellation.cancel() }
     }
 
     func enableSystemProxy(interactive: Bool = false) {

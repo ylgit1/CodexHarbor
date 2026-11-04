@@ -129,6 +129,9 @@ enum HarborNodeGeoIPResolver {
     }
 
     private static func exitDataViaCurl(socksPort: Int, url: URL) async -> Data? {
+        // Network --max-time does NOT cap waiting for a child process or pipe
+        // reader. Keep the whole process under a wall-clock deadline, and
+        // capture to a private file rather than a potentially stuck pipe.
         await Task.detached(priority: .utility) {
             let curl = Process()
             curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
@@ -137,13 +140,39 @@ enum HarborNodeGeoIPResolver {
                 "--proxy", "socks5h://127.0.0.1:\(socksPort)",
                 "--noproxy", "", "--url", url.absoluteString
             ]
-            let output = Pipe()
+            let outputURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("harbor-exit-\(UUID().uuidString).txt")
+            guard FileManager.default.createFile(
+                atPath: outputURL.path, contents: nil,
+                attributes: [.posixPermissions: 0o600]),
+                let output = try? FileHandle(forWritingTo: outputURL) else {
+                return nil as Data?
+            }
+            defer {
+                try? output.close()
+                try? FileManager.default.removeItem(at: outputURL)
+            }
             curl.standardOutput = output
             curl.standardError = FileHandle.nullDevice
-            guard (try? curl.run()) != nil else { return nil as Data? }
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            curl.waitUntilExit()
-            guard curl.terminationStatus == 0, data.count < 4_096 else { return nil }
+            guard (try? curl.run()) != nil else { return nil }
+            let deadline = Date.now.addingTimeInterval(9)
+            while curl.isRunning && Date.now < deadline {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            let exitedOnTime = !curl.isRunning
+            if !exitedOnTime {
+                curl.terminate()
+                let grace = Date.now.addingTimeInterval(0.35)
+                while curl.isRunning && Date.now < grace {
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                if curl.isRunning {
+                    _ = Darwin.kill(curl.processIdentifier, SIGKILL)
+                }
+            }
+            guard exitedOnTime, curl.terminationStatus == 0,
+                let data = try? Data(contentsOf: outputURL),
+                data.count < 4_096 else { return nil }
             return data
         }.value
     }

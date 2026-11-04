@@ -1,10 +1,12 @@
 {
-  "version": "0.1.27",
-  "giteeSourceCommit": "a2f35f190fc45a63fa9ef1bc5ccba6d0071295b1",
-  "localVerifiedDMGSHA256": "f0d695e0fb99052552059011af2d84250ae827c2e36fcc941bddfbd2e4c3ca4b",
-  "localVerifiedDMGSize": 49873860,
-  "publishGitHubRelease": true,
+  "version": "0.1.28",
+  "giteeSourceCommit": "b59517dda3fe7f36507b4c6f0132b09a804cd880",
   "buildOnGitHubMacOS": true,
-  "publishAttempt": 2,
-  "validation": "Run Swift Testing on GitHub macOS runner; initialize clean .build directory"
+  "publishGitHubRelease": true,
+  "validation": "Swift Testing, Release build, signed app, DMG mount and drag-install verification",
+  "fixes": [
+    "Stop latency test immediately with batch generation isolation",
+    "Bound exit geolocation batch to 75 seconds",
+    "Mark unresolved nodes and support Stop Recognition"
+  ]
 }

@@ -9,5 +9,7 @@
     "Partial results retained; untested and unidentified nodes labeled",
     "GeoIP async curl cancellation propagated and cleanup bounded",
     "SOCKS preflight connect timeout bounded"
-  ]
+  ],
+  "publishAttempt": 2,
+  "retryNote": "Retry Gitee source fetch after RPC early EOF"
 }

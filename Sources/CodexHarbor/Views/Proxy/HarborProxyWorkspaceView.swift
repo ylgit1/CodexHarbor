@@ -206,10 +206,11 @@ struct HarborProxyWorkspaceView: View {
             )
             let location: String
             if unknownExits.contains(node.id) {
-                location = "未识别"
+                location = HarborVPNGate.publisherLocation(for: node)?.displayRegion ?? "未识别"
             } else if node.protocolName == "openvpn" {
-                location = exit?.displayRegion ??
-                    HarborProxyIPLocation(ip: node.host, countryCode: node.path).displayRegion
+                location = exit?.displayRegion
+                    ?? HarborVPNGate.publisherLocation(for: node)?.displayRegion
+                    ?? HarborProxyAutomaticName.unresolvedRegion
             } else if snapshot.categoryByID[node.id] == .residential {
                 location = exit?.displayRegion ?? HarborProxyAutomaticName.unresolvedRegion
             } else {
@@ -1869,7 +1870,7 @@ struct HarborProxyWorkspaceView: View {
     private func regionFlag(_ node: HarborProxyNode) -> String {
         if node.protocolName == "openvpn" {
             return proxy.exitLocation(for: node)?.flag
-                ?? HarborProxyIPLocation(ip: node.host, countryCode: node.path).flag
+                ?? HarborVPNGate.publisherLocation(for: node)?.flag ?? "🌐"
         }
         if categoryOf(node) == .residential {
             return proxy.exitLocation(for: node)?.flag ?? "🌐"
@@ -1887,10 +1888,13 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func location(of node: HarborProxyNode) -> String {
-        if proxy.exitGeoUnrecognizedIDs.contains(node.id) { return "未识别" }
+        if proxy.exitGeoUnrecognizedIDs.contains(node.id) {
+            return HarborVPNGate.publisherLocation(for: node)?.displayRegion ?? "未识别"
+        }
         if node.protocolName == "openvpn" {
             return proxy.exitLocation(for: node)?.displayRegion
-                ?? HarborProxyIPLocation(ip: node.host, countryCode: node.path).displayRegion
+                ?? HarborVPNGate.publisherLocation(for: node)?.displayRegion
+                ?? HarborProxyAutomaticName.unresolvedRegion
         }
         if categoryOf(node) == .residential {
             return proxy.exitLocation(for: node)?.displayRegion
@@ -1901,9 +1905,12 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func locationLabel(of node: HarborProxyNode) -> String {
-        if proxy.exitGeoUnrecognizedIDs.contains(node.id) { return "未识别" }
+        let source = HarborVPNGate.publisherLocation(for: node)
+        if proxy.exitGeoUnrecognizedIDs.contains(node.id), source == nil {
+            return "未识别"
+        }
         let region = location(of: node)
-        if node.protocolName == "openvpn", proxy.exitLocation(for: node) == nil {
+        if source != nil, proxy.exitLocation(for: node) == nil {
             return region + "·来源"
         }
         guard region != HarborProxyAutomaticName.unresolvedRegion,
@@ -1913,13 +1920,16 @@ struct HarborProxyWorkspaceView: View {
 
     private func regionHint(_ node: HarborProxyNode) -> String {
         if proxy.exitGeoUnrecognizedIDs.contains(node.id) {
+            if let source = HarborVPNGate.publisherLocation(for: node) {
+                return "实际出口地区识别失败；当前显示 VPN Gate 发布的来源国家：\(source.displayRegion)，并非已验证出口。可重新识别"
+            }
             return "实际出口地区未识别（请求超时或识别失败）；可手动重新识别"
         }
         if let exit = proxy.exitLocation(for: node) {
             return "普通网站检测到的出口 IP：\(exit.ip) · 优先显示出口地区"
         }
-        if node.protocolName == "openvpn" {
-            return "VPN Gate 发布者报告的地区：\(location(of: node))；实际出口尚未确认"
+        if let source = HarborVPNGate.publisherLocation(for: node) {
+            return "VPN Gate 发布者报告的来源国家：\(source.displayRegion)；实际出口尚未确认"
         }
         if categoryOf(node) == .residential {
             return "住宅候选节点的实际出口尚未确认；识别前不按入口地区筛选"

@@ -5,6 +5,16 @@ import Foundation
 public enum HarborVPNGate {
     public static let feedURL = "https://www.vpngate.net/api/iphone/"
 
+    /// The CSV CountryShort is the publisher's *source* country, not proof
+    /// of the live VPN exit. Preserve it for labels when exit verification
+    /// fails; never present it as a measured egress country.
+    public static func publisherLocation(for node: HarborProxyNode) -> HarborProxyIPLocation? {
+        guard node.protocolName == "openvpn",
+              node.security.hasPrefix("vpngate-"),
+              let code = countryCode(node.path), code != "ZZ" else { return nil }
+        return HarborProxyIPLocation(ip: node.host, countryCode: code, locatedAt: nil)
+    }
+
     public static func unclassifiedVolunteerIPs(in nodes: [HarborProxyNode],
                                                 cached: Set<String>, limit: Int) -> [String] {
         guard limit > 0 else { return [] }

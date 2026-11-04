@@ -881,6 +881,38 @@ struct HarborNetworkProxyTests {
         #expect(HarborProxyIPLocation(ip: first.host, countryCode: "ZZ").flag == "🌐")
     }
 
+    @Test("VPN Gate publisher country remains visible before or after failed exit probing")
+    func vpnGatePublisherCountryFallback() {
+        let vpn = HarborProxyNode(
+            name: "JP relay", protocolName: "openvpn",
+            host: "93.184.216.34", port: 1194, credential: "profile",
+            network: "udp", security: "vpngate-unverified",
+            path: "JP", subscriptionID: "gate"
+        )
+        #expect(HarborVPNGate.publisherLocation(for: vpn)?.displayRegion == "日本")
+        let withoutExit = HarborProxyAutomaticName.refreshed(
+            [vpn], results: [:], locations: [:])
+        #expect(withoutExit[0].automaticName == "日本-OPENVPN-001")
+
+        let verifiedExit = HarborProxyAutomaticName.refreshed(
+            [vpn], results: [:], locations: [:],
+            exitLocationsByNodeID: [
+                vpn.id: HarborProxyIPLocation(ip: "8.8.8.8", countryCode: "US")
+            ])
+        #expect(verifiedExit[0].automaticName == "美国-OPENVPN-001")
+
+        let invalid = HarborProxyNode(
+            name: "Not Gate", protocolName: "openvpn",
+            host: "93.184.216.34", port: 1194,
+            credential: "profile", security: "custom", path: "JP",
+            subscriptionID: "other"
+        )
+        #expect(HarborVPNGate.publisherLocation(for: invalid) == nil)
+        #expect(HarborProxyAutomaticName.refreshed(
+            [invalid], results: [:], locations: [:])[0].automaticName
+            == "待识别-OPENVPN-001")
+    }
+
     @Test("Removed active subscription node stays selected until user switches")
     func retiredActiveSubscriptionNode() {
         let active = HarborProxyNode(id: "active", name: "old",

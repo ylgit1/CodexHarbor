@@ -104,17 +104,38 @@ enum HarborNodeGeoIPResolver {
         // Force SOCKS5 + remote DNS; URLSession on some macOS builds can
         // silently bypass its SOCKS proxy dictionary and report the host IP.
         // A failed proxy must return nil, never the machine's direct address.
-        guard let data = await exitDataViaCurl(
-                  socksPort: socksPort, url: url, cancellation: cancellation),
-              !Task.isCancelled, cancellation?.isCancelled != true, data.count < 128,
+        // VPN Gate relays may block one IP-echo provider while allowing
+        // another. Never substitute the host machine's IP: both requests must
+        // still go through this exact isolated SOCKS outbound.
+        var observedData = await exitDataViaCurl(
+            socksPort: socksPort, url: url, cancellation: cancellation)
+        if observedData == nil, !Task.isCancelled, cancellation?.isCancelled != true,
+           let fallbackURL = URL(string: "https://api.ipify.org/") {
+            observedData = await exitDataViaCurl(
+                socksPort: socksPort, url: fallbackURL, cancellation: cancellation)
+        }
+        guard let data = observedData, data.count < 128,
+              !Task.isCancelled, cancellation?.isCancelled != true,
               let observedIP = String(data: data, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
               let canonical = HarborIPAddress.normalizedLiteral(observedIP),
-              isPublic(canonical),
-              let code = await exitCountryCode(
-                  for: canonical, socksPort: socksPort, cancellation: cancellation) else {
-            return nil
+              isPublic(canonical) else { return nil }
+
+        // Geolocate the explicit observed IP independently. Requiring the
+        // second GeoIP website to also be reachable through a fragile VPN
+        // unnecessarily turns a valid observed exit into "待识别".
+        let country = await countryCode(for: canonical)
+        let code: String?
+        if let country {
+            code = country
+        } else if !Task.isCancelled, cancellation?.isCancelled != true {
+            code = await exitCountryCode(
+                for: canonical, socksPort: socksPort, cancellation: cancellation)
+        } else {
+            code = nil
         }
+        guard !Task.isCancelled, cancellation?.isCancelled != true,
+              let code else { return nil }
         return HarborProxyIPLocation(ip: canonical, countryCode: code)
     }
 

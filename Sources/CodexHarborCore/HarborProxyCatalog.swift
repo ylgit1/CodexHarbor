@@ -263,8 +263,13 @@ public enum HarborProxyAutomaticName {
         return nodes.map { original in
             var node = original
             guard !node.subscriptionID.isEmpty else { return node }
+            // Actual exit country wins. Without it, VPN Gate's CSV source
+            // country must not be replaced by a stale server-IP GeoIP cache.
             let region = (exitLocationsByNodeID[node.id]
-                ?? locations[node.host.lowercased()])?.displayRegion ?? unresolvedRegion
+                ?? HarborVPNGate.publisherLocation(for: node)
+                ?? locations[node.host.lowercased()].flatMap {
+                    $0.verifiedCountryCode == nil ? nil : $0
+                })?.displayRegion ?? unresolvedRegion
             node.automaticName = make(
                 region: region, protocolName: node.protocolName,
                 sequence: sequencesByID[node.id] ?? nextSequence

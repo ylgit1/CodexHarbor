@@ -1,12 +1,14 @@
-# Codex Harbor v0.1.29
+# Codex Harbor v0.1.30
 
 Apple Silicon (arm64), macOS 14 or newer.
 
-- Source commit: 61fbc78cbcb27a2577ee59a1efe864a5e640e4f8
-- Verified SHA-256: 33776f02e12a555cfce1fdbb67bc3c6dd918a7a2fc263036ee83bef106e7e290
-- Versioned DMG: v0.1.29/Codex-Harbor-v0.1.29-arm64.dmg
+- Source commit: 25c0f7e63b97aa3e5bd9037f49566fdc742eee97
+- Verified SHA-256: 8e27a4a5326fe4631fb4c5b53a0ea38a4f56fc44f4956927acb2ff47eec12d6d
+- Versioned DMG: v0.1.30/Codex-Harbor-v0.1.30-arm64.dmg
 - Latest DMG: latest/Codex-Harbor-arm64.dmg
 
-This hotfix cancels real curl/Xray/Mihomo test processes with bounded SIGKILL,
-preserves completed measurements, and marks unfinished GeoIP/probe nodes unknown.
+This release fixes VPN Gate node country labels by retaining publisher
+country as unverified source metadata and preferring observed exit
+GeoIP when available. Adds a backup SOCKS-only IP echo provider and
+independent GeoIP lookup for the observed exit IP.
 The app includes Xray/Mihomo and is ad-hoc signed, not Apple-notarized.

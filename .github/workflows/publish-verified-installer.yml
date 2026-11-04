@@ -1,7 +1,7 @@
-name: Publish verified v0.1.29 installer
+name: Publish verified v0.1.30 installer
 on:
   push:
-    branches: [publish/v0.1.29]
+    branches: [publish/v0.1.30]
     paths: [release-upload/manifest.json]
 permissions:
   contents: write
@@ -14,22 +14,22 @@ jobs:
         with:
           ref: release-assets
           fetch-depth: 1
-      - name: Fetch and mirror the exact v0.1.29 source
+      - name: Fetch and mirror the exact v0.1.30 source
         shell: bash
         run: |
           set -euo pipefail
-          SOURCE=61fbc78cbcb27a2577ee59a1efe864a5e640e4f8
+          SOURCE=25c0f7e63b97aa3e5bd9037f49566fdc742eee97
           for attempt in 1 2 3 4; do
             if git -c http.version=HTTP/1.1 fetch --no-tags --depth=2 \
                 https://gitee.com/yangxiaoyong01/CodexHarbor.git \
-                main:refs/remotes/gitee/main tag v0.1.29; then
+                main:refs/remotes/gitee/main tag v0.1.30; then
               break
             fi
             if [ "$attempt" -eq 4 ]; then exit 1; fi
             sleep "$((attempt * 6))"
           done
           test "$(git rev-parse refs/remotes/gitee/main)" = "$SOURCE"
-          test "$(git rev-parse refs/tags/v0.1.29^{commit})" = "$SOURCE"
+          test "$(git rev-parse refs/tags/v0.1.30^{commit})" = "$SOURCE"
           git push origin refs/remotes/gitee/main:refs/heads/main
           git worktree add --detach "$RUNNER_TEMP/codexharbor-source" "$SOURCE"
       - name: Build and verify the arm64 app and DMG
@@ -44,46 +44,48 @@ jobs:
           ./Scripts/verify-probe-stop.sh
           ./Scripts/build-app.sh fast --no-install
           ./Scripts/create-dmg.sh
-          ./Scripts/verify-dmg.sh dist/Codex-Harbor-v0.1.29-arm64.dmg
-          test "$(plutil -extract HarborGitCommit raw -o - 'dist/Codex Harbor.app/Contents/Info.plist')" = "61fbc78cbcb2"
-          cp dist/Codex-Harbor-v0.1.29-arm64.dmg "$GITHUB_WORKSPACE/v0.1.29-installer.dmg"
+          ./Scripts/verify-dmg.sh dist/Codex-Harbor-v0.1.30-arm64.dmg
+          test "$(plutil -extract HarborGitCommit raw -o - 'dist/Codex Harbor.app/Contents/Info.plist')" = "25c0f7e63b97"
+          cp dist/Codex-Harbor-v0.1.30-arm64.dmg "$GITHUB_WORKSPACE/v0.1.30-installer.dmg"
       - name: Update latest and versioned GitHub downloads
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p latest v0.1.29
-          cp v0.1.29-installer.dmg v0.1.29/Codex-Harbor-v0.1.29-arm64.dmg
-          cp v0.1.29-installer.dmg latest/Codex-Harbor-arm64.dmg
-          SHA="$(shasum -a 256 v0.1.29-installer.dmg | awk '{print $1}')"
-          SIZE="$(stat -f '%z' v0.1.29-installer.dmg)"
-          printf '%s  Codex-Harbor-v0.1.29-arm64.dmg\n' "$SHA" > v0.1.29/SHA256SUMS
+          mkdir -p latest v0.1.30
+          cp v0.1.30-installer.dmg v0.1.30/Codex-Harbor-v0.1.30-arm64.dmg
+          cp v0.1.30-installer.dmg latest/Codex-Harbor-arm64.dmg
+          SHA="$(shasum -a 256 v0.1.30-installer.dmg | awk '{print $1}')"
+          SIZE="$(stat -f '%z' v0.1.30-installer.dmg)"
+          printf '%s  Codex-Harbor-v0.1.30-arm64.dmg\n' "$SHA" > v0.1.30/SHA256SUMS
           {
             printf '%s  latest/Codex-Harbor-arm64.dmg\n' "$SHA"
             grep -v '  latest/Codex-Harbor-arm64.dmg' SHA256SUMS |
-              grep -v '  v0.1.29/Codex-Harbor-v0.1.29-arm64.dmg' || true
-            printf '%s  v0.1.29/Codex-Harbor-v0.1.29-arm64.dmg\n' "$SHA"
+              grep -v '  v0.1.30/Codex-Harbor-v0.1.30-arm64.dmg' || true
+            printf '%s  v0.1.30/Codex-Harbor-v0.1.30-arm64.dmg\n' "$SHA"
           } > SHA256SUMS.new
           mv SHA256SUMS.new SHA256SUMS
-          printf '{ "version": "0.1.29", "sourceCommit": "61fbc78cbcb27a2577ee59a1efe864a5e640e4f8", "sha256": "%s", "size": %s, "architecture": "arm64", "notarized": false }\n' "$SHA" "$SIZE" > latest/build-info.json
+          printf '{ "version": "0.1.30", "sourceCommit": "25c0f7e63b97aa3e5bd9037f49566fdc742eee97", "sha256": "%s", "size": %s, "architecture": "arm64", "notarized": false }\n' "$SHA" "$SIZE" > latest/build-info.json
           cat > INSTALLER.md <<EOF
-          # Codex Harbor v0.1.29
+          # Codex Harbor v0.1.30
 
           Apple Silicon (arm64), macOS 14 or newer.
 
-          - Source commit: 61fbc78cbcb27a2577ee59a1efe864a5e640e4f8
+          - Source commit: 25c0f7e63b97aa3e5bd9037f49566fdc742eee97
           - Verified SHA-256: $SHA
-          - Versioned DMG: v0.1.29/Codex-Harbor-v0.1.29-arm64.dmg
+          - Versioned DMG: v0.1.30/Codex-Harbor-v0.1.30-arm64.dmg
           - Latest DMG: latest/Codex-Harbor-arm64.dmg
 
-          This hotfix cancels real curl/Xray/Mihomo test processes with bounded SIGKILL,
-          preserves completed measurements, and marks unfinished GeoIP/probe nodes unknown.
+          This release fixes VPN Gate node country labels by retaining publisher
+          country as unverified source metadata and preferring observed exit
+          GeoIP when available. Adds a backup SOCKS-only IP echo provider and
+          independent GeoIP lookup for the observed exit IP.
           The app includes Xray/Mihomo and is ad-hoc signed, not Apple-notarized.
           EOF
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add latest v0.1.29 SHA256SUMS INSTALLER.md
+          git add latest v0.1.30 SHA256SUMS INSTALLER.md
           git diff --cached --quiet || {
-            git commit -m 'release: publish v0.1.29 arm64 installer'
+            git commit -m 'release: publish v0.1.30 arm64 installer'
             git push origin HEAD:refs/heads/release-assets
           }
       - name: Publish GitHub Release as latest
@@ -92,9 +94,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view v0.1.29 >/dev/null 2>&1; then
-            gh release upload v0.1.29 v0.1.29/Codex-Harbor-v0.1.29-arm64.dmg v0.1.29/SHA256SUMS --clobber
-            gh release edit v0.1.29 --latest
+          if gh release view v0.1.30 >/dev/null 2>&1; then
+            gh release upload v0.1.30 v0.1.30/Codex-Harbor-v0.1.30-arm64.dmg v0.1.30/SHA256SUMS --clobber
+            gh release edit v0.1.30 --latest
           else
-            gh release create v0.1.29               v0.1.29/Codex-Harbor-v0.1.29-arm64.dmg v0.1.29/SHA256SUMS               --target 61fbc78cbcb27a2577ee59a1efe864a5e640e4f8               --title 'Codex Harbor v0.1.29' --notes-file INSTALLER.md --latest
+            gh release create v0.1.30               v0.1.30/Codex-Harbor-v0.1.30-arm64.dmg v0.1.30/SHA256SUMS               --target 25c0f7e63b97aa3e5bd9037f49566fdc742eee97               --title 'Codex Harbor v0.1.30' --notes-file INSTALLER.md --latest
           fi

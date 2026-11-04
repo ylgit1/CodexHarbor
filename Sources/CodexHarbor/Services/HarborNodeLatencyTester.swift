@@ -50,7 +50,7 @@ final class HarborLatencyCancellation: @unchecked Sendable {
 
 /// A failed OpenVPN handshake can leave Mihomo/Xray alive after SIGTERM.
 /// Never make a probe task wait indefinitely for a child process to exit.
-private enum HarborProbeProcessReaper {
+enum HarborProbeProcessReaper {
     /// Wait at most the curl limit plus a small grace period. Reading the
     /// output pipe before the process exits can otherwise block indefinitely
     /// even after the user presses Stop.
@@ -61,6 +61,23 @@ private enum HarborProbeProcessReaper {
             Thread.sleep(forTimeInterval: 0.04)
         }
         stop(process)
+    }
+
+    /// Send SIGTERM immediately, then escalate to SIGKILL after a short
+    /// grace period. This is invoked ONLY for Process handles created by the
+    /// probe batch, never the user's active system proxy.
+    static func requestStop(_ process: Process) {
+        guard process.processIdentifier > 0, process.isRunning else { return }
+        process.terminate()
+        Task.detached(priority: .utility) {
+            let deadline = Date.now.addingTimeInterval(0.8)
+            while process.isRunning && Date.now < deadline {
+                try? await Task.sleep(for: .milliseconds(40))
+            }
+            if process.isRunning {
+                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+            }
+        }
     }
 
     static func stop(_ process: Process) {
@@ -108,7 +125,7 @@ private final class HarborRealDelayAttempt: @unchecked Sendable {
         let request = request
         lock.unlock()
         request?.cancel()
-        if engine?.isRunning == true { engine?.terminate() }
+        if let engine { HarborProbeProcessReaper.requestStop(engine) }
     }
 
     func run(node: HarborProxyNode, root: URL, ruleMode: Bool,
@@ -315,7 +332,7 @@ final class HarborRealDelayBatch: @unchecked Sendable {
             nodes.enumerated().map { ($0.element.id, basePort + $0.offset) })
         self.cancellation = cancellation
         guard let observer = cancellation.observe({ [weak engine] in
-            if engine?.isRunning == true { engine?.terminate() }
+            if let engine { HarborProbeProcessReaper.requestStop(engine) }
         }) else {
             try? FileManager.default.removeItem(at: configPath)
             HarborNodeLatencyTester.releasePortRange(basePort, count: nodes.count)
@@ -352,7 +369,7 @@ final class HarborRealDelayBatch: @unchecked Sendable {
     func exitLocation(node: HarborProxyNode) async -> HarborProxyIPLocation? {
         guard let port = portsByNodeID[node.id],
               !cancellation.isCancelled, engine.isRunning else { return nil }
-        return await HarborNodeGeoIPResolver.exitLocation(socksPort: port)
+        return await HarborNodeGeoIPResolver.exitLocation(socksPort: port, cancellation: cancellation)
     }
 
     func measure(node: HarborProxyNode) async -> HarborNodeDelayReport {
@@ -644,7 +661,8 @@ enum HarborMihomoLatencyTester {
     static func exitLocation(node: HarborProxyNode, root: URL,
                              cancellation: HarborLatencyCancellation) async -> HarborProxyIPLocation? {
         await withProxy(node: node, root: root, cancellation: cancellation) { socksPort, _ in
-            await HarborNodeGeoIPResolver.exitLocation(socksPort: socksPort)
+            await HarborNodeGeoIPResolver.exitLocation(
+                socksPort: socksPort, cancellation: cancellation)
         } ?? nil
     }
 
@@ -677,7 +695,7 @@ enum HarborMihomoLatencyTester {
         engine.standardOutput = FileHandle.nullDevice
         engine.standardError = FileHandle(fileDescriptor: logFD, closeOnDealloc: true)
         guard let observer = cancellation.observe({ [weak engine] in
-            if engine?.isRunning == true { engine?.terminate() }
+            if let engine { HarborProbeProcessReaper.requestStop(engine) }
         }) else { return nil }
         defer { cancellation.removeObserver(observer) }
         do { try engine.run() } catch { return nil }
@@ -756,7 +774,7 @@ enum HarborMihomoLatencyTester {
             curl.standardOutput = output
             curl.standardError = FileHandle.nullDevice
             guard let observer = cancellation.observe({ [weak curl] in
-                if curl?.isRunning == true { curl?.terminate() }
+                if let curl { HarborProbeProcessReaper.requestStop(curl) }
             }) else { return nil as CurlResult? }
             defer { cancellation.removeObserver(observer) }
             do { try curl.run() } catch { return nil }

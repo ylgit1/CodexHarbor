@@ -247,6 +247,8 @@ final class HarborProxyManager: ObservableObject {
     // A canceled batch must not update progress or clear a newer batch.
     private var latencyBatchGeneration: UUID?
     private var latencyCancellation: HarborLatencyCancellation?
+    private var latencyFinishedIDs = Set<String>()
+    private var latencyActiveBatch: HarborRealDelayBatch?
     @Published private(set) var subscriptionUpdatedAt: [String: Date] = [:]
     @Published var routingRules = true {
         didSet {
@@ -266,6 +268,7 @@ final class HarborProxyManager: ObservableObject {
     private var exitGeoTask: Task<Void, Never>?
     private var exitGeoBatchGeneration: UUID?
     private var exitGeoCancellation: HarborLatencyCancellation?
+    private var exitGeoActiveBatch: HarborRealDelayBatch?
     private var exitGeoManualGeneration: UUID?
     private var exitGeoWatchdog: Task<Void, Never>?
     private let exitGeoBatchDeadlineSeconds = 75
@@ -1866,6 +1869,8 @@ final class HarborProxyManager: ObservableObject {
         latencyBatchGeneration = generation
         latencyTesting = true
         latencyBatchIDs = Set(targets.map(\.id))
+        latencyFinishedIDs = []
+        latencyActiveBatch = nil
         let cancellation = HarborLatencyCancellation()
         latencyCancellation = cancellation
         latencyCompleted = 0
@@ -1879,6 +1884,8 @@ final class HarborProxyManager: ObservableObject {
                 latencyCurrentID = nil
                 latencyTestingIDs = []
                 latencyCancellation = nil
+                latencyFinishedIDs = []
+                latencyActiveBatch = nil
             }
         }
         let latencyRoot = root
@@ -1899,6 +1906,7 @@ final class HarborProxyManager: ObservableObject {
             if let sharedRealBatch { Task.detached(priority: .utility) { sharedRealBatch.close() } }
             return
         }
+        latencyActiveBatch = sharedRealBatch
         // Keep one Xray for all nodes and bound only the HTTP probes. Refill
         // each free slot immediately, so a slow node cannot block the next wave.
         // Failed nodes are retried by a later user test, not immediately here.
@@ -1961,6 +1969,7 @@ final class HarborProxyManager: ObservableObject {
                         consecutiveRealFailures: failures,
                         probeRouteID: routeID
                     )
+                    latencyFinishedIDs.insert(id)
                     let errorCategory = result == nil ? "failed" : "success"
                     // Fixed categories only: no raw Xray stderr, address or secrets.
                     let category: String
@@ -1990,6 +1999,7 @@ final class HarborProxyManager: ObservableObject {
         if let sharedRealBatch {
             await Task.detached(priority: .utility) { sharedRealBatch.close() }.value
         }
+        if latencyBatchGeneration == generation { latencyActiveBatch = nil }
         guard latencyBatchGeneration == generation, !cancellation.isCancelled else { return }
         proxyAudit("real_probe_batch_done",
                    note: "tested=\(latencyCompleted) successes=\(succeeded)")
@@ -2114,11 +2124,13 @@ final class HarborProxyManager: ObservableObject {
                 if let batch { Task.detached(priority: .utility) { batch.close() } }
                 return
             }
+            exitGeoActiveBatch = batch
             let geoRoot = root
             let inspect: @Sendable (HarborProxyNode) async
                 -> (HarborProxyNode, HarborProxyIPLocation?) = { node in
                 if let livePort {
-                    return (node, await HarborNodeGeoIPResolver.exitLocation(socksPort: livePort))
+                    return (node, await HarborNodeGeoIPResolver.exitLocation(
+                        socksPort: livePort, cancellation: cancellation))
                 }
                 if node.protocolName == "openvpn" {
                     return (node, await HarborMihomoLatencyTester.exitLocation(
@@ -2178,16 +2190,18 @@ final class HarborProxyManager: ObservableObject {
             if let batch {
                 await Task.detached(priority: .utility) { batch.close() }.value
             }
+            if exitGeoBatchGeneration == generation { exitGeoActiveBatch = nil }
         }
         guard exitGeoBatchGeneration == generation else { return }
         exitGeoBatchGeneration = nil
         exitGeoCancellation = nil
+        exitGeoActiveBatch = nil
         exitGeoTask = nil
         if exitGeoUpdating {
             // If a node was skipped or disappeared, count it as unresolved
             // rather than leaving the UI in an unending "23/24" state.
             exitGeoUnrecognizedIDs.formUnion(exitGeoManualIDs)
-            exitGeoCompleted = exitGeoTotal
+            // The actual completed count remains visible after finishing.
             exitGeoWatchdog?.cancel()
             exitGeoWatchdog = nil
             exitGeoManualGeneration = nil
@@ -2206,26 +2220,32 @@ final class HarborProxyManager: ObservableObject {
         guard exitGeoManualGeneration == generation, exitGeoUpdating else { return }
         let unresolved = exitGeoManualIDs
         exitGeoUnrecognizedIDs.formUnion(unresolved)
-        for id in unresolved {
-            exitGeoFailureCounts[id, default: 0] += 1
+        if reason == "超时" {
+            for id in unresolved {
+                exitGeoFailureCounts[id, default: 0] += 1
+            }
         }
         exitGeoForcedIDs.subtract(unresolved)
         exitGeoPendingIDs.subtract(unresolved)
         exitGeoManualIDs.removeAll()
         exitGeoUpdating = false
-        exitGeoCompleted = exitGeoTotal
+        // Keep the real number completed: a stopped node is not "tested".
         exitGeoManualGeneration = nil
         exitGeoWatchdog?.cancel()
         exitGeoWatchdog = nil
         exitGeoBatchGeneration = nil
         exitGeoTask?.cancel()
         exitGeoTask = nil
-        if let cancellation = exitGeoCancellation {
-            Task.detached(priority: .utility) { cancellation.cancel() }
-        }
+        let cancellation = exitGeoCancellation
+        let activeBatch = exitGeoActiveBatch
         exitGeoCancellation = nil
-        let pendingCount = unresolved.count
-        detail = "出口地区识别\(reason)：确认 \(exitGeoManualSucceeded)/\(exitGeoTotal)；未识别 \(pendingCount)，可重新识别"
+        exitGeoActiveBatch = nil
+        Task.detached(priority: .utility) {
+            cancellation?.cancel()  // signal all owned curl/Mihomo/Xray processes
+            activeBatch?.close()   // reclaim batch ports and config without waiting for the group
+        }
+        let unknownCount = max(0, exitGeoTotal - exitGeoManualSucceeded)
+        detail = "出口地区识别\(reason)：实际完成 \(exitGeoCompleted)/\(exitGeoTotal)，确认 \(exitGeoManualSucceeded)，未识别 \(unknownCount)"
     }
 
     func cancelExitGeoRefresh() {
@@ -2297,6 +2317,7 @@ final class HarborProxyManager: ObservableObject {
         guard latencyTesting, let cancellation = latencyCancellation else { return }
         let completed = latencyCompleted
         let total = latencyTotal
+        let untestedIDs = latencyBatchIDs.subtracting(latencyFinishedIDs)
         // Detach the canceled batch from the view before terminating processes.
         // Reaper tasks may finish later but cannot write into the new generation.
         latencyBatchGeneration = nil
@@ -2305,10 +2326,23 @@ final class HarborProxyManager: ObservableObject {
         latencyBatchIDs = []
         latencyTestingIDs = []
         latencyCurrentID = nil
-        latencyCompleted = 0
-        latencyTotal = 0
-        detail = "已停止测速（之前完成 \(completed)/\(total)）；可以重新测速"
-        Task.detached(priority: .utility) { cancellation.cancel() }
+        latencyFinishedIDs = []
+        // Previously cached values must not make unfinished nodes appear to
+        // have been tested in this batch. Preserve only finished observations.
+        if !untestedIDs.isEmpty {
+            var retained = probeResults
+            for id in untestedIDs { retained.removeValue(forKey: id) }
+            probeResults = retained
+        }
+        persist()
+        // Do not zero latencyCompleted/Total. This is real partial progress.
+        detail = "已停止测速：完成 \(completed)/\(total)；其余 \(untestedIDs.count) 个未测试"
+        let activeBatch = latencyActiveBatch
+        latencyActiveBatch = nil
+        Task.detached(priority: .utility) {
+            cancellation.cancel()
+            activeBatch?.close()
+        }
     }
 
     func enableSystemProxy(interactive: Bool = false) {

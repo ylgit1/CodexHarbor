@@ -93,31 +93,38 @@ enum HarborNodeGeoIPResolver {
     /// Ask a non-Cloudflare site for the IP it sees through this node. Looking
     /// up that explicit IP separately avoids mistaking a CF-only ProxyIP for
     /// the exit used by ordinary websites.
-    static func exitLocation(socksPort: Int) async -> HarborProxyIPLocation? {
+    static func exitLocation(socksPort: Int,
+                             cancellation: HarborLatencyCancellation? = nil)
+        async -> HarborProxyIPLocation? {
         guard (1...65_535).contains(socksPort), !Task.isCancelled,
+              cancellation?.isCancelled != true,
               let url = URL(string: "https://checkip.amazonaws.com/") else {
             return nil
         }
         // Force SOCKS5 + remote DNS; URLSession on some macOS builds can
         // silently bypass its SOCKS proxy dictionary and report the host IP.
         // A failed proxy must return nil, never the machine's direct address.
-        guard let data = await exitDataViaCurl(socksPort: socksPort, url: url),
-              !Task.isCancelled, data.count < 128,
+        guard let data = await exitDataViaCurl(
+                  socksPort: socksPort, url: url, cancellation: cancellation),
+              !Task.isCancelled, cancellation?.isCancelled != true, data.count < 128,
               let observedIP = String(data: data, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
               let canonical = HarborIPAddress.normalizedLiteral(observedIP),
               isPublic(canonical),
-              let code = await exitCountryCode(for: canonical, socksPort: socksPort) else {
+              let code = await exitCountryCode(
+                  for: canonical, socksPort: socksPort, cancellation: cancellation) else {
             return nil
         }
         return HarborProxyIPLocation(ip: canonical, countryCode: code)
     }
 
-    private static func exitCountryCode(for ip: String, socksPort: Int) async -> String? {
+    private static func exitCountryCode(for ip: String, socksPort: Int,
+                                        cancellation: HarborLatencyCancellation?) async -> String? {
         guard let encoded = ip.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
               let url = URL(string: "https://ipwho.is/\(encoded)?fields=success,ip,country_code"),
-              let data = await exitDataViaCurl(socksPort: socksPort, url: url),
-              !Task.isCancelled,
+              let data = await exitDataViaCurl(
+                  socksPort: socksPort, url: url, cancellation: cancellation),
+              !Task.isCancelled, cancellation?.isCancelled != true,
               let result = try? JSONDecoder().decode(Response.self, from: data),
               result.success,
               let returnedIP = result.ip, HarborIPAddress.equivalent(returnedIP, ip),
@@ -128,11 +135,13 @@ enum HarborNodeGeoIPResolver {
         return code
     }
 
-    private static func exitDataViaCurl(socksPort: Int, url: URL) async -> Data? {
+    private static func exitDataViaCurl(socksPort: Int, url: URL,
+                                        cancellation: HarborLatencyCancellation?) async -> Data? {
+        guard !Task.isCancelled, cancellation?.isCancelled != true else { return nil }
         // Network --max-time does NOT cap waiting for a child process or pipe
         // reader. Keep the whole process under a wall-clock deadline, and
         // capture to a private file rather than a potentially stuck pipe.
-        await Task.detached(priority: .utility) {
+        return await Task.detached(priority: .utility) {
             let curl = Process()
             curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
             curl.arguments = [
@@ -154,20 +163,30 @@ enum HarborNodeGeoIPResolver {
             }
             curl.standardOutput = output
             curl.standardError = FileHandle.nullDevice
+            let observer = cancellation?.observe { [weak curl] in
+                if let curl { HarborProbeProcessReaper.requestStop(curl) }
+            }
+            guard cancellation == nil || observer != nil else { return nil }
+            defer {
+                if let observer { cancellation?.removeObserver(observer) }
+            }
             guard (try? curl.run()) != nil else { return nil }
+            if cancellation?.isCancelled == true {
+                HarborProbeProcessReaper.requestStop(curl)
+                return nil
+            }
             let deadline = Date.now.addingTimeInterval(9)
-            while curl.isRunning && Date.now < deadline {
+            while curl.isRunning && Date.now < deadline &&
+                    cancellation?.isCancelled != true {
                 try? await Task.sleep(for: .milliseconds(50))
             }
-            let exitedOnTime = !curl.isRunning
+            let exitedOnTime = !curl.isRunning &&
+                cancellation?.isCancelled != true
             if !exitedOnTime {
-                curl.terminate()
-                let grace = Date.now.addingTimeInterval(0.35)
+                HarborProbeProcessReaper.requestStop(curl)
+                let grace = Date.now.addingTimeInterval(1.1)
                 while curl.isRunning && Date.now < grace {
                     try? await Task.sleep(for: .milliseconds(50))
-                }
-                if curl.isRunning {
-                    _ = Darwin.kill(curl.processIdentifier, SIGKILL)
                 }
             }
             guard exitedOnTime, curl.terminationStatus == 0,

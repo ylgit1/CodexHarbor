@@ -1,1 +1,1 @@
-{ "version": "0.1.30", "sourceCommit": "25c0f7e63b97aa3e5bd9037f49566fdc742eee97", "sha256": "8e27a4a5326fe4631fb4c5b53a0ea38a4f56fc44f4956927acb2ff47eec12d6d", "size": 49408403, "architecture": "arm64", "notarized": false }
+{"version": "0.1.31", "sourceCommit": "0add421158e395f1cad483f77ab7eba462c08ec9", "builtAt": "2026-11-05T10:15:47.646332+00:00"}

@@ -99,6 +99,35 @@ private struct NotchRingView: View {
     }
 }
 
+/// Small view isolated from window management to keep SwiftUI type checking fast.
+private struct NotchWingMetrics: View {
+    let title: String
+    let percent: String
+    let reset: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .firstTextBaseline, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.67))
+                Spacer(minLength: 1)
+                Text(percent)
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .monospacedDigit()
+            }
+            Text(reset)
+                .font(.system(size: 8, weight: .medium, design: .rounded))
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .foregroundStyle(.white.opacity(0.79))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 private struct NotchWingView: View {
     @ObservedObject var model: NotchQuotaModel
     let isFiveHour: Bool
@@ -108,28 +137,28 @@ private struct NotchWingView: View {
         isFiveHour ? model.quota?.fiveHours : model.quota?.weekly
     }
 
+    private var accessibleText: String {
+        let name = isFiveHour ? "5 小时" : "每周"
+        return name + "额度，剩余 " + model.text(window) + "，" + model.fullCountdown(window)
+    }
+
+    private var ring: some View {
+        NotchRingView(percent: model.remaining(window), tint: model.tint(window))
+    }
+
+    private var metrics: some View {
+        let reset = model.countdown(window).map { "重置 " + $0 } ?? "重置待定"
+        return NotchWingMetrics(
+            title: isFiveHour ? "5小时" : "周额度",
+            percent: model.text(window),
+            reset: reset
+        )
+    }
+
     var body: some View {
         HStack(spacing: 3) {
-            NotchRingView(percent: model.remaining(window), tint: model.tint(window))
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .firstTextBaseline, spacing: 2) {
-                    Text(isFiveHour ? "5小时" : "周额度")
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.67))
-                    Spacer(minLength: 1)
-                    Text(model.text(window))
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white)
-                        .monospacedDigit()
-                }
-                Text(model.countdown(window).map { "重置 " + $0 } ?? "重置待定")
-                    .font(.system(size: 8, weight: .medium, design: .rounded))
-                    .monospacedDigit()
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-                    .foregroundStyle(.white.opacity(0.79))
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            ring
+            metrics
         }
         .padding(.horizontal, 3)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -143,8 +172,7 @@ private struct NotchWingView: View {
         }
         .contentShape(Rectangle())
         .onHover(perform: hover)
-        .accessibilityLabel((isFiveHour ? "5 小时" : "每周") + "额度，剩余 " +
-            model.text(window) + "，" + model.fullCountdown(window))
+        .accessibilityLabel(accessibleText)
     }
 }
 

@@ -20,6 +20,8 @@ fi
 jobs="${CODEX_HARBOR_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
 acquire_build_lock() {
+  # A fresh checkout has no .build parent directory. Create it before locking.
+  mkdir -p "$build_root"
   if mkdir "$lock_dir" 2>/dev/null; then
     echo "$$" > "$lock_pid_file"
     return 0

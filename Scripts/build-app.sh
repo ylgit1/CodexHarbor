@@ -71,7 +71,7 @@ case "$mode" in
       swift build --disable-sandbox -c release --jobs "$jobs"
     ;;
   package-only)
-    if [[ ! -x "$build_root/release/CodexHarbor" || ! -x "$build_root/release/HarborChatGPTAgent" ]]; then
+    if [[ ! -x "$build_root/release/CodexHarbor" || ! -x "$build_root/release/HarborChatGPTAgent" || ! -x "$build_root/release/HarborUsageCardAgent" ]]; then
       echo "缺少 Release 可执行文件，不能仅打包。请先运行：Scripts/build-app.sh fast" >&2
       exit 4
     fi
@@ -87,6 +87,7 @@ rm -rf "$staging_app_path"
 mkdir -p "$staging_app_path/Contents/MacOS" "$staging_app_path/Contents/Helpers" "$staging_app_path/Contents/Resources"
 cp "$build_root/release/CodexHarbor" "$staging_app_path/Contents/MacOS/CodexHarbor"
 cp "$build_root/release/HarborChatGPTAgent" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
+cp "$build_root/release/HarborUsageCardAgent" "$staging_app_path/Contents/Helpers/HarborUsageCardAgent"
 cp "$project_root/Resources/Info.plist" "$staging_app_path/Contents/Info.plist"
 # Stamp builds with a monotonic revision and exact Git commit.
 build_number="$(git -C "$project_root" rev-list --count HEAD 2>/dev/null || echo 13)"
@@ -107,6 +108,14 @@ fi
 /usr/libexec/PlistBuddy -c "Add :HarborGitCommit string $build_commit" "$staging_app_path/Contents/Info.plist"
 echo "==> 版本标记：${release_tag:-development} (${build_number}) · $build_commit"
 cp "$project_root/Resources/AppIcon.icns" "$staging_app_path/Contents/Resources/AppIcon.icns"
+# SwiftPM-generated resources are looked up via Bundle.module at runtime.
+resource_bundle="$build_root/release/CodexHarbor_CodexHarbor.bundle"
+if [[ -d "$resource_bundle" ]]; then
+  cp -R "$resource_bundle" "$staging_app_path/Contents/Resources/"
+  # SwiftPM incremental builds may retain a previously declared resource.
+  # Never redistribute the former third-party Codex Usage Card archive.
+  rm -f "$staging_app_path/Contents/Resources/CodexHarbor_CodexHarbor.bundle/CodexUsageCard-macOS-0.9.5.bundledata"
+fi
 if [[ -d "$project_root/Resources/Dashboard" ]]; then
   mkdir -p "$staging_app_path/Contents/Resources/Dashboard"
   cp "$project_root/Resources/Dashboard/"* "$staging_app_path/Contents/Resources/Dashboard/"
@@ -159,7 +168,7 @@ cp "$project_root/Resources/Mihomo/LICENSE" "$staging_app_path/Contents/Resource
 chmod 755 "$mihomo_destination/mihomo"
 "$mihomo_destination/mihomo" -v >/dev/null
 echo "==> 已内置 Mihomo OpenVPN 内核（$host_arch）"
-chmod 755 "$staging_app_path/Contents/MacOS/CodexHarbor" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
+chmod 755 "$staging_app_path/Contents/MacOS/CodexHarbor" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent" "$staging_app_path/Contents/Helpers/HarborUsageCardAgent"
 # Sign with the same certificate on every build so the Agent retains its
 # designated requirement (DR) across binary updates. Stable identifiers alone
 # do NOT make ad-hoc signatures persistent in macOS TCC.
@@ -215,6 +224,7 @@ fi
 codesign --force "${sign_options[@]}" --sign "$sign_identity" --identifier "com.codexharbor.xray" "$xray_destination/xray"
 codesign --force "${sign_options[@]}" --sign "$sign_identity" --identifier "com.codexharbor.mihomo" "$mihomo_destination/mihomo"
 codesign --force "${sign_options[@]}" --sign "$sign_identity" --identifier "com.codexharbor.agent" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
+codesign --force "${sign_options[@]}" --sign "$sign_identity" --identifier "com.codexharbor.usage-card-agent" "$staging_app_path/Contents/Helpers/HarborUsageCardAgent"
 codesign --force "${sign_options[@]}" --sign "$sign_identity" "$staging_app_path"
 
 codesign --verify --deep --strict "$staging_app_path"

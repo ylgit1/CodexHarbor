@@ -1,0 +1,99 @@
+name: Publish versioned macOS installer
+
+on:
+  push:
+    branches: [main]
+
+# Only an explicit release commit starts publication. Ordinary development
+# pushes and GitHub Actions' own release-assets pushes never publish.
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-harbor-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: startsWith(github.event.head_commit.message, 'release: v')
+    runs-on: macos-15
+    timeout-minutes: 55
+    permissions:
+      contents: write
+    env:
+      CODEX_HARBOR_BUILD_JOBS: '4'
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate version and source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)
+          headline=$(git log -1 --pretty=%s)
+          [[ "$headline" == "release: v${version}"* ]] || {
+            echo 'Release commit message does not match Info.plist version' >&2
+            exit 2
+          }
+          if gh release view "v${version}" >/dev/null 2>&1; then
+            echo "v${version} is already published; refusing to overwrite" >&2
+            exit 2
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Build Apple Silicon app and verify signature
+        run: |
+          ./Scripts/build-app.sh fast --no-install
+          codesign --verify --deep --strict 'dist/Codex Harbor.app'
+      - name: Create versioned installer and verify mounted copy
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./Scripts/create-dmg.sh
+          source_dmg=$(./Scripts/create-dmg.sh --print-path)
+          ./Scripts/verify-dmg.sh "$source_dmg"
+          asset="Codex-Harbor-v${VERSION}-arm64.dmg"
+          cp "$source_dmg" "dist/$asset"
+          (cd dist && shasum -a 256 "$asset" > SHA256SUMS)
+          echo "ASSET_NAME=$asset" >> "$GITHUB_ENV"
+      - name: Publish GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          # Codex Harbor v${VERSION}
+
+          - Native notch quota cards (5-hour and weekly remaining limits and reset countdowns).
+          - Compact hover details with read-only reset-credit count.
+          - Uses the Codex App Server directly, with no Node or CDP injection.
+          - Includes Xray and Mihomo; ad-hoc signed and not Apple-notarized.
+          - Source commit: ${GITHUB_SHA}
+          EOF
+          gh release create "v${VERSION}" "dist/${ASSET_NAME}" dist/SHA256SUMS \
+            --target "$GITHUB_SHA" --title "Codex Harbor v${VERSION}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+      - name: Update public latest DMG mirror
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin release-assets
+          git worktree add -B release-assets "$RUNNER_TEMP/harbor-release-assets" origin/release-assets
+          assets="$RUNNER_TEMP/harbor-release-assets"
+          mkdir -p "$assets/v${VERSION}" "$assets/latest"
+          cp "dist/${ASSET_NAME}" "$assets/v${VERSION}/${ASSET_NAME}"
+          cp "dist/${ASSET_NAME}" "$assets/latest/Codex-Harbor-arm64.dmg"
+          cp dist/SHA256SUMS "$assets/v${VERSION}/SHA256SUMS"
+          (cd "$assets/latest" && shasum -a 256 Codex-Harbor-arm64.dmg > SHA256SUMS)
+          python3 - "$assets/latest/build-info.json" "$VERSION" "$GITHUB_SHA" <<'PY'
+          import json, sys
+          from datetime import datetime, timezone
+          path, version, sha = sys.argv[1:]
+          with open(path, 'w') as output:
+              json.dump({'version':version,'sourceCommit':sha,'builtAt':datetime.now(timezone.utc).isoformat()}, output)
+          PY
+          git -C "$assets" config user.name 'github-actions[bot]'
+          git -C "$assets" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$assets" add "v${VERSION}" latest
+          git -C "$assets" commit -m "release-assets: v${VERSION}"
+          git -C "$assets" push origin HEAD:release-assets

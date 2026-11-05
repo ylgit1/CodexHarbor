@@ -30,6 +30,9 @@ copied_app="$install_stage/Codex Harbor.app"
 [[ -L "$mountpoint/Applications" && "$(/usr/bin/readlink "$mountpoint/Applications")" == /Applications ]]
 [[ -x "$mounted_app/Contents/MacOS/CodexHarbor" ]]
 [[ -x "$mounted_app/Contents/Helpers/HarborChatGPTAgent" ]]
+[[ -x "$mounted_app/Contents/Helpers/HarborUsageCardAgent" ]]
+[[ ! -e "$mounted_app/Contents/Resources/CodexHarbor_HarborUsageCardAgent.bundle/usage-card.js" ]]
+[[ ! -e "$mounted_app/Contents/Resources/CodexHarbor_CodexHarbor.bundle/CodexUsageCard-macOS-0.9.5.bundledata" ]]
 [[ -x "$mounted_app/Contents/Resources/Xray/$(uname -m)/xray" ]]
 /usr/bin/codesign --verify --deep --strict "$mounted_app"
 /usr/bin/plutil -lint "$mounted_app/Contents/Info.plist"

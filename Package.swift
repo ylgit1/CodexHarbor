@@ -9,7 +9,8 @@ let package = Package(
         .library(name: "CodexHarborCore", targets: ["CodexHarborCore"]),
         .library(name: "ChatGPTBridgeCore", targets: ["ChatGPTBridgeCore"]),
         .executable(name: "CodexHarbor", targets: ["CodexHarbor"]),
-        .executable(name: "HarborChatGPTAgent", targets: ["HarborChatGPTAgent"])
+        .executable(name: "HarborChatGPTAgent", targets: ["HarborChatGPTAgent"]),
+        .executable(name: "HarborUsageCardAgent", targets: ["HarborUsageCardAgent"])
     ],
     targets: [
         .target(
@@ -35,6 +36,10 @@ let package = Package(
         .executableTarget(
             name: "HarborChatGPTAgent",
             dependencies: ["ChatGPTBridgeCore"]
+        ),
+        .executableTarget(
+            name: "HarborUsageCardAgent",
+            dependencies: ["CodexHarborCore"]
         ),
         .testTarget(
             name: "CodexHarborCoreTests",

@@ -16,6 +16,11 @@ struct HarborConnectionManagementView: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var collapsedSections: Set<ConnectionCatalogFilter> = []
+    @State private var usageCardEnabled = HarborCodexUsageCard.isInstalled
+    @State private var usageCardBusy = false
+    @State private var usageCardMessage: String?
+    @State private var usageCardError = false
+    @State private var usageCardRuntime = HarborCodexUsageCard.runtimeDescription()
 
     var body: some View {
         ScrollView {
@@ -49,6 +54,8 @@ struct HarborConnectionManagementView: View {
                 )
                 .frame(width: 360)
 
+                usageCardSettings
+
                 catalog
             }
             .frame(maxWidth: .infinity, alignment: .top)
@@ -57,6 +64,105 @@ struct HarborConnectionManagementView: View {
             .padding(.bottom, 24)
         }
         .scrollIndicators(.automatic)
+        .task {
+            // Migrate users who enabled the older injected sidebar/top mode.
+            if HarborCodexUsageCard.requiresNotchMigration {
+                performUsageCardAction(.enable)
+            }
+            while !Task.isCancelled {
+                usageCardRuntime = HarborCodexUsageCard.runtimeDescription()
+                try? await Task.sleep(for: .seconds(10))
+            }
+        }
+    }
+
+    private var usageCardSettings: some View {
+        HarborCard(padding: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .center, spacing: 12) {
+                    Image(systemName: "chart.donut.fill")
+                        .font(.system(size: 18))
+                        .foregroundStyle(HarborColors.blue)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Codex 套餐额度卡片")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("ChatGPT 运行时在 MacBook 刘海两侧显示 5h / 周额度")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if usageCardBusy {
+                        ProgressView().controlSize(.small)
+                    }
+                    Toggle("启用", isOn: Binding(
+                        get: { usageCardEnabled },
+                        set: { enabled in performUsageCardAction(enabled ? .enable : .disable) }
+                    ))
+                    .labelsHidden()
+                    .disabled(usageCardBusy)
+                    .accessibilityLabel("启用 Codex 套餐额度显示")
+                }
+
+                HStack(spacing: 9) {
+                    Label("唯一显示方式：MacBook 刘海", systemImage: "laptopcomputer")
+                        .font(.system(size: 11, weight: .medium))
+                    Spacer()
+                    Text(usageCardEnabled ? "已开启" : "未开启")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(usageCardEnabled ? HarborColors.green : Color.secondary)
+                }
+                if usageCardEnabled {
+                    Label(usageCardRuntime, systemImage: "waveform.path.ecg.rectangle")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                Text("打开 ChatGPT 后在刘海两侧显示小圆环；悬停展开额度详情。若账户有重置卡，可在展开卡片内二次确认使用。无需客户端调试端口。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+
+                if HarborCodexUsageCard.legacyPluginDetected {
+                    Label("检测到旧版第三方额度插件，请先卸载，避免重复显示。", systemImage: "exclamationmark.triangle")
+                        .font(.system(size: 10))
+                        .foregroundStyle(HarborColors.orange)
+                }
+
+                if let usageCardMessage {
+                    Text(usageCardMessage)
+                        .font(.system(size: 10))
+                        .foregroundStyle(usageCardError ? HarborColors.red : Color.secondary)
+                        .textSelection(.enabled)
+                } else {
+                    Text("完全自研 Swift 后台服务，使用 Codex App Server 获取真实额度；无需安装 Node.js 或第三方插件。")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func performUsageCardAction(_ action: HarborCodexUsageCard.Action) {
+        guard !usageCardBusy else { return }
+        usageCardBusy = true
+        usageCardError = false
+        usageCardMessage = "正在处理刘海额度设置…"
+
+        Task {
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try HarborCodexUsageCard.perform(action)
+                }.value
+                usageCardEnabled = HarborCodexUsageCard.isInstalled
+                UserDefaults.standard.set(usageCardEnabled, forKey: HarborCodexUsageCard.enabledKey)
+                usageCardRuntime = HarborCodexUsageCard.runtimeDescription()
+                usageCardMessage = result
+            } catch {
+                usageCardEnabled = HarborCodexUsageCard.isInstalled
+                usageCardError = true
+                usageCardMessage = error.localizedDescription
+            }
+            usageCardBusy = false
+        }
     }
 
     private var catalog: some View {

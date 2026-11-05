@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   publish:
-    if: startsWith(github.event.head_commit.message, 'release: v')
+    if: "startsWith(github.event.head_commit.message, 'release: v')"
     runs-on: macos-15
     timeout-minutes: 55
     permissions:

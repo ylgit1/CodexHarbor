@@ -86,7 +86,7 @@ struct HarborConnectionManagementView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Codex 套餐额度卡片")
                             .font(.system(size: 13, weight: .semibold))
-                        Text("ChatGPT 运行时在 MacBook 刘海两侧显示 5h / 周额度")
+                        Text("仅 ChatGPT 在前台时显示刘海额度，不占用其他 App 菜单栏")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                     }
@@ -117,7 +117,7 @@ struct HarborConnectionManagementView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
-                Text("打开 ChatGPT 后在刘海两侧显示小圆环；悬停展开额度详情。若账户有重置卡，可在展开卡片内二次确认使用。无需客户端调试端口。")
+                Text("只有 macOS 菜单栏当前应用为 ChatGPT 时，刘海两侧才显示小圆环；切换到其他 App 立即隐藏。悬停可查看详细额度和只读重置卡数量，无需调试端口。")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
 

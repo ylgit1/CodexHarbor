@@ -294,6 +294,9 @@ final class NotchUsageCoordinator {
     private var rightPanel: NSPanel?
     private var detailPanel: NSPanel?
     private var pollTimer: Timer?
+    private var activationObserver: NSObjectProtocol?
+    private var deactivationObserver: NSObjectProtocol?
+    private var panelsVisible = false
     private var dismissTask: Task<Void, Never>?
     private var activeRefresh = false
     private var nextRefresh = Date.distantPast
@@ -311,6 +314,28 @@ final class NotchUsageCoordinator {
             Task { @MainActor in self?.poll() }
         }
         if let pollTimer { RunLoop.main.add(pollTimer, forMode: .common) }
+
+        // Use the same app identity as the macOS menu bar. Running in the
+        // background is not sufficient: other apps must regain their full
+        // left/right menu bar space immediately.
+        let workspaceEvents = NSWorkspace.shared.notificationCenter
+        activationObserver = workspaceEvents.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.poll() }
+        }
+        deactivationObserver = workspaceEvents.addObserver(
+            forName: NSWorkspace.didDeactivateApplicationNotification,
+            object: nil, queue: .main
+        ) { [weak self] notice in
+            guard let app = notice.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  Self.isChatGPTBundle(app.bundleIdentifier) else { return }
+            Task { @MainActor in
+                guard let self, !self.chatGPTIsFrontmost() else { return }
+                self.closePanels()
+            }
+        }
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
@@ -331,9 +356,17 @@ final class NotchUsageCoordinator {
         app.run()
     }
 
+    nonisolated private static func isChatGPTBundle(_ identifier: String?) -> Bool {
+        identifier == "com.openai.codex" || identifier == "com.openai.chatgpt"
+    }
+
     private func chatGPTIsRunning() -> Bool {
         !NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.codex").isEmpty ||
         !NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.chatgpt").isEmpty
+    }
+
+    private func chatGPTIsFrontmost() -> Bool {
+        Self.isChatGPTBundle(NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
     }
 
     private func poll() {
@@ -363,10 +396,23 @@ final class NotchUsageCoordinator {
             return
         }
 
+        // Do not show any notch panel while another app owns the menu bar.
+        // Keep the most recent quota in memory for an instant return to ChatGPT.
+        guard preview || chatGPTIsFrontmost() else {
+            closePanels()
+            UsageCardAgent.report(state: "hidden-in-background",
+                                  detail: "ChatGPT 不是当前前台应用，刘海额度已隐藏",
+                                  snapshot: model.quota)
+            return
+        }
+
         if leftPanel == nil || rightPanel == nil { createPanels() }
-        layoutPanels()
-        leftPanel?.orderFrontRegardless()
-        rightPanel?.orderFrontRegardless()
+        if !panelsVisible {
+            layoutPanels()
+            leftPanel?.orderFrontRegardless()
+            rightPanel?.orderFrontRegardless()
+            panelsVisible = true
+        }
 
         if Date() >= nextRefresh && !activeRefresh {
             nextRefresh = Date().addingTimeInterval(90)
@@ -512,7 +558,7 @@ final class NotchUsageCoordinator {
     private func onHover(_ hovering: Bool) {
         dismissTask?.cancel()
         if hovering {
-            guard model.hasChatGPT else { return }
+            guard model.hasChatGPT, (preview || chatGPTIsFrontmost()) else { return }
             layoutPanels()
             detailPanel?.orderFrontRegardless()
         } else {
@@ -526,8 +572,10 @@ final class NotchUsageCoordinator {
 
     private func closePanels() {
         dismissTask?.cancel()
+        guard panelsVisible || detailPanel?.isVisible == true else { return }
         leftPanel?.orderOut(nil)
         rightPanel?.orderOut(nil)
         detailPanel?.orderOut(nil)
+        panelsVisible = false
     }
 }

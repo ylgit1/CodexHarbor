@@ -64,7 +64,7 @@ jobs:
           cat > "$RUNNER_TEMP/release-notes.md" <<EOF
           # Codex Harbor v${VERSION}
 
-          - Native notch quota cards (5-hour and weekly remaining limits and reset countdowns).
+          - Native notch quota cards shown only while ChatGPT is the active foreground app; hidden for other apps.
           - Compact hover details with read-only reset-credit count.
           - Uses the Codex App Server directly, with no Node or CDP injection.
           - Includes Xray and Mihomo; ad-hoc signed and not Apple-notarized.

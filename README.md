@@ -25,12 +25,14 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 
 - [最新 DMG · GitHub 公共下载（无需登录）](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg)
 - [最新 DMG · Gitee 下载（访问大文件可能需要登录）](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg)
-- [v0.1.31 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.31/Codex-Harbor-v0.1.31-arm64.dmg)
+- [v0.1.32 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.32/Codex-Harbor-v0.1.32-arm64.dmg)
 - Gitee 的安装包镜像可能落后于 GitHub；新版本请优先使用 GitHub 公共下载。
 
-v0.1.31 DMG 可通过 [SHA-256 校验清单](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/SHA256SUMS) 核验下载完整性。
+v0.1.32 DMG 可通过 [SHA-256 校验清单](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.32/SHA256SUMS) 核验下载完整性。
 
-**v0.1.31 更新**：增加完全自研的原生刘海额度卡片。ChatGPT 启动后在刘海两侧常驻 5 小时 / 周额度，百分比与重置倒计时同时展示；鼠标悬停显示详细用量和只读可用重置卡张数。无需 Node.js、CDP 或页面注入，并对临时额度读取失败保留最近一次有效数据。
+**v0.1.32 更新**：刘海额度仅在 ChatGPT 是 macOS 当前前台应用时显示；切换 Chrome、Finder、IDEA 等其他应用时立即隐藏两侧额度和悬停详情，切回 ChatGPT 自动恢复且保留已获取额度，避免占用其他应用菜单栏。
+
+**v0.1.31 更新**：增加完全自研的原生刘海额度卡片。ChatGPT 运行时，在刘海两侧显示 5 小时 / 周额度，百分比与重置倒计时同时展示；鼠标悬停显示详细用量和只读可用重置卡张数。无需 Node.js、CDP 或页面注入，并对临时额度读取失败保留最近一次有效数据。
 
 **v0.1.30 更新**：修复 VPN Gate 节点自动重命名长期显示“待识别”以及点击“更新出口地区”后没有地区结果的问题。真实出口验证成功时优先显示真实出口国家；无法验证时使用 VPN Gate 订阅自带的来源国家并在界面标注“来源”，不冒充已验证的实际出口。出口查询新增备用 IP 回显服务，并允许在获得真实出口 IP 后独立查询国家信息。保留 v0.1.29 的真实测速/地区识别停止和子进程清理修复。
 Gitee Raw 大文件可能要求登录，无法直接下载时可使用 GitHub 公共文件下载地址。
@@ -67,7 +69,7 @@ Codex Harbor 当前支持三类 Codex 连接：
 原生 Swift 后台 `HarborUsageCardAgent` 使用 Codex App Server 的
 `account/rateLimits/read` 获取真实 5 小时和每周额度，UI 仅使用 macOS AppKit/SwiftUI 绘制，**不使用 CDP、JavaScript 页面注入或调试端口**。
 
-- **刘海旁常驻**：使用 macOS 刘海安全区域，在左右两侧显示「5小时 / 周额度」两个小型圆环。微型卡片采用双行显示：第一行同时显示额度周期及剩余百分比，第二行常驻简写重置倒计时，圆环始终表示剩余额度；不再交替闪烁。倒计时低频更新，减少 CPU 唤醒。打开 ChatGPT 自动显示，完全退出后自动隐藏；不带刘海的显示器上退化为顶部两个小面板。
+- **刘海旁常驻**：使用 macOS 刘海安全区域，在左右两侧显示「5小时 / 周额度」两个小型圆环。微型卡片采用双行显示：第一行同时显示额度周期及剩余百分比，第二行常驻简写重置倒计时，圆环始终表示剩余额度；不再交替闪烁。倒计时低频更新，减少 CPU 唤醒。切换到 ChatGPT 时立即显示，切到其他 App 时立即隐藏全部卡片（包括悬停详情），保留最近一次额度数据以便切回后快速恢复；不带刘海的显示器上退化为顶部两个小面板。
 - **鼠标悬停**：刘海下方展开紧凑的只读详细卡片，同时显示已用/剩余比例、剩余重置倒计时、重置日期、套餐类型、数据更新时间，以及服务端提供的可用重置卡张数。短时间读取失败会保留上一份有效数据并提示正在重试。
 - **重置卡只读**：仅显示可用张数，不提供消耗操作，也不会向重置卡兑换接口发起请求。
 - **后台管理**：注册当前用户的 `com.codexharbor.usage-card` LaunchAgent。CodexHarbor 主窗口关闭后仍运行；关闭开关会停止服务并清理面板。未安装 Node.js 或 Homebrew 也能使用。
@@ -431,7 +433,7 @@ Transport Installer 当前同时包含 Apple Silicon（arm64）与 Intel（x86_6
 
 ## 下载与安装
 
-从上方「下载安装」下载 v0.1.31 DMG，双击打开后将 `Codex Harbor.app` 拖入 `Applications`。Gitee Raw 大文件可能要求登录，无法直接下载时使用 GitHub 公共文件下载地址；安装前建议校验 SHA-256。当前安装包尚未经过 Apple 公证，其他 Mac 首次打开时可能需要在「系统设置 → 隐私与安全性」中手动允许。
+从上方「下载安装」下载 v0.1.32 DMG，双击打开后将 `Codex Harbor.app` 拖入 `Applications`。Gitee Raw 大文件可能要求登录，无法直接下载时使用 GitHub 公共文件下载地址；安装前建议校验 SHA-256。当前安装包尚未经过 Apple 公证，其他 Mac 首次打开时可能需要在「系统设置 → 隐私与安全性」中手动允许。
 
 构建脚本会优先沿用已安装 Agent 的签名证书，并自动识别有效的 **Apple Development / Developer ID Application** 证书或本机固定名称的自签名证书；`HarborChatGPTAgent` 使用 `com.codexharbor.agent` 代码签名标识。
 

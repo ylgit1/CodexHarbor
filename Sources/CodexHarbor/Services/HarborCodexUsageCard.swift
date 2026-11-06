@@ -55,7 +55,7 @@ enum HarborCodexUsageCard {
             }
             try saveConfiguration(enabled: true)
             try installAgent()
-            return "刘海额度已开启。ChatGPT 运行时自动显示；不需要调试端口。"
+            return "刘海额度已开启。仅 ChatGPT 为当前前台应用时显示；切到其他 App 会自动隐藏。"
         case .disable:
             try saveConfiguration(enabled: false)
             try removeAgent()
@@ -80,6 +80,7 @@ enum HarborCodexUsageCard {
             ].compactMap { $0 }
             return values.isEmpty ? "刘海已显示，额度正在读取" : "刘海显示中 · " + values.joined(separator: " · ")
         case "waiting-for-window": return "等待 ChatGPT 启动后显示"
+        case "hidden-in-background": return "已隐藏 · 切回 ChatGPT 时自动显示"
         case "quota-unavailable": return "额度暂不可用 · " + detail
         default: return detail.isEmpty ? "后台状态：" + value : detail
         }

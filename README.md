@@ -24,9 +24,9 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 ## 下载安装
 
 - [最新 DMG · GitHub 公共下载（无需登录）](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg)
-- [最新 DMG · Gitee 下载（访问大文件可能需要登录）](https://gitee.com/yangxiaoyong01/CodexHarbor/raw/release-assets/latest/Codex-Harbor-arm64.dmg)
+- [Gitee 发行版安装包（按版本选择附件）](https://gitee.com/yangxiaoyong01/CodexHarbor/releases)
 - [v0.1.33 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.33/Codex-Harbor-v0.1.33-arm64.dmg)
-- Gitee 的安装包镜像可能落后于 GitHub；新版本请优先使用 GitHub 公共下载。
+- Gitee 发布附件独立于 GitHub，需要单独上传和核验；以发行版页面显示的实际附件为准，未同步完成时请先从 GitHub 下载。
 
 v0.1.33 DMG 可通过 [SHA-256 校验清单](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.33/SHA256SUMS) 核验下载完整性。
 
@@ -432,6 +432,14 @@ Transport Installer 当前同时包含 Apple Silicon（arm64）与 Intel（x86_6
 - macOS Command Line Tools
 
 不要求 Node、npm 或 Homebrew 才能运行 ChatGPT 接入。
+
+## GitHub / Gitee 双平台发布
+
+- GitHub 正式发布仍使用 `.github/workflows/publish-release.yml`，编译并验证 ARM64 DMG，生成版本号下载链接和 GitHub `latest` 镜像。
+- GitHub 正式发布成功后，`.github/workflows/publish-gitee-release.yml` 会读取**同一份** DMG 和 `SHA256SUMS`，先校验哈希，再向 Gitee 推送源码/标签、创建同版本 Release、上传 DMG 附件并验证其名称和文件大小；此流程与 GitHub 发布分开，可独立重试，失败时不能视作双平台发布完成。
+- **首次配置（必须）**：在 Gitee [个人设置 → 私人令牌](https://gitee.com/profile/personal_access_tokens) 创建具有 `projects` 权限的私人令牌；到 GitHub 仓库的 `Settings → Secrets and variables → Actions → New repository secret` 中创建名称**严格为 `GITEE_TOKEN`** 的 Secret。不要把令牌写入配置文件、终端命令、代码或提交记录。
+- 补发已存在的版本：进入 GitHub Actions → **Mirror verified GitHub Release to Gitee** → **Run workflow**，输入 `v0.1.33`（或目标已有版本标签）。此操作不会重复编译或覆盖 GitHub Release；远端同名附件会先检查，避免重复上传。**未设置 `GITEE_TOKEN` 时工作流会明确失败**。
+- Gitee `release-assets` 原始文件镜像与 Gitee Release 附件是不同的分发路径；旧原始文件镜像未自动更新时，请用 Gitee 的正式发行版附件下载，避免误下历史 DMG。
 
 ## 下载与安装
 

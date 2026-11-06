@@ -1,0 +1,126 @@
+name: Mirror verified GitHub Release to Gitee
+
+on:
+  workflow_run:
+    workflows: ["Publish versioned macOS installer"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing GitHub Release tag to sync (e.g. v0.1.33)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Separate workflow permits retrying a Gitee upload without rebuilding the
+# official GitHub artifact or creating another GitHub Release.
+concurrency:
+  group: codex-harbor-gitee-release
+  cancel-in-progress: false
+
+jobs:
+  gitee-release:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       startsWith(github.event.workflow_run.head_commit.message, 'release: v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      REQUESTED_TAG: ${{ inputs.tag }}
+      PUBLISHED_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Require Gitee publishing authorization
+        shell: bash
+        run: |
+          if [ -z "${GITEE_TOKEN:-}" ]; then
+            echo "::error::Missing GITEE_TOKEN. Add a Gitee Personal Access Token with projects permission under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "workflow_run" ]; then
+            source_commit="$PUBLISHED_SHA"
+            tag=$(python3 - "$source_commit" <<'PY'
+          import plistlib, subprocess, sys
+          contents = subprocess.check_output(
+              ["git", "show", f"${sys.argv[1]}:Resources/Info.plist"]
+          )
+          print("v" + plistlib.loads(contents)["CFBundleShortVersionString"])
+          PY
+          )
+          else
+            tag="$REQUESTED_TAG"
+            source_commit=$(git rev-parse "refs/tags/${tag}^{commit}")
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version tag"
+            exit 2
+          fi
+          tag_commit=$(git rev-parse "refs/tags/${tag}^{commit}")
+          if [ "$source_commit" != "$tag_commit" ]; then
+            echo "::error::The release tag does not match the published source commit"
+            exit 2
+          fi
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "SOURCE_COMMIT=$source_commit" >> "$GITHUB_ENV"
+
+      - name: Download and verify the exact GitHub Release installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gitee-installer"
+          asset="Codex-Harbor-${TAG}-arm64.dmg"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/gitee-installer" --pattern "$asset"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/gitee-installer" --pattern SHA256SUMS
+          (
+            cd "$RUNNER_TEMP/gitee-installer"
+            sha256sum --check SHA256SUMS
+          )
+          echo "ASSET_PATH=$RUNNER_TEMP/gitee-installer/$asset" >> "$GITHUB_ENV"
+          echo "ASSET_SHA256=$(sha256sum "$RUNNER_TEMP/gitee-installer/$asset" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Synchronize source commit and tag to Gitee
+        shell: bash
+        run: |
+          set -euo pipefail
+          askpass="$RUNNER_TEMP/gitee-askpass.sh"
+          cat > "$askpass" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'yangxiaoyong01' ;;
+            *Password*) printf '%s\n' "$GITEE_TOKEN" ;;
+          esac
+          SH
+          chmod 700 "$askpass"
+          export GIT_ASKPASS="$askpass"
+          export GIT_TERMINAL_PROMPT=0
+          git -c credential.helper= push \
+            'https://gitee.com/yangxiaoyong01/CodexHarbor.git' \
+            "${SOURCE_COMMIT}:refs/heads/main"
+          git -c credential.helper= push \
+            'https://gitee.com/yangxiaoyong01/CodexHarbor.git' \
+            "refs/tags/${TAG}:refs/tags/${TAG}"
+
+      - name: Upload and verify Gitee Release attachment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 Scripts/publish-gitee-release.py \
+            --tag "$TAG" --commit "$SOURCE_COMMIT" \
+            --asset "$ASSET_PATH" --sha256 "$ASSET_SHA256"

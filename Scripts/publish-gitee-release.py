@@ -93,7 +93,7 @@ def create_release(tag: str, sha: str, token: str, notes: str):
     return response
 
 
-def upload_attachment(release_id: int, asset: Path, token: str):
+def upload_attachment(release_id: int, asset: Path, token: str, attempt: int = 0):
     # Let curl stream a large multipart file instead of buffering 51 MB into
     # Python's urllib request body. Gitee may need several minutes to accept
     # an upload from a GitHub-hosted runner outside China.
@@ -106,29 +106,37 @@ def upload_attachment(release_id: int, asset: Path, token: str):
     endpoint = f"{GITEE_API}/repos/{REPOSITORY}/releases/{release_id}/attach_files"
     config = (
         f"url = {config_quote(endpoint)}\n"
-        f"form = {config_quote('access_token=' + token)}\n"
+        f"header = {config_quote('Authorization: Bearer ' + token)}\n"
         f"form = {config_quote('file=@' + str(asset.resolve()))}\n"
     )
+    # On some routes the HTTP/1.1 Expect: 100-continue handshake can finish
+    # without the upstream accepting the body. Disable it explicitly. Start
+    # with HTTP/2, then retry once on HTTP/1.1 for compatibility.
+    protocol = "--http2" if attempt == 0 else "--http1.1"
     try:
         result = subprocess.run(
             [
-                "curl", "-q", "--config", "-", "--http1.1",
+                "curl", "-q", "--config", "-", protocol,
+                "--header", "Expect:",
                 "--silent", "--show-error", "--fail",
-                "--connect-timeout", "40", "--max-time", "600",
+                "--connect-timeout", "40", "--max-time", "360",
+                "--speed-limit", "10240", "--speed-time", "90",
                 "--output", "/dev/null",
-                "--write-out", "%{http_code}",
+                "--write-out",
+                "HTTP=%{http_code} uploaded=%{size_upload} speed=%{speed_upload} total=%{time_total}",
             ],
-            input=config, text=True, capture_output=True, timeout=620,
+            input=config, text=True, capture_output=True, timeout=380,
             check=False,
         )
     except subprocess.TimeoutExpired as error:
-        raise PublishError("Gitee multipart upload timed out after 620 seconds.") from error
+        raise PublishError("Gitee multipart upload timed out after 380 seconds.") from error
     if result.returncode:
-        code = result.stdout.strip() or "unknown"
+        details = result.stdout.strip() or "no HTTP response"
         raise PublishError(
-            f"Gitee multipart upload failed (curl exit={result.returncode}, "
-            f"HTTP={code})."
+            f"Gitee multipart upload failed ({protocol}, curl exit={result.returncode}, "
+            f"{details})."
         )
+    print(f"Gitee multipart response ({protocol}): {result.stdout.strip()}", flush=True)
 
 
 def verify_local(asset: Path, expected_sha256: str):
@@ -199,7 +207,7 @@ def main():
         # before trying again, so a network reset never creates duplicates.
         for attempt in range(2):
             try:
-                upload_attachment(release_id, args.asset, token)
+                upload_attachment(release_id, args.asset, token, attempt=attempt)
             except PublishError as error:
                 print(f"Upload attempt {attempt + 1}: {error}", file=sys.stderr,
                       flush=True)

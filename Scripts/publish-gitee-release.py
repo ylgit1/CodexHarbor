@@ -14,11 +14,12 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from pathlib import Path
 
 GITEE_API = "https://gitee.com/api/v5"
@@ -93,25 +94,41 @@ def create_release(tag: str, sha: str, token: str, notes: str):
 
 
 def upload_attachment(release_id: int, asset: Path, token: str):
-    # Upload with the stdlib so GitHub Actions needs no additional packages.
-    boundary = "codex-harbor-" + uuid.uuid4().hex
-    prefix = (
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="access_token"\r\n\r\n'
-        f"{token}\r\n"
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="{asset.name}"\r\n'
-        "Content-Type: application/octet-stream\r\n\r\n"
-    ).encode("utf-8")
-    suffix = f"\r\n--{boundary}--\r\n".encode("ascii")
-    # A single DMG is <100 MB (the Gitee Release per-file limit).
-    content = prefix + asset.read_bytes() + suffix
-    return api(
-        f"releases/{release_id}/attach_files",
-        token=token, method="POST",
-        data=content,
-        content_type=f"multipart/form-data; boundary={boundary}",
+    # Let curl stream a large multipart file instead of buffering 51 MB into
+    # Python's urllib request body. Gitee may need several minutes to accept
+    # an upload from a GitHub-hosted runner outside China.
+    #
+    # Pass the secret in curl's stdin config, never in argv, a URL or logs.
+    # curl is installed on GitHub Actions ubuntu-latest runners.
+    def config_quote(value: str) -> str:
+        return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+    endpoint = f"{GITEE_API}/repos/{REPOSITORY}/releases/{release_id}/attach_files"
+    config = (
+        f"url = {config_quote(endpoint)}\n"
+        f"form = {config_quote('access_token=' + token)}\n"
+        f"form = {config_quote('file=@' + str(asset.resolve()))}\n"
     )
+    try:
+        result = subprocess.run(
+            [
+                "curl", "-q", "--config", "-", "--http1.1",
+                "--silent", "--show-error", "--fail",
+                "--connect-timeout", "40", "--max-time", "600",
+                "--output", "/dev/null",
+                "--write-out", "%{http_code}",
+            ],
+            input=config, text=True, capture_output=True, timeout=620,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise PublishError("Gitee multipart upload timed out after 620 seconds.") from error
+    if result.returncode:
+        code = result.stdout.strip() or "unknown"
+        raise PublishError(
+            f"Gitee multipart upload failed (curl exit={result.returncode}, "
+            f"HTTP={code})."
+        )
 
 
 def verify_local(asset: Path, expected_sha256: str):
@@ -176,19 +193,29 @@ def main():
         if len(matching) != 1 or int(matching[0].get("size", -1)) != size:
             raise PublishError("Gitee already has a conflicting attachment name.")
     else:
-        print(f"Uploading verified {size}-byte installer to Gitee {args.tag}...")
-        try:
-            upload_attachment(release_id, args.asset, token)
-        except PublishError:
-            # The server may have accepted the upload before the connection
-            # failed. Check before attempting a duplicate.
-            pass
-        files = list_attachments(release_id, token)
-        matching = [f for f in files if f.get("name") == args.asset.name]
+        print(f"Uploading verified {size}-byte installer to Gitee {args.tag}...",
+              flush=True)
+        # A timed-out upload can still finish server-side. Re-check the API
+        # before trying again, so a network reset never creates duplicates.
+        for attempt in range(2):
+            try:
+                upload_attachment(release_id, args.asset, token)
+            except PublishError as error:
+                print(f"Upload attempt {attempt + 1}: {error}", file=sys.stderr,
+                      flush=True)
+            files = list_attachments(release_id, token)
+            matching = [f for f in files if f.get("name") == args.asset.name]
+            if len(matching) == 1 and int(matching[0].get("size", -1)) == size:
+                break
+            if matching:
+                raise PublishError("Gitee returned an attachment with a conflicting size.")
+            if attempt == 0:
+                print("Gitee has not confirmed the attachment. Retrying once...",
+                      flush=True)
+                time.sleep(5)
         if len(matching) != 1 or int(matching[0].get("size", -1)) != size:
             raise PublishError(
-                "Gitee attachment upload has not been confirmed; "
-                "check the release and rerun this command."
+                "Gitee attachment upload has not been confirmed after two attempts."
             )
 
     asset_url = matching[0].get("browser_download_url")

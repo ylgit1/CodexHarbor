@@ -8,7 +8,9 @@ on:
   # without asking users to press Run workflow or rebuilding the GitHub DMG.
   push:
     branches: [main]
-    paths: [.github/workflows/publish-gitee-release.yml]
+    paths:
+      - .github/workflows/publish-gitee-release.yml
+      - Scripts/publish-gitee-release.py
   workflow_dispatch:
     inputs:
       tag:

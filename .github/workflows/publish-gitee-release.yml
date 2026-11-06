@@ -4,6 +4,11 @@ on:
   workflow_run:
     workflows: ["Publish versioned macOS installer"]
     types: [completed]
+  # An explicit retry commit can recover a previously failed Gitee upload
+  # without asking users to press Run workflow or rebuilding the GitHub DMG.
+  push:
+    branches: [main]
+    paths: [.github/workflows/publish-gitee-release.yml]
   workflow_dispatch:
     inputs:
       tag:
@@ -24,6 +29,8 @@ jobs:
   gitee-release:
     if: >-
       github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+       startsWith(github.event.head_commit.message, 'ci: retry-gitee-release v')) ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'main' &&
        github.event.workflow_run.head_repository.full_name == github.repository &&
@@ -56,11 +63,15 @@ jobs:
             tag=$(python3 - "$source_commit" <<'PY'
           import plistlib, subprocess, sys
           contents = subprocess.check_output(
-              ["git", "show", f"${sys.argv[1]}:Resources/Info.plist"]
+              ["git", "show", f"{sys.argv[1]}:Resources/Info.plist"]
           )
           print("v" + plistlib.loads(contents)["CFBundleShortVersionString"])
           PY
           )
+          elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            tag=$(git log -1 --format=%s |
+              sed -nE 's/^ci: retry-gitee-release (v[0-9]+\.[0-9]+\.[0-9]+).*$/\1/p')
+            source_commit=$(git rev-parse "refs/tags/${tag}^{commit}")
           else
             tag="$REQUESTED_TAG"
             source_commit=$(git rev-parse "refs/tags/${tag}^{commit}")
@@ -110,12 +121,33 @@ jobs:
           chmod 700 "$askpass"
           export GIT_ASKPASS="$askpass"
           export GIT_TERMINAL_PROMPT=0
-          git -c credential.helper= push \
-            'https://gitee.com/yangxiaoyong01/CodexHarbor.git' \
-            "${SOURCE_COMMIT}:refs/heads/main"
-          git -c credential.helper= push \
-            'https://gitee.com/yangxiaoyong01/CodexHarbor.git' \
-            "refs/tags/${TAG}:refs/tags/${TAG}"
+          gitee='https://gitee.com/yangxiaoyong01/CodexHarbor.git'
+          # Backfilling an older Release must never move Gitee main backwards.
+          # Fetch first, then push only when it is a strict fast-forward.
+          git -c credential.helper= fetch --no-tags "$gitee" refs/heads/main
+          remote_main=$(git rev-parse FETCH_HEAD)
+          if git merge-base --is-ancestor "$SOURCE_COMMIT" "$remote_main"; then
+            echo "Gitee main already includes the published commit. No push needed."
+          elif git merge-base --is-ancestor "$remote_main" "$SOURCE_COMMIT"; then
+            git -c credential.helper= push "$gitee" \
+              "${SOURCE_COMMIT}:refs/heads/main"
+          else
+            echo "::error::Gitee main and source commit have diverged; refusing force push."
+            exit 2
+          fi
+
+          if git ls-remote --exit-code --tags "$gitee" "refs/tags/${TAG}" >/dev/null 2>&1; then
+            git -c credential.helper= fetch --no-tags "$gitee" "refs/tags/${TAG}"
+            remote_tag_commit=$(git rev-parse 'FETCH_HEAD^{commit}')
+            if [ "$remote_tag_commit" != "$SOURCE_COMMIT" ]; then
+              echo "::error::Gitee release tag already targets a different commit."
+              exit 2
+            fi
+            echo "Gitee tag $TAG already matches the published source."
+          else
+            git -c credential.helper= push "$gitee" \
+              "refs/tags/${TAG}:refs/tags/${TAG}"
+          fi
 
       - name: Upload and verify Gitee Release attachment
         shell: bash

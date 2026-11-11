@@ -155,6 +155,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          notes="$RUNNER_TEMP/gitee-installer/release-notes.md"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq '.body' > "$notes"
+          printf '\nARM64 DMG SHA-256 `%s`\n' "$ASSET_SHA256" >> "$notes"
           python3 Scripts/publish-gitee-release.py \
             --tag "$TAG" --commit "$SOURCE_COMMIT" \
-            --asset "$ASSET_PATH" --sha256 "$ASSET_SHA256"
+            --asset "$ASSET_PATH" --sha256 "$ASSET_SHA256" --notes "$notes"

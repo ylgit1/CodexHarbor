@@ -25,10 +25,14 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 
 - [最新 DMG · GitHub 公共下载（无需登录）](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg)
 - [Gitee 发行版安装包（按版本选择附件）](https://gitee.com/yangxiaoyong01/CodexHarbor/releases)
-- [v0.1.33 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.33/Codex-Harbor-v0.1.33-arm64.dmg)
+- [v0.1.34 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.34/Codex-Harbor-v0.1.34-arm64.dmg)
 - Gitee 发布附件独立于 GitHub，需要单独上传和核验；以发行版页面显示的实际附件为准，未同步完成时请先从 GitHub 下载。
 
-v0.1.33 DMG 可通过 [SHA-256 校验清单](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.33/SHA256SUMS) 核验下载完整性。
+可用 SHA-256 校验清单核验 v0.1.34 DMG 的完整性。[下载校验清单](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.34/SHA256SUMS)
+
+**v0.1.34 更新**
+
+订阅节点按服务器地址和端口合并显示，同一入口可切换不同协议配置，列表增加端口列。导入和更新订阅时自动去重相同配置，并修复重复地址导致的刷新崩溃。改善出口地区刷新，VPN Gate 志愿节点支持通过独立 WARP 通道筛选网络类型。本地构建支持固定的代码签名证书。
 
 **v0.1.33 更新**：原生刘海额度卡片升级为一体化灵动岛，紧凑态与详情态共用一个 NSPanel；展开/收回改由 AppKit 单一窗口动画控制，固定顶部锚点并稳定 SwiftUI 内容布局，增加鼠标位置检测与悬停防抖，减少跳动和闪烁。降低后台空闲检查频率及状态写盘次数，保留仅 ChatGPT 前台可见的行为。
 
@@ -451,7 +455,7 @@ Transport Installer 当前同时包含 Apple Silicon（arm64）与 Intel（x86_6
 
 ## 下载与安装
 
-从上方「下载安装」下载 v0.1.33 DMG，双击打开后将 `Codex Harbor.app` 拖入 `Applications`。Gitee Raw 大文件可能要求登录，无法直接下载时使用 GitHub 公共文件下载地址；安装前建议校验 SHA-256。当前安装包尚未经过 Apple 公证，其他 Mac 首次打开时可能需要在「系统设置 → 隐私与安全性」中手动允许。
+从上方「下载安装」下载 v0.1.34 DMG，双击打开后将 `Codex Harbor.app` 拖入 `Applications`。Gitee Raw 大文件可能要求登录，无法直接下载时可使用 GitHub 公共下载地址。安装前建议校验 SHA-256。安装包尚未经过 Apple 公证，其他 Mac 首次打开时可能需要在「系统设置 → 隐私与安全性」中手动允许。
 
 构建脚本会优先沿用已安装 Agent 的签名证书，并自动识别有效的 **Apple Development / Developer ID Application** 证书或本机固定名称的自签名证书；`HarborChatGPTAgent` 使用 `com.codexharbor.agent` 代码签名标识。
 

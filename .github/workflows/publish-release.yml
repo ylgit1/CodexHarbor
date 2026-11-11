@@ -61,17 +61,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
-          # Codex Harbor v${VERSION}
-
-          - Seamless single-window macOS notch island with a compact quota view and expanded detail panel.
-          - Smooth AppKit-only expand/collapse transition, stable top edge, and hover jitter protection.
-          - Quota cards are visible only while ChatGPT is the foreground app.
-          - Compact hover details with read-only reset-credit count.
-          - Uses the Codex App Server directly, with no Node or CDP injection.
-          - Includes Xray and Mihomo; ad-hoc signed and not Apple-notarized.
-          - Source commit: ${GITHUB_SHA}
-          EOF
+          {
+            printf '# Codex Harbor v%s\n\n' "$VERSION"
+            git log -1 --format=%b
+            printf '\nThe Apple Silicon DMG includes Xray and Mihomo and uses an ad-hoc signature.\n'
+            printf '\nSource commit `%s`\n' "$GITHUB_SHA"
+          } > "$RUNNER_TEMP/release-notes.md"
           gh release create "v${VERSION}" "dist/${ASSET_NAME}" dist/SHA256SUMS \
             --target "$GITHUB_SHA" --title "Codex Harbor v${VERSION}" \
             --notes-file "$RUNNER_TEMP/release-notes.md"

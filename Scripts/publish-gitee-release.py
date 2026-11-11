@@ -110,26 +110,27 @@ def upload_attachment(release_id: int, asset: Path, token: str, attempt: int = 0
         f"form = {config_quote('file=@' + str(asset.resolve()))}\n"
     )
     # On some routes the HTTP/1.1 Expect: 100-continue handshake can finish
-    # without the upstream accepting the body. Disable it explicitly. Start
-    # with HTTP/2, then retry once on HTTP/1.1 for compatibility.
-    protocol = "--http2" if attempt == 0 else "--http1.1"
+    # without the upstream accepting the body. Disable it explicitly. The
+    # hosted runner uploaded faster over HTTP/1.1 than HTTP/2.
+    protocol = "--http1.1" if attempt == 0 else "--http2"
+    upload_timeout = 2400
     try:
         result = subprocess.run(
             [
                 "curl", "-q", "--config", "-", protocol,
                 "--header", "Expect:",
                 "--silent", "--show-error", "--fail",
-                "--connect-timeout", "40", "--max-time", "360",
+                "--connect-timeout", "40", "--max-time", str(upload_timeout),
                 "--speed-limit", "10240", "--speed-time", "90",
                 "--output", "/dev/null",
                 "--write-out",
                 "HTTP=%{http_code} uploaded=%{size_upload} speed=%{speed_upload} total=%{time_total}",
             ],
-            input=config, text=True, capture_output=True, timeout=380,
+            input=config, text=True, capture_output=True, timeout=upload_timeout + 20,
             check=False,
         )
     except subprocess.TimeoutExpired as error:
-        raise PublishError("Gitee multipart upload timed out after 380 seconds.") from error
+        raise PublishError("Gitee multipart upload exceeded its process timeout.") from error
     if result.returncode:
         details = result.stdout.strip() or "no HTTP response"
         raise PublishError(

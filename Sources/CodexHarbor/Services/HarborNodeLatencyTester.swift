@@ -111,6 +111,24 @@ struct HarborNodeDelayReport: Sendable {
     }
 }
 
+/// Whether a node's isolated proxy actually started matters separately from
+/// a remote IP/GeoIP failure. Never report a failed startup as a network test.
+struct HarborNodeExitGeoReport: Sendable {
+    let location: HarborProxyIPLocation?
+    let failure: String?
+    let started: Bool
+
+    static func probed(_ location: HarborProxyIPLocation?) -> Self {
+        Self(location: location,
+             failure: location == nil ? "未能通过该节点获取出口 IP 或地区" : nil,
+             started: true)
+    }
+
+    static func notStarted(_ reason: String) -> Self {
+        Self(location: nil, failure: reason, started: false)
+    }
+}
+
 /// One v2rayN-style real-delay attempt, isolated from the active proxy.
 private final class HarborRealDelayAttempt: @unchecked Sendable {
     private let lock = NSLock()
@@ -372,6 +390,14 @@ final class HarborRealDelayBatch: @unchecked Sendable {
         return await HarborNodeGeoIPResolver.exitLocation(socksPort: port, cancellation: cancellation)
     }
 
+    func exitLocationReport(node: HarborProxyNode) async -> HarborNodeExitGeoReport {
+        guard portsByNodeID[node.id] != nil, !cancellation.isCancelled,
+              !Task.isCancelled, engine.isRunning else {
+            return .notStarted("节点检测代理未启动或已退出")
+        }
+        return .probed(await exitLocation(node: node))
+    }
+
     func measure(node: HarborProxyNode) async -> HarborNodeDelayReport {
         guard let port = portsByNodeID[node.id], !cancellation.isCancelled else {
             return .failed("测试已取消")
@@ -491,6 +517,42 @@ enum HarborNodeLatencyTester {
         }.value
     }
 
+    /// A malformed profile can prevent a shared Xray from starting. Retry
+    /// each node independently, under the caller's concurrency limit, rather
+    /// than silently returning nil for every other profile in that batch.
+    static func probeExitLocation(
+        node: HarborProxyNode, root: URL,
+        cancellation: HarborLatencyCancellation,
+        batch: HarborRealDelayBatch? = nil
+    ) async -> HarborNodeExitGeoReport {
+        guard !Task.isCancelled, !cancellation.isCancelled else {
+            return .notStarted("地区识别已取消")
+        }
+        if let batch {
+            let report = await batch.exitLocationReport(node: node)
+            if report.started { return report }
+        }
+        guard FileManager.default.isExecutableFile(
+            atPath: root.appendingPathComponent("xray").path
+        ) else {
+            return .notStarted("检测内核缺失或无法运行")
+        }
+        // Validate locally before starting a process. Do not expose raw core
+        // errors, which can include subscription addresses or credentials.
+        guard (try? HarborXrayConfig.makeRealPingBatch(
+            nodes: [node], basePort: 18200)) != nil else {
+            return .notStarted("节点配置不受支持或参数不完整，检测代理未启动")
+        }
+        guard let isolated = await startRealBatch(
+            nodes: [node], root: root, cancellation: cancellation
+        ) else {
+            return .notStarted("节点检测代理启动失败，请检查节点配置或本地端口占用")
+        }
+        let report = await isolated.exitLocationReport(node: node)
+        await Task.detached(priority: .utility) { isolated.close() }.value
+        return report
+    }
+
     fileprivate static func reservePortRange(_ count: Int) -> Int? {
         guard (1...HarborProxyLatencyPolicy.realPingBatchSize).contains(count) else { return nil }
         portLock.lock()
@@ -548,7 +610,7 @@ enum HarborNodeLatencyTester {
         portLock.unlock()
     }
 
-    fileprivate static func waitUntilListening(
+    static func waitUntilListening(
         port: Int,
         process: Process,
         cancellation: HarborLatencyCancellation
@@ -623,9 +685,11 @@ enum HarborMihomoLatencyTester {
 
     static func measure(node: HarborProxyNode, root: URL,
                         cancellation: HarborLatencyCancellation,
-                        underlaySocksPort: Int? = nil) async -> HarborNodeDelayReport {
+                        underlaySocksPort: Int? = nil,
+                        warpProfile: HarborWARPProfile? = nil) async -> HarborNodeDelayReport {
         guard let result = await withProxy(node: node, root: root, cancellation: cancellation,
                                            underlaySocksPort: underlaySocksPort,
+                                           warpProfile: warpProfile,
                                            action: { socksPort, failureLog in
             await warmupAndMeasure(socksPort: socksPort, cancellation: cancellation,
                                    failureLog: failureLog)
@@ -659,16 +723,30 @@ enum HarborMihomoLatencyTester {
     }
 
     static func exitLocation(node: HarborProxyNode, root: URL,
-                             cancellation: HarborLatencyCancellation) async -> HarborProxyIPLocation? {
-        await withProxy(node: node, root: root, cancellation: cancellation) { socksPort, _ in
-            await HarborNodeGeoIPResolver.exitLocation(
-                socksPort: socksPort, cancellation: cancellation)
-        } ?? nil
+                             cancellation: HarborLatencyCancellation,
+                             warpProfile: HarborWARPProfile? = nil) async -> HarborProxyIPLocation? {
+        await exitLocationReport(node: node, root: root, cancellation: cancellation,
+                                 warpProfile: warpProfile).location
+    }
+
+    static func exitLocationReport(
+        node: HarborProxyNode, root: URL, cancellation: HarborLatencyCancellation,
+        warpProfile: HarborWARPProfile? = nil
+    ) async -> HarborNodeExitGeoReport {
+        let report = await withProxy(
+            node: node, root: root, cancellation: cancellation,
+            warpProfile: warpProfile
+        ) { socksPort, _ in
+            HarborNodeExitGeoReport.probed(await HarborNodeGeoIPResolver.exitLocation(
+                socksPort: socksPort, cancellation: cancellation))
+        }
+        return report ?? .notStarted("Mihomo/OpenVPN 检测代理未启动，请检查节点配置及检测内核")
     }
 
     private static func withProxy<T: Sendable>(
         node: HarborProxyNode, root: URL, cancellation: HarborLatencyCancellation,
         underlaySocksPort: Int? = nil,
+        warpProfile: HarborWARPProfile? = nil,
         action: @escaping @Sendable (Int, URL) async -> T
     ) async -> T? {
         guard !cancellation.isCancelled,
@@ -679,7 +757,8 @@ enum HarborMihomoLatencyTester {
         let binary = root.appendingPathComponent("mihomo")
         guard FileManager.default.isExecutableFile(atPath: binary.path),
               let config = try? HarborMihomoConfig.make(
-                node: node, httpPort: port, underlaySocksPort: underlaySocksPort),
+                node: node, httpPort: port, underlaySocksPort: underlaySocksPort,
+                warpProfile: warpProfile),
               (try? config.write(to: configPath, options: .atomic)) != nil else { return nil }
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configPath.path)
         defer { try? FileManager.default.removeItem(at: configPath) }

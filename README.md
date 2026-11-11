@@ -161,6 +161,9 @@ XTLS Xray-core、`geoip.dat` 和 `geosite.dat`。首次启动会把它们复制�
 
 从已有 v2rayN 迁移的底层兼容代码仍然保留，但不再是新设备安装的前置条件。
 可通过「新增」导入 HTTPS 订阅或 VLESS、VMess、Trojan、Shadowsocks 分享链接。
+导入、刷新订阅和载入已有节点时会自动合并完整连接配置相同的重复项，保留收藏和自定义名称。
+不同协议、端口或连接参数仍分别显示；相同节点若来自不同订阅，各订阅保留自己的来源记录，
+「全部节点」和「我的收藏」各只显示一次。列表视图有独立「端口」列，卡片也显示地址和端口。
 敏感节点、订阅信息保存在系统钥匙串，临时运行配置设为 0600 权限。
 
 **公开候选节点（实验性）**：代理页保留
@@ -176,9 +179,14 @@ XTLS Xray-core、`geoip.dat` 和 `geosite.dat`。首次启动会把它们复制�
 住宅订阅每次最多自动测试 20 个节点，VPN Gate 每次最多自动测试 24 个节点，并优先
 测尚未测过的家宽入口；再次筛选会推进到后续候选，不会永远重复第一批。测试使用与当前
 系统代理隔离的 Xray 或内置 Mihomo/OpenVPN 实例；VPN Gate 的 TCP 入口先做短时预筛，
-避免把明显无法连接的入口逐个等待 OpenVPN 握手超时。若当前已有健康的普通订阅节点，
-抓取候选、入口预筛和 OpenVPN 测试会走该节点；选用 VPN Gate 节点时也沿用这条底座链路。
-没有底座节点时仍可直连尝试，失败会明确显示，不会把入口连通当作出口可用。
+避免把明显无法连接的入口逐个等待 OpenVPN 握手超时。VPN Gate 筛选会自动建立独立的
+Cloudflare WARP/MASQUE 通道，不要求提前导入或启用普通订阅节点，也不使用志愿候选来
+建立初始通道。首次通过 Cloudflare 接口生成本机独有的凭据，随后保存在加密配置中复用；
+不内置共享私钥，不需要安装 WARP 客户端或首次下载额外内核。自动尝试 TCP/HTTP2 与
+QUIC/HTTP3 地址，必须同时通过 WARP 出口标记及非 Cloudflare 的实际 HTTPS 请求才采用。
+抓取名单、入口预筛和家宽入口识别走独立临时通道；每个 OpenVPN 测速实例和正式连接
+直接嵌入同一条 WARP 路径，关闭临时通道不会使已选节点失效。通道故障会单独提示，
+不会把全部志愿节点记为失败。首次注册接口或通道本身在当前网络不可达时仍可能无法筛选。
 只有经 SOCKS5 完成实际 HTTPS 请求才算可用；**刷新和测试不会自动切换节点或接管系统代理**。
 节点使用后也要再次核验。
 当前版本没有独立的 MITM 与风险评分全套筛选，因此不能承诺住宅出口身份、
@@ -186,9 +194,9 @@ XTLS Xray-core、`geoip.dat` 和 `geosite.dat`。首次启动会把它们复制�
 
 实现参考：[`xehn/vpngate.go`](https://github.com/hezhanleiok/xehn/blob/main/vpngate.go)
 从 VPN Gate 抓取 OpenVPN 配置，做列表缓存、本机 TCP 延迟检测、住宅/机房分类及
-短期失败记忆。本应用实现了 VPN Gate 获取与 Mihomo 原生 OpenVPN 出站，但**没有实现
-xehn 的 WARP 底层链路或其住宅归类规则**：当前普通订阅节点只是一条可选底座，
-不是 WARP 的等价替代；若底座或志愿节点本身不稳定，仍可能没有可用节点。
+短期失败记忆。本应用实现了 VPN Gate 获取、Mihomo 原生 OpenVPN 出站及独立 WARP/MASQUE 底层链路；
+住宅归类仍使用明确的公开网络类型证据，不将所有志愿节点默认归为家宽。
+若 Cloudflare 注册、独立通道或志愿节点本身不可用，仍可能没有可用节点。
 VPN Gate 出站的域名解析由 Mihomo 通过所选出口的 DoH 完成，避免沿用本机可能错误的 DNS。
 节点真正的运营商类型和风险分须由独立可靠来源核查，不能由 VPN Gate 自报。
 [`freesub/scripts/main_v2.py`](https://github.com/hezhanleiok/freesub/blob/main/scripts/main_v2.py)
@@ -446,6 +454,10 @@ Transport Installer 当前同时包含 Apple Silicon（arm64）与 Intel（x86_6
 从上方「下载安装」下载 v0.1.33 DMG，双击打开后将 `Codex Harbor.app` 拖入 `Applications`。Gitee Raw 大文件可能要求登录，无法直接下载时使用 GitHub 公共文件下载地址；安装前建议校验 SHA-256。当前安装包尚未经过 Apple 公证，其他 Mac 首次打开时可能需要在「系统设置 → 隐私与安全性」中手动允许。
 
 构建脚本会优先沿用已安装 Agent 的签名证书，并自动识别有效的 **Apple Development / Developer ID Application** 证书或本机固定名称的自签名证书；`HarborChatGPTAgent` 使用 `com.codexharbor.agent` 代码签名标识。
+
+已配置专用本地签名身份时，构建脚本优先读取 `~/Library/Application Support/CodexHarbor/CodeSigning/profile.json`（可用 `CODEX_HARBOR_SIGNING_PROFILE` 指定其他配置），按证书指纹固定身份，并自动解锁专用签名钥匙串。配置缺失、凭据不可用或证书失效会停止打包，不会默默改用 ad-hoc 签名；显式设置 `CODEX_HARBOR_SIGN_IDENTITY` 仍可覆盖。签名前先检查身份，避免完成编译后才发现问题。
+
+专用签名目录中的加密 `identity.p12`、钥匙串及凭据文件只应保留在本机或安全备份中，不得提交 Git 或放入安装包。后续更新应继续使用同一证书和私钥；切换签名身份后，首次访问现有受保护条目仍可能需要重新授权。
 
 **不付费、仅在自己的 Mac 上开发：** 打开「钥匙串访问」→ 菜单「钥匙串访问」→「证书助理」→「创建证书」，将名称设为 `Codex Harbor Local Code Signing`，身份类型选「自签名根证书」，证书类型选「代码签名」。保存到登录钥匙串并保留私钥；若系统不认可该证书的代码签名用途，需要在钥匙串里按需检查信任设置。创建后检查：
 

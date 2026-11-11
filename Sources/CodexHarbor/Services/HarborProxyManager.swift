@@ -12,6 +12,10 @@ private struct HarborProxyState: Codable, Equatable, Sendable {
     var selectedID: String?
     // Optional so existing encrypted configurations continue to decode.
     var vpnGateUnderlayNodeID: String?
+    // Optional fields preserve existing encrypted state on upgrade.
+    var warpAccount: HarborWARPAccount?
+    var warpEndpoint: HarborWARPEndpoint?
+    var warpProbeEndpoints: [String: HarborWARPEndpoint]?
     var routingRules = true
     // Optional so existing Keychain JSON decodes without losing saved subscriptions.
     var forcedProxyDomains: [String]?
@@ -37,6 +41,7 @@ private struct HarborProxyProcessRecord: Codable {
     var configPath: String
     var executablePath: String
     var underlay: HarborProxyUnderlayRecord?
+    var warpEndpoint: HarborWARPEndpoint?
 }
 
 private struct HarborProxyUnderlayRecord: Codable {
@@ -206,6 +211,7 @@ private final class HarborSystemProxyChangeMonitor: @unchecked Sendable {
 @MainActor
 final class HarborProxyManager: ObservableObject {
     static let shared = HarborProxyManager()
+    static let favoriteNodeIDsKey = "com.codexharbor.proxy.favoriteNodeIDs"
     @Published private(set) var nodes: [HarborProxyNode] = []
     @Published private(set) var subscriptions: [HarborProxySubscription] = []
     @Published private(set) var selectedID: String?
@@ -235,6 +241,7 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var nodeExitLocations: [String: HarborProxyExitLocation] = [:]
     @Published private(set) var exitGeoUpdating = false
     @Published private(set) var exitGeoUnrecognizedIDs: Set<String> = []
+    @Published private(set) var exitGeoFailureReasons: [String: String] = [:]
     @Published private(set) var exitGeoCompleted = 0
     @Published private(set) var exitGeoTotal = 0
     @Published private(set) var latencyTesting = false
@@ -271,11 +278,11 @@ final class HarborProxyManager: ObservableObject {
     private var exitGeoActiveBatch: HarborRealDelayBatch?
     private var exitGeoManualGeneration: UUID?
     private var exitGeoWatchdog: Task<Void, Never>?
-    private let exitGeoBatchDeadlineSeconds = 75
     private var exitGeoPendingIDs = Set<String>()
     private var exitGeoForcedIDs = Set<String>()
     private var exitGeoManualIDs = Set<String>()
     private var exitGeoManualSucceeded = 0
+    private var exitGeoManualNotStarted = 0
     private var exitGeoAttemptedAt: [String: Date] = [:]
     private var exitGeoFailureCounts: [String: Int] = [:]
     private var exitGeoRetryTask: Task<Void, Never>?
@@ -290,6 +297,9 @@ final class HarborProxyManager: ObservableObject {
     private var underlayConfigPath: URL?
     private var underlayPort: Int?
     private var vpnGateUnderlayNodeID: String?
+    private var activeWARPProfile: HarborWARPProfile?
+    private var warpRegistrationTask: Task<HarborWARPAccount, Error>?
+    private var vpnGateDownloadCancellation: HarborLatencyCancellation?
     private var bootstrapped = false
     private var bootstrapping = false
     /// Bounded, non-sensitive startup tracing for diagnosing fixed-port recovery.
@@ -338,10 +348,45 @@ final class HarborProxyManager: ObservableObject {
     /// A relay's validity is scoped to its network path. Changing from
     /// direct access to VLESS (or switching VLESS nodes) requires new evidence.
     private var vpnGateProbeRouteID: String {
-        guard workingUnderlaySocksPort != nil else { return "direct" }
-        let baseID = activeNode?.protocolName == "openvpn"
-            ? vpnGateUnderlayNodeID : activeNodeID
-        return "underlay:" + (baseID ?? "unknown")
+        guard let account = store.warpAccount, let endpoint = store.warpEndpoint else { return "direct" }
+        return HarborWARPProfile(account: account, endpoint: endpoint).routeID
+    }
+
+    private func warpProfile(for node: HarborProxyNode) -> HarborWARPProfile? {
+        guard node.protocolName == "openvpn", let account = store.warpAccount,
+              let endpoint = store.warpProbeEndpoints?[node.id] ?? store.warpEndpoint else { return nil }
+        return HarborWARPProfile(account: account, endpoint: endpoint)
+    }
+
+    /// Enrollment and discovery are independent of the selected subscription,
+    /// the active proxy, and every VPN Gate candidate.
+    private func prepareIndependentVPNGateTunnel(
+        cancellation: HarborLatencyCancellation,
+        preferred: HarborWARPEndpoint? = nil
+    ) async throws -> HarborWARPTunnel {
+        guard mihomoInstalled else { throw HarborProxyError.invalid("请从安装包恢复内置 Mihomo 内核") }
+        if store.warpAccount == nil {
+            detail = "首次准备独立筛选通道，正在生成本机凭据"
+            if warpRegistrationTask == nil {
+                warpRegistrationTask = Task { try await HarborWARPRegistration.register() }
+            }
+            let task = warpRegistrationTask!
+            let observer = cancellation.observe { task.cancel() }
+            defer {
+                if let observer { cancellation.removeObserver(observer) }
+                warpRegistrationTask = nil
+            }
+            store.warpAccount = try await task.value
+            persist()
+        }
+        guard !cancellation.isCancelled, let account = store.warpAccount else { throw CancellationError() }
+        detail = "正在验证独立筛选通道，无需启用订阅节点"
+        let tunnel = try await HarborWARPTunnel.prepare(
+            account: account, preferred: preferred ?? store.warpEndpoint,
+            root: root, cancellation: cancellation)
+        store.warpEndpoint = tunnel.profile.endpoint
+        persist()
+        return tunnel
     }
 
     private func runningConfigMatches(_ id: String, path: URL?) -> Bool {
@@ -349,7 +394,8 @@ final class HarborProxyManager: ObservableObject {
               let path, let data = try? Data(contentsOf: path) else { return false }
         return node.protocolName == "openvpn"
             ? HarborMihomoConfig.matches(configuration: data, node: node,
-                                         underlaySocksPort: underlayPort.map { $0 + 1 })
+                                         underlaySocksPort: underlayPort.map { $0 + 1 },
+                                         warpProfile: activeWARPProfile)
             : HarborProxyRuntimeIdentity.matches(configuration: data, node: node)
     }
 
@@ -574,6 +620,8 @@ final class HarborProxyManager: ObservableObject {
         NSLog("HarborProxy lifecycle: bootstrap entered")
         bootstrapping = true
         defer { bootstrapping = false }
+        let probeRoot = root
+        await Task.detached(priority: .utility) { HarborWARPTunnel.cleanupOrphans(root: probeRoot) }.value
         if !configurationLoaded {
             do {
                 let state = try await persistence.load()
@@ -595,12 +643,26 @@ final class HarborProxyManager: ObservableObject {
                 forcedProxyDomains = (try? HarborProxyDomainRules.normalized(
                     state.forcedProxyDomains ?? HarborProxyDomainRules.defaults
                 )) ?? HarborProxyDomainRules.defaults
+                let favorites = favoriteNodeIDs
+                let distinct = HarborProxyNodeDeduplication.coalesce(
+                    nodes, withinSubscriptions: true
+                ) { node in
+                    if node.id == selectedID { return 8 }
+                    if node.id == vpnGateUnderlayNodeID { return 4 }
+                    if favorites.contains(node.id) { return 2 }
+                    return probeResults[node.id]?.succeeded == true ? 1 : 0
+                }
+                let removedDuplicates = distinct.nodes.count < nodes.count
+                if removedDuplicates {
+                    mergeDuplicateMetadata(distinct.replacementIDs, keeping: distinct.nodes)
+                    nodes = distinct.nodes
+                }
                 configurationLoaded = true
                 var namesChanged = false
                 for subscription in subscriptions {
                     namesChanged = refreshAutomaticNames(for: subscription.id) || namesChanged
                 }
-                if namesChanged { persist() }
+                if namesChanged || removedDuplicates { persist() }
             } catch {
                 detail = "代理配置载入失败：" + error.localizedDescription
                 configurationLoaded = true
@@ -810,6 +872,10 @@ final class HarborProxyManager: ObservableObject {
     private func persist() {
         guard configurationLoaded else { return }
         store.nodes = nodes
+        if let endpoints = store.warpProbeEndpoints {
+            let validIDs = Set(nodes.map(\.id))
+            store.warpProbeEndpoints = endpoints.filter { validIDs.contains($0.key) }
+        }
         store.nodeServerLocations = nodeServerLocations
         store.nodeNetworkEvidence = nodeNetworkEvidence
         store.nodeServerResolvedAt = nodeServerResolvedAt
@@ -965,10 +1031,18 @@ final class HarborProxyManager: ObservableObject {
     func addLinks(_ value: String) {
         let items = HarborProxyLinks.parse(value)
         guard !items.isEmpty else { detail = "未找到有效节点链接"; return }
-        nodes += items
+        let additions = HarborProxyNodeDeduplication.newNodes(items, excluding: nodes)
+        let duplicates = items.count - additions.count
+        guard !additions.isEmpty else {
+            detail = "节点已存在，已跳过 \(duplicates) 个重复节点"
+            return
+        }
+        nodes += additions
         scheduleGeoIPRefresh()
-        if selectedID == nil { selectedID = items[0].id }
-        persist(); detail = "已导入 \(items.count) 个节点"
+        if selectedID == nil { selectedID = additions[0].id }
+        persist()
+        detail = "已导入 \(additions.count) 个节点"
+            + (duplicates > 0 ? "；已跳过 \(duplicates) 个重复节点" : "")
     }
 
     @discardableResult
@@ -1013,13 +1087,9 @@ final class HarborProxyManager: ObservableObject {
             busy = true
             detail = "正在获取新订阅并校验节点…"
             do {
-                let previousIPs = Dictionary(uniqueKeysWithValues: nodes
-                    .filter { $0.subscriptionID == id }
-                    .compactMap { node in
-                        nodeServerLocations[node.host.lowercased()].map {
-                            (node.host.lowercased(), $0.ip)
-                        }
-                    })
+                let previousIPs = HarborProxySubscriptionRefreshPolicy.resolvedIPSnapshot(
+                    nodes: nodes, subscriptionID: id, serverLocations: nodeServerLocations
+                )
                 let incoming = try await downloadSubscriptionNodes(from: sourceURL, id: id)
                 let update = applySubscriptionNodes(incoming, id: id)
                 let currentIPs = HarborProxyCommunitySource.matching(updated.url) == .vpnGate
@@ -1044,7 +1114,8 @@ final class HarborProxyManager: ObservableObject {
                 busy = false
                 // Import and refresh never start an unrequested batch probe.
                 // New or changed nodes are shown as 未测速 until the user tests.
-                detail = "订阅「\(updated.name)」已保存并更新 \(update.count) 个节点；待测速 \(testIDs.count) 个" +
+                detail = "订阅「\(updated.name)」已保存并更新 \(update.count) 个节点；待测速 \(testIDs.count) 个"
+                    + update.duplicateSummary +
                     (update.retainedActive
                         ? "；原连接保持运行，请手动选择新节点"
                         : "；不会自动切换当前连接")
@@ -1126,11 +1197,9 @@ final class HarborProxyManager: ObservableObject {
               let url = URL(string: subscription.url) else { return }
         busy = true
         do {
-            let previousIPs = Dictionary(uniqueKeysWithValues: nodes
-                .filter { $0.subscriptionID == id }
-                .compactMap { node in
-                    nodeServerLocations[node.host.lowercased()].map { (node.host.lowercased(), $0.ip) }
-                })
+            let previousIPs = HarborProxySubscriptionRefreshPolicy.resolvedIPSnapshot(
+                nodes: nodes, subscriptionID: id, serverLocations: nodeServerLocations
+            )
             let incoming = try await downloadSubscriptionNodes(from: url, id: id)
             let update = applySubscriptionNodes(incoming, id: id)
             let currentIPs = HarborProxyCommunitySource.matching(subscription.url) == .vpnGate
@@ -1152,11 +1221,12 @@ final class HarborProxyManager: ObservableObject {
             persist()
             busy = false
             // Don't silently test the full subscription after refresh.
-            detail = "订阅更新完成：\(update.count) 个节点；待测速 \(testIDs.count) 个" +
+            detail = "订阅更新完成：\(update.count) 个节点；待测速 \(testIDs.count) 个"
+                + update.duplicateSummary +
                 (update.retainedActive ? "；原连接仍在运行，请手动选择最新节点" : "")
         } catch {
             busy = false
-            detail = "更新失败，已保留原节点：" + error.localizedDescription
+            detail = "订阅「\(subscription.name)」更新失败，已保留原节点：" + error.localizedDescription
         }
     }
 
@@ -1229,11 +1299,19 @@ final class HarborProxyManager: ObservableObject {
             return
         }
         var failedSources = 0
+        var lastSourceFailure: String?
         for subscription in sources {
             guard !Task.isCancelled else { return }
             let previousUpdate = subscriptionUpdatedAt[subscription.id]
             await refreshCommunitySubscription(subscription.id)
-            if subscriptionUpdatedAt[subscription.id] == previousUpdate { failedSources += 1 }
+            if subscriptionUpdatedAt[subscription.id] == previousUpdate {
+                failedSources += 1
+                lastSourceFailure = detail
+            }
+        }
+        if failedSources == sources.count {
+            detail = "筛选未完成：" + (lastSourceFailure ?? "独立通道或节点来源暂时不可用") + "；已保留旧列表"
+            return
         }
         let gateIDs = Set(subscriptions.filter {
             HarborProxyCommunitySource.matching($0.url) == .vpnGate
@@ -1268,27 +1346,26 @@ final class HarborProxyManager: ObservableObject {
         var request = URLRequest(url: url)
         request.timeoutInterval = url.host == "api.github.com" ? 8 : 20
         if url.host == "api.github.com" { request.setValue("CodexHarbor", forHTTPHeaderField: "User-Agent") }
-        let gateFeed = url.host == "www.vpngate.net"
-        let activeProxyPort = running && healthy
-            ? (gateFeed && activeNode?.protocolName == "openvpn" ? underlayPort : localPort)
-            : nil
-        let attempts: [Int?] = gateFeed && activeProxyPort != nil
-            ? [activeProxyPort, nil] : [activeProxyPort]
+        let gateFeed = HarborProxyCommunitySource.matching(url.absoluteString) == .vpnGate
+        let tunnel: HarborWARPTunnel?
+        if gateFeed {
+            let cancellation = HarborLatencyCancellation()
+            vpnGateDownloadCancellation = cancellation
+            defer { vpnGateDownloadCancellation = nil }
+            tunnel = try await prepareIndependentVPNGateTunnel(cancellation: cancellation)
+        } else {
+            tunnel = nil
+        }
+        defer { tunnel?.close() }
+        let activeProxyPort = gateFeed ? tunnel?.httpPort : (running && healthy ? localPort : nil)
+        let attempts: [Int?] = [activeProxyPort]
         var downloaded: Data?
         var usedProxyPort: Int?
         var lastError: Error = HarborProxyError.invalid("订阅响应不是有效的 HTTP 200 文本（最大 2 MB）")
         for proxyPort in attempts {
-            let config = URLSessionConfiguration.ephemeral
-            if let proxyPort {
-                config.connectionProxyDictionary = [
-                    "HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": proxyPort,
-                    "HTTPSEnable": 1, "HTTPSProxy": "127.0.0.1", "HTTPSPort": proxyPort
-                ]
-            } else if gateFeed {
-                config.connectionProxyDictionary = [
-                    "HTTPEnable": 0, "HTTPSEnable": 0, "SOCKSEnable": 0
-                ]
-            }
+            let config = proxyPort == nil && !gateFeed
+                ? URLSessionConfiguration.ephemeral
+                : HarborProxyHTTP.configuration(httpPort: proxyPort)
             let session = URLSession(configuration: config)
             defer { session.invalidateAndCancel() }
             do {
@@ -1331,6 +1408,36 @@ final class HarborProxyManager: ObservableObject {
         return incoming
     }
 
+    private var favoriteNodeIDs: Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: Self.favoriteNodeIDsKey) ?? [])
+    }
+
+    private func mergeDuplicateMetadata(_ replacements: [String: String],
+                                        keeping remaining: [HarborProxyNode]) {
+        guard !replacements.isEmpty else { return }
+        let favorites = favoriteNodeIDs
+        let mergedFavorites = Set(favorites.map { replacements[$0] ?? $0 })
+        if mergedFavorites != favorites {
+            UserDefaults.standard.set(mergedFavorites.sorted(), forKey: Self.favoriteNodeIDsKey)
+        }
+        if let selectedID { self.selectedID = replacements[selectedID] ?? selectedID }
+        if let vpnGateUnderlayNodeID {
+            self.vpnGateUnderlayNodeID = replacements[vpnGateUnderlayNodeID] ?? vpnGateUnderlayNodeID
+        }
+        let byID = Dictionary(remaining.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for (removed, kept) in replacements {
+            if let probe = probeResults.removeValue(forKey: removed),
+               probeResults[kept] == nil {
+                probeResults[kept] = probe
+            }
+            if let observation = nodeExitLocations.removeValue(forKey: removed),
+               nodeExitLocations[kept] == nil,
+               observation.endpointSignature == byID[kept]?.endpointSignature {
+                nodeExitLocations[kept] = observation
+            }
+        }
+    }
+
     /// No Xray restart is performed. Preserve matching profile IDs, aliases
     /// and favorites; retain an active endpoint removed by the provider until
     /// the user explicitly connects to a new profile.
@@ -1338,6 +1445,11 @@ final class HarborProxyManager: ObservableObject {
         let count: Int
         let retainedActive: Bool
         let previousNodeIDs: Set<String>
+        let duplicatesRemoved: Int
+
+        var duplicateSummary: String {
+            duplicatesRemoved > 0 ? "；已合并 \(duplicatesRemoved) 个重复节点" : ""
+        }
     }
 
     private func applySubscriptionNodes(_ incoming: [HarborProxyNode], id: String)
@@ -1345,8 +1457,10 @@ final class HarborProxyManager: ObservableObject {
         let previousNodeIDs = Set(nodes.filter { $0.subscriptionID == id }.map(\.id))
         let merged = HarborProxySubscriptionReconciler.replace(
             current: nodes, incoming: incoming, subscriptionID: id,
-            selectedID: selectedID, keepActiveConnection: running
+            selectedID: activeNodeID ?? selectedID, keepActiveConnection: running,
+            preferredNodeIDs: favoriteNodeIDs
         )
+        mergeDuplicateMetadata(merged.replacementIDs, keeping: merged.nodes)
         let validIDs = Set(merged.nodes.map(\.id))
         nodes = merged.nodes
         selectedID = merged.selectedID
@@ -1363,10 +1477,12 @@ final class HarborProxyManager: ObservableObject {
             }
         }
         subscriptionUpdatedAt[id] = .now
+        let count = merged.nodes.filter { $0.subscriptionID == id }.count
         return SubscriptionNodeUpdate(
-            count: incoming.count,
+            count: count,
             retainedActive: merged.retainedActiveNode,
-            previousNodeIDs: previousNodeIDs
+            previousNodeIDs: previousNodeIDs,
+            duplicatesRemoved: max(0, incoming.count - count)
         )
     }
 
@@ -1448,10 +1564,9 @@ final class HarborProxyManager: ObservableObject {
             detail = "所选节点已不存在"
             return
         }
-        let underlayID = requestedNode.protocolName == "openvpn" && healthy
-            ? (activeNode?.protocolName == "openvpn"
-                ? (underlayPort == nil ? nil : vpnGateUnderlayNodeID)
-                : activeNodeID) : nil
+        // New VPN Gate connections build their own WARP underlay. Never
+        // silently borrow the ordinary subscription that happened to be active.
+        let underlayID: String? = nil
         let previousUnderlayID = activeNode?.protocolName == "openvpn" && underlayPort != nil
             ? vpnGateUnderlayNodeID : nil
         guard let preserveSystemProxy = prepareSystemProxyForActivation() else { return }
@@ -1605,6 +1720,16 @@ final class HarborProxyManager: ObservableObject {
         do {
             let port = try choosePort()
             let isOpenVPN = node.protocolName == "openvpn"
+            if isOpenVPN, underlayNodeID == nil {
+                let cancellation = HarborLatencyCancellation()
+                activationPreflightCancellation = cancellation
+                defer { activationPreflightCancellation = nil }
+                let tunnel = try await prepareIndependentVPNGateTunnel(
+                    cancellation: cancellation,
+                    preferred: store.warpProbeEndpoints?[node.id])
+                activeWARPProfile = tunnel.profile
+                tunnel.close()
+            }
             if isOpenVPN, let underlayNodeID {
                 guard coreInstalled,
                       let base = nodes.first(where: {
@@ -1616,7 +1741,8 @@ final class HarborProxyManager: ObservableObject {
             }
             let config = try isOpenVPN
                 ? HarborMihomoConfig.make(node: node, httpPort: port,
-                                          underlaySocksPort: underlayPort.map { $0 + 1 })
+                                          underlaySocksPort: underlayPort.map { $0 + 1 },
+                                          warpProfile: activeWARPProfile)
                 : HarborXrayConfig.make(node: node, httpPort: port, ruleMode: routingRules,
                                        forcedProxyDomains: forcedProxyDomains,
                                        routeVerificationViaProxy: true,
@@ -1652,7 +1778,8 @@ final class HarborProxyManager: ObservableObject {
             let record = HarborProxyProcessRecord(
                 pid: process.processIdentifier, configPath: file.path,
                 executablePath: process.executableURL?.path ?? "",
-                underlay: underlayRecord(nodeID: underlayNodeID)
+                underlay: underlayRecord(nodeID: underlayNodeID),
+                warpEndpoint: activeWARPProfile?.endpoint
             )
             try JSONEncoder().encode(record).write(to: runtimeRecordURL, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: runtimeRecordURL.path)
@@ -1860,10 +1987,9 @@ final class HarborProxyManager: ObservableObject {
             return
         }
         let containsOpenVPN = targets.contains { $0.protocolName == "openvpn" }
-        // Probe the relay over the same healthy base route that will carry it
-        // when selected. Without a base, keep the direct path explicit.
-        let latencyUnderlayPort = containsOpenVPN ? workingUnderlaySocksPort : nil
-        let openVPNRouteID = latencyUnderlayPort == nil ? "direct" : vpnGateProbeRouteID
+        // WARP is prepared after publishing the cancellable batch state.
+        // Its profile is embedded in every OpenVPN probe, independent of any
+        // active listener or subscription.
 
         let generation = UUID()
         latencyBatchGeneration = generation
@@ -1888,6 +2014,22 @@ final class HarborProxyManager: ObservableObject {
                 latencyActiveBatch = nil
             }
         }
+        let tunnel: HarborWARPTunnel?
+        if containsOpenVPN {
+            do {
+                tunnel = try await prepareIndependentVPNGateTunnel(cancellation: cancellation)
+            } catch {
+                detail = cancellation.isCancelled ? "测试已停止" : "无法准备独立筛选通道：" + error.localizedDescription
+                return
+            }
+        } else {
+            tunnel = nil
+        }
+        defer { tunnel?.close() }
+        guard !cancellation.isCancelled, latencyBatchGeneration == generation else { return }
+        let warpProfile = tunnel?.profile
+        let latencyUnderlayPort = tunnel?.socksPort
+        let openVPNRouteID = warpProfile?.routeID ?? "direct"
         let latencyRoot = root
         let latencyRuleMode = routingRules
         let latencyForcedDomains = forcedProxyDomains
@@ -1917,7 +2059,7 @@ final class HarborProxyManager: ObservableObject {
                     ? .failed("入口 TCP 连接失败")
                     : await HarborMihomoLatencyTester.measure(
                         node: node, root: latencyRoot, cancellation: cancellation,
-                        underlaySocksPort: latencyUnderlayPort)
+                        warpProfile: warpProfile)
             } else if let sharedRealBatch {
                 report = await sharedRealBatch.measure(node: node)
             } else {
@@ -1952,6 +2094,10 @@ final class HarborProxyManager: ObservableObject {
                     guard latencyBatchGeneration == generation, !cancellation.isCancelled, !Task.isCancelled else {
                         group.cancelAll()
                         break
+                    }
+                    if let warpProfile, targets.contains(where: { $0.id == id && $0.protocolName == "openvpn" }) {
+                        if store.warpProbeEndpoints == nil { store.warpProbeEndpoints = [:] }
+                        store.warpProbeEndpoints?[id] = warpProfile.endpoint
                     }
                     let previous = probeResults[id]
                     let checkedAt = Date.now
@@ -2036,11 +2182,13 @@ final class HarborProxyManager: ObservableObject {
         guard !candidates.isEmpty else { return }
         exitGeoManualIDs = Set(candidates.map(\.id))
         exitGeoUnrecognizedIDs.subtract(exitGeoManualIDs)
+        for id in exitGeoManualIDs { exitGeoFailureReasons.removeValue(forKey: id) }
         exitGeoForcedIDs.formUnion(exitGeoManualIDs)
         let manualGeneration = UUID()
         exitGeoManualGeneration = manualGeneration
         exitGeoWatchdog?.cancel()
-        let timeoutSeconds = exitGeoBatchDeadlineSeconds
+        let timeoutSeconds = HarborProxyGeoIPPolicy.exitBatchDeadlineSeconds(
+            nodeCount: candidates.count)
         exitGeoWatchdog = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(timeoutSeconds)) }
             catch { return }
@@ -2050,6 +2198,7 @@ final class HarborProxyManager: ObservableObject {
         exitGeoCompleted = 0
         exitGeoTotal = candidates.count
         exitGeoManualSucceeded = 0
+        exitGeoManualNotStarted = 0
         detail = "正在识别普通网站的出口地区：0/\(exitGeoTotal)"
         enqueueExitGeoRefresh(for: candidates)
     }
@@ -2084,9 +2233,14 @@ final class HarborProxyManager: ObservableObject {
     private func runExitGeoQueue(generation: UUID) async {
         while !Task.isCancelled, exitGeoBatchGeneration == generation,
               !exitGeoPendingIDs.isEmpty {
-            let ids = exitGeoPendingIDs
-            exitGeoPendingIDs.subtract(ids)
-            let candidates = nodes.filter { ids.contains($0.id) }
+            // Bound the number of listeners and the impact of one invalid
+            // profile. Prefer explicit requests over queued automatic work.
+            exitGeoPendingIDs.formIntersection(Set(nodes.map(\.id)))
+            let pending = nodes.filter { exitGeoPendingIDs.contains($0.id) }
+            let ordered = pending.filter { exitGeoManualIDs.contains($0.id) }
+                + pending.filter { !exitGeoManualIDs.contains($0.id) }
+            let candidates = Array(ordered.prefix(HarborProxyGeoIPPolicy.exitBatchSize))
+            exitGeoPendingIDs.subtract(candidates.map(\.id))
             let now = Date.now
             let due = candidates.filter { node in
                 let serverIP = nodeServerLocations[node.host.lowercased()]?.ip
@@ -2126,27 +2280,32 @@ final class HarborProxyManager: ObservableObject {
             }
             exitGeoActiveBatch = batch
             let geoRoot = root
+            let warpProfiles = Dictionary(uniqueKeysWithValues: due.compactMap { node in
+                warpProfile(for: node).map { (node.id, $0) }
+            })
             let inspect: @Sendable (HarborProxyNode) async
-                -> (HarborProxyNode, HarborProxyIPLocation?) = { node in
+                -> (HarborProxyNode, HarborNodeExitGeoReport) = { node in
                 if let livePort {
-                    return (node, await HarborNodeGeoIPResolver.exitLocation(
-                        socksPort: livePort, cancellation: cancellation))
+                    return (node, .probed(await HarborNodeGeoIPResolver.exitLocation(
+                        socksPort: livePort, cancellation: cancellation)))
                 }
                 if node.protocolName == "openvpn" {
-                    return (node, await HarborMihomoLatencyTester.exitLocation(
-                        node: node, root: geoRoot, cancellation: cancellation))
+                    return (node, await HarborMihomoLatencyTester.exitLocationReport(
+                        node: node, root: geoRoot, cancellation: cancellation,
+                        warpProfile: warpProfiles[node.id]))
                 }
-                return (node, await batch?.exitLocation(node: node))
+                return (node, await HarborNodeLatencyTester.probeExitLocation(
+                    node: node, root: geoRoot, cancellation: cancellation, batch: batch))
             }
             var queue = HarborProxyLatencyQueue(
                 count: due.count, limit: HarborProxyGeoIPPolicy.exitParallelCount
             )
-            await withTaskGroup(of: (HarborProxyNode, HarborProxyIPLocation?).self) { group in
+            await withTaskGroup(of: (HarborProxyNode, HarborNodeExitGeoReport).self) { group in
                 for index in queue.initialIndices() {
                     let target = due[index]
                     group.addTask { await inspect(target) }
                 }
-                while let (target, observed) = await group.next() {
+                while let (target, report) = await group.next() {
                     guard exitGeoBatchGeneration == generation,
                           !Task.isCancelled, !cancellation.isCancelled else {
                         group.cancelAll()
@@ -2162,14 +2321,23 @@ final class HarborProxyManager: ObservableObject {
                     let manuallyRequested = exitGeoManualIDs.remove(target.id) != nil
                     exitGeoForcedIDs.remove(target.id)
                     if manuallyRequested {
-                        exitGeoCompleted += 1
-                        detail = "正在识别普通网站的出口地区：\(exitGeoCompleted)/\(exitGeoTotal)"
+                        if report.started {
+                            exitGeoCompleted += 1
+                        } else {
+                            exitGeoManualNotStarted += 1
+                        }
+                        detail = "正在识别普通网站的出口地区：已检测 \(exitGeoCompleted)/\(exitGeoTotal)"
+                        if exitGeoManualNotStarted > 0 {
+                            detail += "，检测代理未启动 \(exitGeoManualNotStarted)"
+                        }
                     }
-                    guard let observed else {
+                    guard let observed = report.location else {
                         exitGeoFailureCounts[target.id, default: 0] += 1
+                        exitGeoFailureReasons[target.id] = report.failure
                         if manuallyRequested { exitGeoUnrecognizedIDs.insert(target.id) }
                         continue
                     }
+                    exitGeoFailureReasons.removeValue(forKey: target.id)
                     exitGeoUnrecognizedIDs.remove(target.id)
                     if manuallyRequested { exitGeoManualSucceeded += 1 }
                     exitGeoFailureCounts.removeValue(forKey: target.id)
@@ -2205,7 +2373,12 @@ final class HarborProxyManager: ObservableObject {
             exitGeoWatchdog?.cancel()
             exitGeoWatchdog = nil
             exitGeoManualGeneration = nil
-            detail = "出口地区识别完成：确认 \(exitGeoManualSucceeded)/\(exitGeoTotal) 个；未确认的节点仍显示入口"
+            detail = "出口地区识别结束：已检测 \(exitGeoCompleted)/\(exitGeoTotal)，确认 \(exitGeoManualSucceeded)"
+            if exitGeoManualNotStarted > 0 {
+                detail += "；\(exitGeoManualNotStarted) 个检测代理未启动，可查看节点地区提示"
+            } else if exitGeoManualSucceeded < exitGeoTotal {
+                detail += "；未确认的节点可查看地区提示后重试"
+            }
             exitGeoUpdating = false
             exitGeoManualIDs.removeAll()
             exitGeoForcedIDs.removeAll()
@@ -2220,6 +2393,9 @@ final class HarborProxyManager: ObservableObject {
         guard exitGeoManualGeneration == generation, exitGeoUpdating else { return }
         let unresolved = exitGeoManualIDs
         exitGeoUnrecognizedIDs.formUnion(unresolved)
+        for id in unresolved {
+            exitGeoFailureReasons[id] = reason == "超时" ? "本次地区识别超时，尚未完成" : "本次地区识别已停止，尚未完成"
+        }
         if reason == "超时" {
             for id in unresolved {
                 exitGeoFailureCounts[id, default: 0] += 1
@@ -2379,6 +2555,10 @@ final class HarborProxyManager: ObservableObject {
 
     @discardableResult
     func stop(interactive: Bool = false) async -> Bool {
+        activationPreflightCancellation?.cancel()
+        vpnGateDownloadCancellation?.cancel()
+        warpRegistrationTask?.cancel()
+        cancelLatencyTests()
         if HarborProxyRecoveryPolicy.mustRestoreBeforeStop(hasBackup: HarborSystemProxy.hasBackup) {
             do { try HarborSystemProxy.restore(interactive: interactive) }
             catch {
@@ -2563,6 +2743,7 @@ final class HarborProxyManager: ObservableObject {
         underlayPort = nil
         underlayConfigPath = nil
         adoptedUnderlayPID = nil
+        activeWARPProfile = nil
         if let configPath { try? FileManager.default.removeItem(at: configPath) }
         try? FileManager.default.removeItem(at: runtimeRecordURL)
         configPath = nil; localPort = nil
@@ -2584,6 +2765,10 @@ final class HarborProxyManager: ObservableObject {
               record.underlay.map({ validAdoptedUnderlay($0) }) ?? true,
               portListening(configuredHTTPPort),
               portListening(configuredHTTPPort + 1) else { return false }
+        if let endpoint = record.warpEndpoint {
+            guard let account = store.warpAccount else { return false }
+            activeWARPProfile = HarborWARPProfile(account: account, endpoint: endpoint)
+        }
         adoptedPID = record.pid
         adoptedUnderlayPID = record.underlay?.pid
         underlayPort = record.underlay?.httpPort
@@ -2603,7 +2788,8 @@ final class HarborProxyManager: ObservableObject {
                 node.protocolName == "openvpn"
                     ? HarborMihomoConfig.matches(
                         configuration: data, node: node,
-                        underlaySocksPort: record.underlay.map { $0.httpPort + 1 })
+                        underlaySocksPort: record.underlay.map { $0.httpPort + 1 },
+                        warpProfile: activeWARPProfile)
                     : HarborProxyRuntimeIdentity.matches(configuration: data, node: node)
             }
         }

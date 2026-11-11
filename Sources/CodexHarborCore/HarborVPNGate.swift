@@ -258,7 +258,8 @@ public struct OpenVPNProfile: Sendable {
 
 public enum HarborMihomoConfig {
     public static func make(node: HarborProxyNode, httpPort: Int,
-                            underlaySocksPort: Int? = nil) throws -> Data {
+                            underlaySocksPort: Int? = nil,
+                            warpProfile: HarborWARPProfile? = nil) throws -> Data {
         guard node.protocolName == "openvpn", (1024...65534).contains(httpPort),
               let data = Data(base64Encoded: node.credential),
               let text = String(data: data, encoding: .utf8),
@@ -266,6 +267,9 @@ public enum HarborMihomoConfig {
               profile.server == node.host, profile.port == node.port,
               profile.proto == node.network else {
             throw HarborProxyError.invalid("OpenVPN 节点配置无效")
+        }
+        guard underlaySocksPort == nil || warpProfile == nil else {
+            throw HarborProxyError.invalid("节点不能同时使用两条底层通道")
         }
         if let underlaySocksPort, !(1024...65535).contains(underlaySocksPort) {
             throw HarborProxyError.invalid("底座代理端口无效")
@@ -278,6 +282,7 @@ public enum HarborMihomoConfig {
             "handshake-timeout": 30
         ]
         if underlaySocksPort != nil { outbound["dialer-proxy"] = "underlay" }
+        if warpProfile != nil { outbound["dialer-proxy"] = "warp" }
         if !profile.tlsAuth.isEmpty { outbound["tls-auth"] = profile.tlsAuth }
         if !profile.tlsCrypt.isEmpty { outbound["tls-crypt"] = profile.tlsCrypt }
         if !profile.tlsCryptV2.isEmpty { outbound["tls-crypt-v2"] = profile.tlsCryptV2 }
@@ -287,6 +292,7 @@ public enum HarborMihomoConfig {
         if !profile.auth.isEmpty { outbound["auth"] = profile.auth }
         if !profile.compLZO.isEmpty { outbound["comp-lzo"] = profile.compLZO }
         var proxies: [[String: Any]] = [outbound]
+        if let warpProfile { proxies.append(try warpProfile.outbound()) }
         if let underlaySocksPort {
             proxies.append([
                 "name": "underlay", "type": "socks5", "server": "127.0.0.1",
@@ -322,10 +328,12 @@ public enum HarborMihomoConfig {
     }
 
     public static func matches(configuration: Data, node: HarborProxyNode,
-                               underlaySocksPort: Int? = nil) -> Bool {
+                               underlaySocksPort: Int? = nil,
+                               warpProfile: HarborWARPProfile? = nil) -> Bool {
         guard node.protocolName == "openvpn",
               let expected = try? make(node: node, httpPort: HarborProxyPortPolicy.defaultHTTPPort,
-                                       underlaySocksPort: underlaySocksPort),
+                                       underlaySocksPort: underlaySocksPort,
+                                       warpProfile: warpProfile),
               let actualObject = try? JSONSerialization.jsonObject(with: configuration) as? [String: Any],
               let expectedObject = try? JSONSerialization.jsonObject(with: expected) as? [String: Any],
               let actual = actualObject["proxies"] as? [[String: Any]],

@@ -260,6 +260,14 @@ struct HarborNetworkProxyTests {
         #expect(HarborProxyLatencyPolicy.realPingBatchSize == 1_000)
     }
 
+    @Test("Exit-region deadline allows every wave in a large subscription")
+    func exitRegionBatchDeadline() {
+        #expect(HarborProxyGeoIPPolicy.exitBatchDeadlineSeconds(nodeCount: 1) >= 75)
+        #expect(HarborProxyGeoIPPolicy.exitBatchDeadlineSeconds(nodeCount: 360) >= 45 * 45)
+        #expect(HarborProxyGeoIPPolicy.exitBatchDeadlineSeconds(nodeCount: 360)
+            > HarborProxyGeoIPPolicy.exitBatchDeadlineSeconds(nodeCount: 32))
+    }
+
     @Test("Failed real probes use bounded retry backoff")
     func failedProbeRetryPolicy() {
         let now = Date(timeIntervalSince1970: 100_000)
@@ -785,6 +793,133 @@ struct HarborNetworkProxyTests {
         #expect(result.nodes.contains { $0.id == "new-id" })
         #expect(result.nodes.contains { $0.id == "manual" })
         #expect(!result.nodes.contains { $0.id == "expired" })
+    }
+
+    @Test("Duplicate nodes ignore labels and DNS case, while retaining distinct connection settings")
+    func completeEndpointDeduplication() {
+        let original = HarborProxyNode(id: "first", name: "First",
+            customName: "我的别名", protocolName: "vless", host: "Relay.Example.test",
+            port: 443, credential: "fixture", network: "ws", security: "tls",
+            path: "/one", subscriptionID: "source")
+        var duplicate = original
+        duplicate.id = "active"
+        duplicate.name = "Another name"
+        duplicate.customName = nil
+        duplicate.host = "relay.example.test"
+        var port = original
+        port.id = "port"
+        port.port = 8443
+        var password = original
+        password.id = "credential"
+        password.credential = "different"
+        var transport = original
+        transport.id = "transport"
+        transport.path = "/two"
+        var protocolVariant = original
+        protocolVariant.id = "protocol"
+        protocolVariant.protocolName = "trojan"
+        let result = HarborProxyNodeDeduplication.coalesce(
+            [original, duplicate, port, password, transport, protocolVariant]
+        ) { $0.id == "active" ? 1 : 0 }
+        #expect(result.nodes.map(\.id) == ["active", "port", "credential", "transport", "protocol"])
+        #expect(result.nodes.first?.customName == "我的别名")
+        #expect(result.replacementIDs == ["first": "active"])
+        #expect(HarborProxyNodeDeduplication.newNodes(
+            [duplicate, port, port], excluding: [original]).map(\.id) == ["port"])
+    }
+
+    @Test("Combined catalog coalesces a shared endpoint without removing its subscription membership")
+    func duplicateSubscriptionMembership() {
+        let first = HarborProxyNode(id: "one", name: "first", protocolName: "vless",
+            host: "2001:db8::1", port: 443, credential: "fixture", subscriptionID: "a")
+        var second = first
+        second.id = "two"
+        second.host = "[2001:0db8:0:0:0:0:0:1]"
+        second.subscriptionID = "b"
+        #expect(HarborProxyNodeDeduplication.coalesce(
+            [first, second], withinSubscriptions: true).nodes.map(\.id) == ["one", "two"])
+        #expect(HarborProxyNodeDeduplication.coalesce([first, second]).nodes.map(\.id) == ["one"])
+    }
+
+    @Test("Refreshing duplicate profiles keeps the active ID and merges saved aliases")
+    func duplicateSubscriptionRefresh() {
+        let original = HarborProxyNode(id: "active", name: "old", protocolName: "vless",
+            host: "relay.example.test", port: 443, credential: "fixture", subscriptionID: "sub")
+        var duplicate = original
+        duplicate.id = "favorite"
+        duplicate.customName = "常用"
+        var incoming = original
+        incoming.id = "incoming"
+        incoming.name = "new label"
+        var otherPort = incoming
+        otherPort.id = "different-port"
+        otherPort.port = 8443
+        let result = HarborProxySubscriptionReconciler.replace(
+            current: [duplicate, original], incoming: [incoming, incoming, otherPort],
+            subscriptionID: "sub", selectedID: "active", keepActiveConnection: true,
+            preferredNodeIDs: ["favorite"]
+        )
+        #expect(result.nodes.map(\.id) == ["active", "different-port"])
+        #expect(result.nodes.first?.customName == "常用")
+        #expect(result.selectedID == "active")
+        #expect(!result.retainedActiveNode)
+        #expect(result.replacementIDs == ["favorite": "active"])
+    }
+
+    @Test("Refreshing shared server addresses snapshots each cached host without crashing")
+    func sharedServerIPSnapshot() {
+        let nodes = [
+            HarborProxyNode(name: "VLESS", protocolName: "vless",
+                host: "Relay.Example.test", port: 443, credential: "first",
+                subscriptionID: "target"),
+            HarborProxyNode(name: "Trojan", protocolName: "trojan",
+                host: "relay.example.test", port: 8443, credential: "second",
+                subscriptionID: "target"),
+            HarborProxyNode(name: "IP A", protocolName: "vless",
+                host: "192.0.2.10", port: 443, credential: "third",
+                subscriptionID: "target"),
+            HarborProxyNode(name: "IP B", protocolName: "vless",
+                host: "192.0.2.10", port: 8443, credential: "fourth",
+                subscriptionID: "target"),
+            HarborProxyNode(name: "Unresolved", protocolName: "vless",
+                host: "no-cache.example.test", port: 443, credential: "fifth",
+                subscriptionID: "target"),
+            HarborProxyNode(name: "Other subscription", protocolName: "vless",
+                host: "other.example.test", port: 443, credential: "sixth",
+                subscriptionID: "other")
+        ]
+        let snapshot = HarborProxySubscriptionRefreshPolicy.resolvedIPSnapshot(
+            nodes: nodes, subscriptionID: "target", serverLocations: [
+                "relay.example.test": HarborProxyIPLocation(ip: "198.51.100.1", countryCode: "US"),
+                "192.0.2.10": HarborProxyIPLocation(ip: "192.0.2.10", countryCode: "US"),
+                "other.example.test": HarborProxyIPLocation(ip: "203.0.113.1", countryCode: "JP")
+            ])
+        #expect(snapshot == [
+            "relay.example.test": "198.51.100.1", "192.0.2.10": "192.0.2.10"
+        ])
+        #expect(HarborProxySubscriptionRefreshPolicy.resolvedIPSnapshot(
+            nodes: nodes, subscriptionID: "missing", serverLocations: [:]).isEmpty)
+    }
+
+    @Test("A changed shared server IP still identifies every affected profile")
+    func sharedServerIPRefreshPreservesProbeDecisions() {
+        let nodes = ["relay.example.test", "RELAY.example.test"].enumerated().map { index, host in
+            HarborProxyNode(id: "shared-\(index)", name: "shared", protocolName: "vless",
+                host: host, port: 443 + index, credential: "fixture",
+                subscriptionID: "target")
+        }
+        let previous = HarborProxySubscriptionRefreshPolicy.resolvedIPSnapshot(
+            nodes: nodes, subscriptionID: "target", serverLocations: [
+                "relay.example.test": HarborProxyIPLocation(ip: "198.51.100.1", countryCode: "US")
+            ])
+        let ids = Set(nodes.map(\.id))
+        #expect(HarborProxySubscriptionRefreshPolicy.nodesRequiringProbe(
+            previousNodeIDs: ids, refreshedNodes: nodes,
+            previousResolvedIPs: previous,
+            currentResolvedIPs: ["relay.example.test": "198.51.100.2"]) == ids)
+        #expect(HarborProxySubscriptionRefreshPolicy.nodesRequiringProbe(
+            previousNodeIDs: ids, refreshedNodes: nodes,
+            previousResolvedIPs: previous, currentResolvedIPs: previous).isEmpty)
     }
 
     @Test("Subscription refresh preserves measured order and probes only new or IP-changed nodes")

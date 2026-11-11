@@ -50,13 +50,7 @@ enum HarborVPNGateNetworkClassifier {
         guard var url = URLComponents(string: "https://ip-info.com/json") else { return nil }
         url.queryItems = [URLQueryItem(name: "ip", value: ip)]
         guard let endpoint = url.url else { return nil }
-        let configuration = URLSessionConfiguration.ephemeral
-        if let proxyPort {
-            configuration.connectionProxyDictionary = [
-                "HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": proxyPort,
-                "HTTPSEnable": 1, "HTTPSProxy": "127.0.0.1", "HTTPSPort": proxyPort
-            ]
-        }
+        let configuration = HarborProxyHTTP.configuration(httpPort: proxyPort)
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
         var request = URLRequest(url: endpoint)

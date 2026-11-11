@@ -142,6 +142,66 @@ public struct HarborProxyNode: Codable, Identifiable, Sendable, Hashable {
     }
 }
 
+/// Connection equality ignores display metadata and source membership.
+/// Credentials and every transport option remain part of the key.
+public enum HarborProxyNodeDeduplication {
+    public struct Result: Sendable {
+        public let nodes: [HarborProxyNode]
+        public let replacementIDs: [String: String]
+    }
+
+    static func endpoint(_ node: HarborProxyNode, withinSubscriptions: Bool = false) -> HarborProxyNode {
+        var key = node
+        key.id = ""
+        key.name = ""
+        key.customName = nil
+        key.automaticName = nil
+        if !withinSubscriptions { key.subscriptionID = "" }
+        key.host = HarborIPAddress.normalizedLiteral(node.host) ?? node.host.lowercased()
+        return key
+    }
+
+    public static func coalesce(
+        _ nodes: [HarborProxyNode], withinSubscriptions: Bool = false,
+        priority: (HarborProxyNode) -> Int = { _ in 0 }
+    ) -> Result {
+        var representatives: [HarborProxyNode] = []
+        var indices: [HarborProxyNode: Int] = [:]
+        for node in nodes {
+            let key = endpoint(node, withinSubscriptions: withinSubscriptions)
+            if let index = indices[key] {
+                let previous = representatives[index]
+                if priority(node) > priority(previous) {
+                    var chosen = node
+                    chosen.customName = node.customName ?? previous.customName
+                    representatives[index] = chosen
+                } else if previous.customName == nil {
+                    representatives[index].customName = node.customName
+                }
+            } else {
+                indices[key] = representatives.count
+                representatives.append(node)
+            }
+        }
+        var replacements: [String: String] = [:]
+        if representatives.count < nodes.count {
+            for node in nodes {
+                let key = endpoint(node, withinSubscriptions: withinSubscriptions)
+                guard let index = indices[key] else { continue }
+                let keptID = representatives[index].id
+                if node.id != keptID { replacements[node.id] = keptID }
+            }
+        }
+        return Result(nodes: representatives, replacementIDs: replacements)
+    }
+
+    public static func newNodes(_ incoming: [HarborProxyNode],
+                                excluding existing: [HarborProxyNode]) -> [HarborProxyNode] {
+        var seen = Set(existing.map { endpoint($0) })
+        return incoming.filter { seen.insert(endpoint($0)).inserted }
+    }
+}
+
 /// User-assigned node names stay separate from provider remarks, so a
 /// subscription refresh can update connection data without erasing the alias.
 public enum HarborProxyNodeNaming {
@@ -325,16 +385,7 @@ public enum HarborProxySubscriptionReconciler {
         public let nodes: [HarborProxyNode]
         public let selectedID: String?
         public let retainedActiveNode: Bool
-    }
-
-    private static func endpoint(_ node: HarborProxyNode) -> HarborProxyNode {
-        var value = node
-        value.id = ""
-        value.name = ""
-        value.customName = nil
-        value.automaticName = nil
-        value.subscriptionID = ""
-        return value
+        public let replacementIDs: [String: String]
     }
 
     public static func replace(
@@ -342,26 +393,34 @@ public enum HarborProxySubscriptionReconciler {
         incoming: [HarborProxyNode],
         subscriptionID: String,
         selectedID: String?,
-        keepActiveConnection: Bool
+        keepActiveConnection: Bool,
+        preferredNodeIDs: Set<String> = []
     ) -> Result {
         let previous = current.filter { $0.subscriptionID == subscriptionID }
-        var previousByEndpoint: [HarborProxyNode: [HarborProxyNode]] = [:]
-        for node in previous {
-            previousByEndpoint[endpoint(node), default: []].append(node)
+        let coalesced = HarborProxyNodeDeduplication.coalesce(previous) { node in
+            if node.id == selectedID { return 4 }
+            if preferredNodeIDs.contains(node.id) { return 2 }
+            return node.customName == nil ? 0 : 1
         }
-
+        let previousByEndpoint = Dictionary(uniqueKeysWithValues: coalesced.nodes.map {
+            (HarborProxyNodeDeduplication.endpoint($0), $0)
+        })
+        var usedIDs = Set(current.filter { $0.subscriptionID != subscriptionID }.map(\.id))
+        let oldIDs = Set(previous.map(\.id))
         var refreshed: [HarborProxyNode] = []
-        for supplied in incoming {
+        for supplied in HarborProxyNodeDeduplication.coalesce(incoming).nodes {
             var node = supplied
             node.subscriptionID = subscriptionID
-            let key = endpoint(node)
-            if var matches = previousByEndpoint[key], !matches.isEmpty {
-                let previous = matches.removeFirst()
-                previousByEndpoint[key] = matches
-                node.id = previous.id
-                node.customName = previous.customName
-                node.automaticName = previous.automaticName
+            let key = HarborProxyNodeDeduplication.endpoint(node)
+            if let existing = previousByEndpoint[key] {
+                node.id = existing.id
+                node.host = existing.host
+                node.customName = existing.customName ?? node.customName
+                node.automaticName = existing.automaticName
+            } else if oldIDs.contains(node.id) {
+                node.id = UUID().uuidString
             }
+            while !usedIDs.insert(node.id).inserted { node.id = UUID().uuidString }
             refreshed.append(node)
         }
 
@@ -369,7 +428,7 @@ public enum HarborProxySubscriptionReconciler {
         // measured order for profiles whose complete connection identity did
         // not change, then append genuinely new profiles in provider order.
         let refreshedByID = Dictionary(uniqueKeysWithValues: refreshed.map { ($0.id, $0) })
-        let stableIDs = previous.compactMap { refreshedByID[$0.id]?.id }
+        let stableIDs = coalesced.nodes.compactMap { refreshedByID[$0.id]?.id }
         let stableIDSet = Set(stableIDs)
         refreshed = stableIDs.compactMap { refreshedByID[$0] }
             + refreshed.filter { !stableIDSet.contains($0.id) }
@@ -389,8 +448,10 @@ public enum HarborProxySubscriptionReconciler {
                 chosen = refreshed.first?.id ?? other.first?.id
             }
         }
+        let keptIDs = Set(refreshed.map(\.id))
         return Result(nodes: other + refreshed, selectedID: chosen,
-                      retainedActiveNode: retainedActive)
+                      retainedActiveNode: retainedActive,
+                      replacementIDs: coalesced.replacementIDs.filter { keptIDs.contains($0.value) })
     }
 }
 

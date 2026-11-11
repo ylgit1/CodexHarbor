@@ -3,6 +3,37 @@ import AppKit
 import Combine
 import CodexHarborCore
 
+private struct ServerAddress: Hashable {
+    let host: String
+    let port: Int
+
+    init(_ node: HarborProxyNode) {
+        host = HarborIPAddress.normalizedLiteral(node.host) ?? node.host.lowercased()
+        port = node.port
+    }
+}
+
+/// Keep each connection configuration available within its server address.
+private struct AddressGroup: Identifiable {
+    let id: ServerAddress
+    var nodes: [HarborProxyNode]
+
+    static func group(_ nodes: [HarborProxyNode]) -> [AddressGroup] {
+        var groups: [AddressGroup] = []
+        var indices: [ServerAddress: Int] = [:]
+        for node in nodes {
+            let address = ServerAddress(node)
+            if let index = indices[address] {
+                groups[index].nodes.append(node)
+            } else {
+                indices[address] = groups.count
+                groups.append(AddressGroup(id: address, nodes: [node]))
+            }
+        }
+        return groups
+    }
+}
+
 /// Compact, high-fidelity macOS proxy workspace.
 /// This view never starts background timers or probes unrelated nodes.
 struct HarborProxyWorkspaceView: View {
@@ -60,14 +91,16 @@ struct HarborProxyWorkspaceView: View {
 
     private struct CatalogPresentation {
         var sourceNodes: [HarborProxyNode] = []
-        var groupNodes: [HarborProxyNode] = []
-        var categoryNodes: [HarborProxyNode] = []
-        var shownNodes: [HarborProxyNode] = []
+        var sourceAddressCount = 0
+        var categoryAddressCount = 0
+        var shownGroups: [AddressGroup] = []
         var categoryByID: [String: NodeCategory] = [:]
         var categoryCounts: [NodeCategory: Int] = [:]
         var regionCounts: [String: Int] = [:]
         var subscriptionCounts: [String: Int] = [:]
         var subscriptionUsableCounts: [String: Int] = [:]
+        var allNodeCount = 0
+        var favoriteCount = 0
         var unavailableCount = 0
         var protocols: [String] = ["全部"]
         var regions: [String] = ["全部"]
@@ -91,15 +124,14 @@ struct HarborProxyWorkspaceView: View {
         var id: String { rawValue }
     }
 
-    private let favoritesKey = "com.codexharbor.proxy.favoriteNodeIDs"
+    private let favoritesKey = HarborProxyManager.favoriteNodeIDsKey
+    private let nodePortColumnWidth: CGFloat = 42
+    private let profileMenuWidth: CGFloat = 56
     private let subscriptionTints: [Color] = [
         HarborColors.blue, HarborColors.green, HarborColors.orange, HarborColors.purple
     ]
 
     private var sourceGroupNodes: [HarborProxyNode] { catalog.sourceNodes }
-    private var groupNodes: [HarborProxyNode] { catalog.groupNodes }
-    private var categoryNodes: [HarborProxyNode] { catalog.categoryNodes }
-    private var shownNodes: [HarborProxyNode] { catalog.shownNodes }
     private var unavailableCount: Int { catalog.unavailableCount }
     private var protocols: [String] { catalog.protocols }
     private var regions: [String] { catalog.regions }
@@ -155,13 +187,43 @@ struct HarborProxyWorkspaceView: View {
         let query = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
         var snapshot = CatalogPresentation.empty
 
-        // One O(N) traversal builds classifications and per-subscription counts;
-        // no repeated subscriptions.first(where:) during row creation or scroll.
-        for node in nodes {
-            snapshot.subscriptionCounts[node.subscriptionID, default: 0] += 1
-            if results[node.id]?.succeeded == true {
-                snapshot.subscriptionUsableCounts[node.subscriptionID, default: 0] += 1
-            }
+        // Coalesce identical connection configurations before grouping the
+        // display by server address. Keep protocol variants available for probing.
+        func priority(_ node: HarborProxyNode) -> Int {
+            if node.id == proxy.activeNodeID { return 8 }
+            if favorites.contains(node.id) { return 4 }
+            if results[node.id]?.succeeded == true { return 2 }
+            return node.customName == nil ? 0 : 1
+        }
+        let sourceNodes = HarborProxyNodeDeduplication.coalesce(
+            nodes, withinSubscriptions: true, priority: priority
+        ).nodes
+        let allNodes = HarborProxyNodeDeduplication.coalesce(sourceNodes, priority: priority).nodes
+        let favoriteNodes = HarborProxyNodeDeduplication.coalesce(
+            nodes.filter { favorites.contains($0.id) }, priority: priority
+        ).nodes
+        func addressCount(_ nodes: [HarborProxyNode]) -> Int {
+            Set(nodes.map(ServerAddress.init)).count
+        }
+        snapshot.allNodeCount = addressCount(allNodes)
+        snapshot.favoriteCount = addressCount(favoriteNodes)
+        for (id, members) in Dictionary(grouping: sourceNodes, by: \.subscriptionID) {
+            snapshot.subscriptionCounts[id] = addressCount(members)
+            snapshot.subscriptionUsableCounts[id] = addressCount(
+                members.filter { results[$0.id]?.succeeded == true }
+            )
+        }
+        let visibleSource: [HarborProxyNode]
+        if let groupID {
+            visibleSource = sourceNodes.filter { $0.subscriptionID == groupID }
+        } else {
+            visibleSource = favoritesOnly ? favoriteNodes : allNodes
+        }
+        snapshot.sourceNodes = visibleSource
+        snapshot.sourceAddressCount = addressCount(visibleSource)
+        var categoryAddresses: [NodeCategory: Set<ServerAddress>] = [:]
+        var availableNodes: [HarborProxyNode] = []
+        for node in visibleSource {
             let kind: NodeCategory
             switch sources[node.subscriptionID] ?? nil {
             case .vpnGate:
@@ -178,28 +240,27 @@ struct HarborProxyWorkspaceView: View {
             default: kind = .residential
             }
             snapshot.categoryByID[node.id] = kind
-            guard groupID == nil || node.subscriptionID == groupID else { continue }
-            guard groupID != nil || !favoritesOnly || favorites.contains(node.id) else { continue }
-            snapshot.sourceNodes.append(node)
-            snapshot.categoryCounts[kind, default: 0] += 1
+            categoryAddresses[kind, default: []].insert(ServerAddress(node))
             if results[node.id]?.isConfirmedUnavailable == true {
                 snapshot.unavailableCount += 1
                 if !showUnavailable { continue }
             }
-            snapshot.groupNodes.append(node)
+            availableNodes.append(node)
         }
-
+        snapshot.categoryCounts = categoryAddresses.mapValues(\.count)
         snapshot.protocols = ["全部"] +
-            Array(Set(snapshot.groupNodes.map { $0.protocolName.uppercased() })).sorted()
+            Array(Set(availableNodes.map { $0.protocolName.uppercased() })).sorted()
         let categoryIndex = snapshot.categoryByID
-        snapshot.categoryNodes = snapshot.groupNodes.filter {
+        let categoryNodes = availableNodes.filter {
             category == .all || categoryIndex[$0.id] == category
         }
+        snapshot.categoryAddressCount = addressCount(categoryNodes)
 
         // Resolve displayed region once per node. Keep the same verified-exit
         // preference as HarborProxyManager.exitLocation(for:).
         var nodeRegions: [String: String] = [:]
-        for node in snapshot.categoryNodes {
+        var regionAddresses: [String: Set<ServerAddress>] = [:]
+        for node in categoryNodes {
             let server = serverLocations[node.host.lowercased()]
             let exit = exitLocations[node.id]?.verifiedLocation(
                 for: node, resolvedServerIP: server?.ip
@@ -217,14 +278,15 @@ struct HarborProxyWorkspaceView: View {
                 location = (exit ?? server)?.displayRegion ?? HarborProxyAutomaticName.unresolvedRegion
             }
             nodeRegions[node.id] = location
-            snapshot.regionCounts[location, default: 0] += 1
+            regionAddresses[location, default: []].insert(ServerAddress(node))
         }
+        snapshot.regionCounts = regionAddresses.mapValues(\.count)
         let priority = ["香港", "美国", "日本", "新加坡", "台湾", "德国", "韩国", "英国"]
         let names = Set(snapshot.regionCounts.keys)
         snapshot.regions = ["全部"] + priority.filter(names.contains)
             + names.subtracting(Set(priority)).sorted()
 
-        let candidates = snapshot.categoryNodes.filter { node in
+        let candidates = categoryNodes.filter { node in
             if region != "全部" && nodeRegions[node.id] != region { return false }
             if protocolFilter != "全部" && node.protocolName.uppercased() != protocolFilter { return false }
             if latencyFilter != "全部" {
@@ -241,10 +303,11 @@ struct HarborProxyWorkspaceView: View {
                 node.displayName.localizedCaseInsensitiveContains(query) ||
                 node.name.localizedCaseInsensitiveContains(query) ||
                 node.host.localizedCaseInsensitiveContains(query) ||
+                Int(query) == node.port ||
                 node.protocolName.localizedCaseInsensitiveContains(query)
         }
-        snapshot.shownNodes = HarborProxySubscriptionRefreshPolicy.initialLatencyOrder(
-            candidates, results: results
+        snapshot.shownGroups = AddressGroup.group(
+            HarborProxySubscriptionRefreshPolicy.initialLatencyOrder(candidates, results: results)
         )
         catalog = snapshot
     }
@@ -273,7 +336,11 @@ struct HarborProxyWorkspaceView: View {
             rebuildCatalog()
         }
         .onDisappear { refreshScheduler.task?.cancel() }
-        .onReceive(proxy.$nodes) { _ in scheduleCatalogRefresh() }
+        .onReceive(proxy.$nodes) { _ in
+            favorites = Set(UserDefaults.standard.stringArray(forKey: favoritesKey) ?? [])
+            scheduleCatalogRefresh()
+        }
+        .onReceive(proxy.$activeNodeID) { _ in scheduleCatalogRefresh() }
         .onReceive(proxy.$subscriptions) { _ in scheduleCatalogRefresh() }
         .onReceive(proxy.$probeResults) { _ in scheduleCatalogRefresh() }
         .onReceive(proxy.$nodeServerLocations) { _ in scheduleCatalogRefresh() }
@@ -773,13 +840,13 @@ struct HarborProxyWorkspaceView: View {
             .padding(.horizontal, 15)
             .padding(.bottom, 5)
 
-            groupButton("全部节点", icon: "square.stack.3d.up", count: proxy.nodes.count,
+            groupButton("全部节点", icon: "square.stack.3d.up", count: catalog.allNodeCount,
                         selected: groupID == nil && !favoritesOnly) {
                 groupID = nil
                 favoritesOnly = false
                 resetFilters()
             }
-            groupButton("我的收藏", icon: "star", count: proxy.nodes.filter { favorites.contains($0.id) }.count,
+            groupButton("我的收藏", icon: "star", count: catalog.favoriteCount,
                         selected: groupID == nil && favoritesOnly) {
                 groupID = nil
                 favoritesOnly = true
@@ -994,7 +1061,7 @@ struct HarborProxyWorkspaceView: View {
         ScrollView(.horizontal) {
             HStack(spacing: 5) {
                 ForEach(availableCategories, id: \.self) { choice in
-                    let count = choice == .all ? sourceGroupNodes.count
+                    let count = choice == .all ? catalog.sourceAddressCount
                         : catalog.categoryCounts[choice, default: 0]
                     Button {
                         category = choice
@@ -1047,7 +1114,7 @@ struct HarborProxyWorkspaceView: View {
                 ForEach(regions, id: \.self) { name in
                     let selected = region == name
                     let count = name == "全部"
-                        ? categoryNodes.count
+                        ? catalog.categoryAddressCount
                         : catalog.regionCounts[name, default: 0]
                     Button { region = name } label: {
                         HStack(spacing: 5) {
@@ -1100,7 +1167,7 @@ struct HarborProxyWorkspaceView: View {
                 }
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
                 .disabled(proxy.busy || proxy.latencyTesting)
-                .help("重新获取 VPN Gate 志愿候选，识别家宽入口并真实测速；不会自动切换节点")
+                .help("自动准备独立通道，再获取 VPN Gate 志愿候选、识别家宽入口并真实测速；无需先启用订阅节点")
             }
             if currentGroupIsTesting {
                 Button { proxy.cancelLatencyTests() } label: {
@@ -1164,7 +1231,7 @@ struct HarborProxyWorkspaceView: View {
             ))
             .help(proxy.exitGeoUpdating
                   ? "立即停止本次出口地区识别；未完成节点标记为未识别"
-                  : "独立检测真实出口 IP；最多等待 75 秒，超时标记为未识别")
+                  : "分批独立检测真实出口 IP；耗时取决于节点数量，可随时停止。悬停地区可查看失败原因")
 
             if narrow { Spacer(minLength: 6) }
 
@@ -1242,10 +1309,11 @@ struct HarborProxyWorkspaceView: View {
                            compactActions: Bool) -> some View {
         // Snapshot filtering and latency sorting once per render, not again
         // for each pagination label, row and empty-state check.
-        let filteredNodes = shownNodes
-        let lastPage = max(1, (filteredNodes.count + pageSize - 1) / pageSize)
+        let groups = catalog.shownGroups
+        let lastPage = max(1, (groups.count + pageSize - 1) / pageSize)
         let selectedPage = min(max(1, page), lastPage)
-        let pageNodes = Array(filteredNodes.dropFirst((selectedPage - 1) * pageSize).prefix(pageSize))
+        let pageGroups = Array(groups.dropFirst((selectedPage - 1) * pageSize).prefix(pageSize))
+        let showsProfileMenu = groups.contains { $0.nodes.count > 1 }
         return VStack(spacing: 0) {
             if availableCategories.count > 2 { categoryBar }
             regionBar(narrow: narrow, compactActions: compactActions)
@@ -1258,9 +1326,6 @@ struct HarborProxyWorkspaceView: View {
                         Text("节点名称")
                             .lineLimit(1)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                        if showRegion {
-                            Text("地区").frame(width: 76, alignment: .leading)
-                        }
                     } else {
                         HStack(spacing: 0) {
                             Text("节点名称")
@@ -1289,6 +1354,9 @@ struct HarborProxyWorkspaceView: View {
                         Text("类别 / 地址")
                             .lineLimit(1)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    Text("端口").frame(width: nodePortColumnWidth, alignment: .leading)
+                    if !compact || showRegion {
                         Text("地区").frame(width: 76, alignment: .leading)
                     }
                     if compact {
@@ -1297,6 +1365,9 @@ struct HarborProxyWorkspaceView: View {
                             .frame(width: 88, alignment: .leading)
                     } else {
                         Text("真实延迟").frame(width: 102, alignment: .leading)
+                    }
+                    if showsProfileMenu {
+                        Text("配置").frame(width: profileMenuWidth)
                     }
                     Image(systemName: "speedometer").frame(width: 26)
                         .help("单节点真实测速")
@@ -1315,7 +1386,7 @@ struct HarborProxyWorkspaceView: View {
 
             GeometryReader { available in
                 ScrollView(.vertical) {
-                if pageNodes.isEmpty {
+                if pageGroups.isEmpty {
                     VStack(spacing: 9) {
                         Image(systemName: "line.3.horizontal.decrease.circle")
                             .font(.system(size: 24, weight: .ultraLight))
@@ -1345,14 +1416,15 @@ struct HarborProxyWorkspaceView: View {
                     let cellHeight = max(88, min(128,
                         (available.size.height - 18 - CGFloat(max(0, rowCount - 1)) * 8) / CGFloat(rowCount)))
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 9), count: columnCount), spacing: 8) {
-                        ForEach(pageNodes) { node in gridCard(node).frame(height: cellHeight) }
+                        ForEach(pageGroups) { group in gridCard(group).frame(height: cellHeight) }
                     }
                     .padding(9)
                     .frame(maxWidth: .infinity, minHeight: available.size.height, alignment: .top)
                 } else {
                     LazyVStack(spacing: 2) {
-                        ForEach(pageNodes) { node in
-                            row(node, compact: compact, showRegion: showRegion)
+                        ForEach(pageGroups) { group in
+                            row(group, compact: compact, showRegion: showRegion,
+                                showsProfileMenu: showsProfileMenu)
                         }
                     }
                     .padding(.horizontal, 9)
@@ -1375,7 +1447,7 @@ struct HarborProxyWorkspaceView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            pagination(totalCount: filteredNodes.count, currentPage: selectedPage, maxPage: lastPage)
+            pagination(totalCount: groups.count, currentPage: selectedPage, maxPage: lastPage)
                 .fixedSize(horizontal: false, vertical: true)
                 .layoutPriority(2)
         }
@@ -1384,7 +1456,47 @@ struct HarborProxyWorkspaceView: View {
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(HarborColors.cardBorder))
     }
 
-    private func row(_ node: HarborProxyNode, compact: Bool, showRegion: Bool) -> some View {
+    private func displayedNode(in group: AddressGroup) -> HarborProxyNode {
+        if let selected = group.nodes.first(where: { $0.id == previewNodeID }) {
+            return selected
+        }
+        if let connecting = group.nodes.first(where: { $0.id == visibleSwitchingNodeID }) {
+            return connecting
+        }
+        return group.nodes.first(where: { $0.id == proxy.activeNodeID }) ?? group.nodes[0]
+    }
+
+    @ViewBuilder
+    private func profileMenu(_ group: AddressGroup, selected node: HarborProxyNode) -> some View {
+        if group.nodes.count > 1 {
+            Menu {
+                ForEach(group.nodes) { profile in
+                    Button {
+                        previewNodeID = profile.id
+                    } label: {
+                        let title = "\(profile.protocolName.uppercased()) · \(profile.displayName)"
+                        if profile.id == node.id {
+                            Label(title, systemImage: "checkmark")
+                        } else {
+                            Text(title)
+                        }
+                    }
+                }
+            } label: {
+                Text("\(group.nodes.count) 种")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(HarborColors.blue)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .accessibilityLabel("选择连接配置，\(group.nodes.count) 种")
+            .help("选择同一地址和端口的连接配置")
+        }
+    }
+
+    private func row(_ group: AddressGroup, compact: Bool, showRegion: Bool,
+                     showsProfileMenu: Bool) -> some View {
+        let node = displayedNode(in: group)
         let active = proxy.activeNodeID == node.id && proxy.running
         let connected = active && proxy.healthy
         let probe = proxy.probeResults[node.id]
@@ -1434,43 +1546,44 @@ struct HarborProxyWorkspaceView: View {
                             .lineLimit(1)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        if showRegion {
-                            HStack(spacing: 5) {
-                                Text(regionFlag(node)).font(.system(size: 13))
-                                Text(locationLabel(of: node)).lineLimit(1)
-                            }
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 76, alignment: .leading)
-                            .help(regionHint(node))
-                        }
                     } else {
-                        Text(node.displayName)
-                            .font(.system(size: 11, weight: connected ? .semibold : .medium))
-                            .foregroundStyle(connected ? HarborColors.green : .primary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .frame(width: nodeNameColumnWidth, alignment: .leading)
-                        if node.customName != nil {
-                            Image(systemName: "pencil")
-                                .font(.system(size: 8.5, weight: .medium))
-                                .foregroundStyle(.secondary)
-                                .help("这是自定义节点名称；右键可修改或恢复订阅名称")
+                        HStack(spacing: 4) {
+                            Text(node.displayName)
+                                .font(.system(size: 11, weight: connected ? .semibold : .medium))
+                                .foregroundStyle(connected ? HarborColors.green : .primary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            if node.customName != nil {
+                                Image(systemName: "pencil")
+                                    .font(.system(size: 8.5, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                    .help("这是自定义节点名称；右键可修改或恢复订阅名称")
+                            }
                         }
+                        .frame(width: nodeNameColumnWidth, alignment: .leading)
                         Text("\(categoryOf(node).rawValue) · \(node.host)")
                             .font(.system(size: 9.5))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    Text(String(node.port))
+                        .font(.system(size: 10.5))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .frame(width: nodePortColumnWidth, alignment: .leading)
+                        .accessibilityLabel("端口 \(node.port)")
+                    if !compact || showRegion {
                         HStack(spacing: 5) {
                             Text(regionFlag(node)).font(.system(size: 13))
                             Text(locationLabel(of: node)).lineLimit(1)
-                                .help(regionHint(node))
                         }
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
-                            .frame(width: 76, alignment: .leading)
+                        .frame(width: 76, alignment: .leading)
+                        .help(regionHint(node))
                     }
                     if compact {
                         Text(realLatencyText(
@@ -1513,6 +1626,10 @@ struct HarborProxyWorkspaceView: View {
                 Task { await proxy.activate(node.id) }
             }
 
+            if showsProfileMenu {
+                profileMenu(group, selected: node)
+                    .frame(width: profileMenuWidth)
+            }
             Button {
                 Task { await proxy.testRealLatency([node.id]) }
             } label: {
@@ -1564,7 +1681,8 @@ struct HarborProxyWorkspaceView: View {
         .accessibilityAddTraits(connected ? .isSelected : [])
     }
 
-    private func gridCard(_ node: HarborProxyNode) -> some View {
+    private func gridCard(_ group: AddressGroup) -> some View {
+        let node = displayedNode(in: group)
         let active = proxy.activeNodeID == node.id && proxy.running
         let connected = active && proxy.healthy
         let connecting = visibleSwitchingNodeID == node.id
@@ -1612,11 +1730,17 @@ struct HarborProxyWorkspaceView: View {
                                 .foregroundStyle(HarborColors.orange)
                         }
                     }
-                    Text("\(categoryOf(node).rawValue) · \(node.host)")
-                        .font(.system(size: 9.5))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    HStack(spacing: 0) {
+                        Text("\(categoryOf(node).rawValue) · \(node.host)")
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(":\(node.port)")
+                            .monospacedDigit()
+                            .fixedSize()
+                            .accessibilityLabel("端口 \(node.port)")
+                    }
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.secondary)
                     HStack(spacing: 8) {
                         Text("\(regionFlag(node)) \(locationLabel(of: node))")
                             .help(regionHint(node))
@@ -1647,15 +1771,18 @@ struct HarborProxyWorkspaceView: View {
             .accessibilityAction(named: "连接节点") {
                 Task { await proxy.activate(node.id) }
             }
-            VStack(spacing: 2) {
-                Button {
-                    toggleFavorite(node.id)
-                } label: {
-                    Image(systemName: favorites.contains(node.id) ? "star.fill" : "star")
-                        .foregroundStyle(favorites.contains(node.id) ? HarborColors.orange : Color.secondary)
-                        .frame(width: 30, height: 30)
+            VStack(alignment: .trailing, spacing: 2) {
+                HStack(spacing: 2) {
+                    profileMenu(group, selected: node)
+                    Button {
+                        toggleFavorite(node.id)
+                    } label: {
+                        Image(systemName: favorites.contains(node.id) ? "star.fill" : "star")
+                            .foregroundStyle(favorites.contains(node.id) ? HarborColors.orange : Color.secondary)
+                            .frame(width: 30, height: 30)
+                    }
+                    .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.orange))
                 }
-                .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.orange))
                 Button {
                     Task { await proxy.testRealLatency([node.id]) }
                 } label: {
@@ -1920,10 +2047,11 @@ struct HarborProxyWorkspaceView: View {
 
     private func regionHint(_ node: HarborProxyNode) -> String {
         if proxy.exitGeoUnrecognizedIDs.contains(node.id) {
+            let reason = proxy.exitGeoFailureReasons[node.id] ?? "请求超时或识别失败"
             if let source = HarborVPNGate.publisherLocation(for: node) {
-                return "实际出口地区识别失败；当前显示 VPN Gate 发布的来源国家：\(source.displayRegion)，并非已验证出口。可重新识别"
+                return "\(reason)；当前显示 VPN Gate 发布的来源国家：\(source.displayRegion)，并非已验证出口。可重新识别"
             }
-            return "实际出口地区未识别（请求超时或识别失败）；可手动重新识别"
+            return "实际出口地区未识别：\(reason)；可手动重新识别"
         }
         if let exit = proxy.exitLocation(for: node) {
             return "普通网站检测到的出口 IP：\(exit.ip) · 优先显示出口地区"

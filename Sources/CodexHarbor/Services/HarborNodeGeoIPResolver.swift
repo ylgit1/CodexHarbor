@@ -54,7 +54,9 @@ enum HarborNodeGeoIPResolver {
         }.value
     }
 
-    static func countryCode(for ip: String, proxyPort: Int? = nil) async -> String? {
+    static func countryCode(for ip: String, proxyPort: Int? = nil,
+                            cancellation: HarborLatencyCancellation? = nil) async -> String? {
+        guard !Task.isCancelled, cancellation?.isCancelled != true else { return nil }
         // Only the public IP is sent to the geolocation provider; node labels,
         // subscriptions, credentials and DNS host names are never transmitted.
         guard let canonicalIP = HarborIPAddress.normalizedLiteral(ip),
@@ -67,6 +69,7 @@ enum HarborNodeGeoIPResolver {
         request.timeoutInterval = 6
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 6
+        config.timeoutIntervalForResource = 6
         config.waitsForConnectivity = false
         if let proxyPort {
             config.connectionProxyDictionary = [
@@ -76,6 +79,11 @@ enum HarborNodeGeoIPResolver {
         }
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
+        let observer = cancellation?.observe { session.invalidateAndCancel() }
+        guard cancellation == nil || observer != nil else { return nil }
+        defer {
+            if let observer { cancellation?.removeObserver(observer) }
+        }
         guard let (data, response) = try? await session.data(for: request),
               (response as? HTTPURLResponse)?.statusCode == 200,
               data.count < 16_384,
@@ -124,7 +132,7 @@ enum HarborNodeGeoIPResolver {
         // Geolocate the explicit observed IP independently. Requiring the
         // second GeoIP website to also be reachable through a fragile VPN
         // unnecessarily turns a valid observed exit into "待识别".
-        let country = await countryCode(for: canonical)
+        let country = await countryCode(for: canonical, cancellation: cancellation)
         let code: String?
         if let country {
             code = country

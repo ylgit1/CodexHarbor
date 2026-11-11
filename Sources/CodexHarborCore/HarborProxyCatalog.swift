@@ -99,6 +99,14 @@ public enum HarborProxyGeoIPPolicy {
     public static let serverDNSCacheInterval: TimeInterval = 6 * 60 * 60
     public static let exitRefreshInterval: TimeInterval = 7 * 24 * 60 * 60
     public static let exitParallelCount = 8
+    public static let exitBatchSize = 32
+
+    /// Include independent startup and both IP/GeoIP fallbacks for every
+    /// concurrency wave. Large subscriptions must not share a 75-second cap.
+    public static func exitBatchDeadlineSeconds(nodeCount: Int) -> Int {
+        let waves = max(1, (max(0, nodeCount) + exitParallelCount - 1) / exitParallelCount)
+        return max(75, waves * 45)
+    }
     public static let exitFailureRetryIntervals: [TimeInterval] = [
         10, 60, 10 * 60, 60 * 60
     ]
@@ -190,6 +198,23 @@ public struct HarborProxyProbeResult: Codable, Sendable, Equatable {
 /// genuinely new profile or a profile whose resolved server IP changed needs
 /// another end-to-end probe.
 public enum HarborProxySubscriptionRefreshPolicy {
+    /// Several profiles can share one server hostname or IP (different
+    /// protocols, ports or credentials). Snapshot the host cache without
+    /// requiring those node addresses to be unique.
+    public static func resolvedIPSnapshot(
+        nodes: [HarborProxyNode], subscriptionID: String,
+        serverLocations: [String: HarborProxyIPLocation]
+    ) -> [String: String] {
+        var snapshot: [String: String] = [:]
+        for node in nodes where node.subscriptionID == subscriptionID {
+            let host = node.host.lowercased()
+            if let location = serverLocations[host] {
+                snapshot[host] = location.ip
+            }
+        }
+        return snapshot
+    }
+
     public static func nodesRequiringProbe(
         previousNodeIDs: Set<String>,
         refreshedNodes: [HarborProxyNode],

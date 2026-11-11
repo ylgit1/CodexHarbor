@@ -56,6 +56,76 @@ release_build_lock() {
 acquire_build_lock
 trap release_build_lock EXIT
 
+# Sign with the same certificate on every build so the Agent retains its
+# designated requirement (DR) across binary updates. Stable identifiers alone
+# do NOT make ad-hoc signatures persistent in macOS TCC.
+#
+# Explicit CODEX_HARBOR_SIGN_IDENTITY overrides auto-detection, and "-" forces
+# ad-hoc signing. Prefer Apple Development for local builds, Developer ID for
+# distributed builds with an appropriate notarization workflow.
+sign_identity="${CODEX_HARBOR_SIGN_IDENTITY:-auto}"
+sign_keychain_args=()
+sign_keychain_lookup_args=()
+local_signing_profile="${CODEX_HARBOR_SIGNING_PROFILE:-$HOME/Library/Application Support/CodexHarbor/CodeSigning/profile.json}"
+# Once configured, pin the exact certificate instead of silently selecting a
+# different identity or returning to ad-hoc signing after a keychain failure.
+if [[ "$sign_identity" == "auto" ]] && {
+  [[ -n "${CODEX_HARBOR_SIGNING_PROFILE:-}" ]] ||
+  [[ -d "${local_signing_profile:h}" ]];
+}; then
+  if [[ ! -f "$local_signing_profile" ]]; then
+    echo "固定签名配置缺失，已停止打包；不会改用临时签名。" >&2
+    exit 6
+  fi
+  /usr/bin/swift -suppress-warnings "$project_root/Scripts/unlock-local-signing.swift" "$local_signing_profile"
+  sign_identity="$(/usr/bin/plutil -extract identity raw -o - "$local_signing_profile")"
+  signing_keychain="$(/usr/bin/plutil -extract keychainPath raw -o - "$local_signing_profile")"
+  sign_keychain_args=(--keychain "$signing_keychain")
+  sign_keychain_lookup_args=("$signing_keychain")
+  echo "==> 已固定本机长期签名证书，不使用临时签名"
+fi
+if [[ "$sign_identity" == "auto" ]]; then
+  available_identities="$(/usr/bin/security find-identity -v -p codesigning 2>/dev/null || true)"
+  # If the installed Agent has a certificate, keep using that exact identity;
+  # changing from Apple Development to Developer ID would itself reset TCC.
+  installed_agent="$installed_app_path/Contents/Helpers/HarborChatGPTAgent"
+  if [[ -x "$installed_agent" ]]; then
+    prior_signer="$(/usr/bin/codesign -dv --verbose=4 "$installed_agent" 2>&1 |
+      /usr/bin/awk -F= '/^Authority=(Apple Development: |Developer ID Application: |Codex Harbor Local Code Signing)/ { if (name == "") name = $2 } END { print name }')"
+    if [[ -n "$prior_signer" ]]; then
+      if [[ "$available_identities" != *"$prior_signer"* ]]; then
+        echo "已安装应用的固定签名证书不可用，已停止打包；不会更换签名身份。" >&2
+        exit 6
+      fi
+      sign_identity="$prior_signer"
+      echo "==> 沿用已安装 Agent 的签名证书，避免升级时更换身份"
+    fi
+  fi
+  if [[ "$sign_identity" == "auto" ]]; then
+    sign_identity="$(print -r -- "$available_identities" | /usr/bin/awk -F '"' '/"Apple Development: / { if (name == "") name = $2 } END { print name }')"
+  fi
+  if [[ -z "$sign_identity" ]]; then
+    sign_identity="$(print -r -- "$available_identities" | /usr/bin/awk -F '"' '/"Developer ID Application: / { print $2; exit }')"
+  fi
+  # Free local-only alternative: a persistent self-signed Code Signing
+  # identity created once with Keychain Access Certificate Assistant.
+  if [[ -z "$sign_identity" ]]; then
+    sign_identity="$(print -r -- "$available_identities" | /usr/bin/awk -F '"' '/"Codex Harbor Local Code Signing"/ { if (name == "") name = $2 } END { print name }')"
+  fi
+  if [[ -z "$sign_identity" ]]; then sign_identity="-"; fi
+fi
+if [[ "$sign_identity" != "-" ]]; then
+  if [[ "$(/usr/bin/security find-identity -v -p codesigning "${sign_keychain_lookup_args[@]}")" != *"$sign_identity"* ]]; then
+    echo "未找到有效的签名证书：$sign_identity" >&2
+    exit 6
+  fi
+  echo "==> 稳定代码签名身份：$sign_identity"
+else
+  echo "==> 警告：没有有效的持久代码签名身份，当前只能 ad-hoc 签名。" >&2
+  echo "    更新 Agent 后，macOS 可能要求重新开启辅助功能和屏幕录制授权。" >&2
+  echo "    免费方案：用钥匙串访问 → 证书助理创建「Codex Harbor Local Code Signing」自签名代码签名证书。" >&2
+  echo "    或者登录 Xcode 的免费 Apple Account / Personal Team 创建开发证书。" >&2
+fi
 case "$mode" in
   fast)
     echo "==> Release 快速编译（关闭 WMO，jobs=$jobs）"
@@ -171,63 +241,17 @@ chmod 755 "$mihomo_destination/mihomo"
 "$mihomo_destination/mihomo" -v >/dev/null
 echo "==> 已内置 Mihomo OpenVPN 内核（$host_arch）"
 chmod 755 "$staging_app_path/Contents/MacOS/CodexHarbor" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent" "$staging_app_path/Contents/Helpers/HarborUsageCardAgent"
-# Sign with the same certificate on every build so the Agent retains its
-# designated requirement (DR) across binary updates. Stable identifiers alone
-# do NOT make ad-hoc signatures persistent in macOS TCC.
-#
-# Explicit CODEX_HARBOR_SIGN_IDENTITY overrides auto-detection, and "-" forces
-# ad-hoc signing. Prefer Apple Development for local builds, Developer ID for
-# distributed builds with an appropriate notarization workflow.
-sign_identity="${CODEX_HARBOR_SIGN_IDENTITY:-auto}"
-if [[ "$sign_identity" == "auto" ]]; then
-  available_identities="$(/usr/bin/security find-identity -v -p codesigning 2>/dev/null || true)"
-  # If the installed Agent has a certificate, keep using that exact identity;
-  # changing from Apple Development to Developer ID would itself reset TCC.
-  installed_agent="$installed_app_path/Contents/Helpers/HarborChatGPTAgent"
-  if [[ -x "$installed_agent" ]]; then
-    prior_signer="$(/usr/bin/codesign -dv --verbose=4 "$installed_agent" 2>&1 |
-      /usr/bin/awk -F= '/^Authority=(Apple Development: |Developer ID Application: |Codex Harbor Local Code Signing)/ { if (name == "") name = $2 } END { print name }')"
-    if [[ -n "$prior_signer" && "$available_identities" == *"$prior_signer"* ]]; then
-      sign_identity="$prior_signer"
-      echo "==> 沿用已安装 Agent 的签名证书，避免升级时更换身份"
-    fi
-  fi
-  if [[ "$sign_identity" == "auto" ]]; then
-    sign_identity="$(print -r -- "$available_identities" | /usr/bin/awk -F '"' '/"Apple Development: / { if (name == "") name = $2 } END { print name }')"
-  fi
-  if [[ -z "$sign_identity" ]]; then
-    sign_identity="$(print -r -- "$available_identities" | /usr/bin/awk -F '"' '/"Developer ID Application: / { print $2; exit }')"
-  fi
-  # Free local-only alternative: a persistent self-signed Code Signing
-  # identity created once with Keychain Access Certificate Assistant.
-  if [[ -z "$sign_identity" ]]; then
-    sign_identity="$(print -r -- "$available_identities" | /usr/bin/awk -F '"' '/"Codex Harbor Local Code Signing"/ { if (name == "") name = $2 } END { print name }')"
-  fi
-  if [[ -z "$sign_identity" ]]; then sign_identity="-"; fi
-fi
-if [[ "$sign_identity" != "-" ]]; then
-  if [[ "$(/usr/bin/security find-identity -v -p codesigning)" != *"$sign_identity"* ]]; then
-    echo "未找到有效的签名证书：$sign_identity" >&2
-    exit 6
-  fi
-  echo "==> 稳定代码签名身份：$sign_identity"
-else
-  echo "==> 警告：没有有效的持久代码签名身份，当前只能 ad-hoc 签名。" >&2
-  echo "    更新 Agent 后，macOS 可能要求重新开启辅助功能和屏幕录制授权。" >&2
-  echo "    免费方案：用钥匙串访问 → 证书助理创建「Codex Harbor Local Code Signing」自签名代码签名证书。" >&2
-  echo "    或者登录 Xcode 的免费 Apple Account / Personal Team 创建开发证书。" >&2
-fi
 # Sign nested executables first, then the enclosing app. Avoid --deep when
 # signing: it can re-sign nested code with an unexpected identity.
 sign_options=()
 if [[ "$sign_identity" == "Developer ID Application:"* ]]; then
   sign_options=(--options runtime --timestamp)
 fi
-codesign --force "${sign_options[@]}" --sign "$sign_identity" --identifier "com.codexharbor.xray" "$xray_destination/xray"
-codesign --force "${sign_options[@]}" --sign "$sign_identity" --identifier "com.codexharbor.mihomo" "$mihomo_destination/mihomo"
-codesign --force "${sign_options[@]}" --sign "$sign_identity" --identifier "com.codexharbor.agent" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
-codesign --force "${sign_options[@]}" --sign "$sign_identity" --identifier "com.codexharbor.usage-card-agent" "$staging_app_path/Contents/Helpers/HarborUsageCardAgent"
-codesign --force "${sign_options[@]}" --sign "$sign_identity" "$staging_app_path"
+codesign --force "${sign_options[@]}" --sign "$sign_identity" "${sign_keychain_args[@]}" --identifier "com.codexharbor.xray" "$xray_destination/xray"
+codesign --force "${sign_options[@]}" --sign "$sign_identity" "${sign_keychain_args[@]}" --identifier "com.codexharbor.mihomo" "$mihomo_destination/mihomo"
+codesign --force "${sign_options[@]}" --sign "$sign_identity" "${sign_keychain_args[@]}" --identifier "com.codexharbor.agent" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
+codesign --force "${sign_options[@]}" --sign "$sign_identity" "${sign_keychain_args[@]}" --identifier "com.codexharbor.usage-card-agent" "$staging_app_path/Contents/Helpers/HarborUsageCardAgent"
+codesign --force "${sign_options[@]}" --sign "$sign_identity" "${sign_keychain_args[@]}" "$staging_app_path"
 
 codesign --verify --deep --strict "$staging_app_path"
 plutil -lint "$staging_app_path/Contents/Info.plist"

@@ -503,7 +503,7 @@ struct HarborProxyWorkspaceView: View {
                 Text("网络代理")
                     .font(.system(size: 20, weight: .bold, design: .rounded))
                     .tracking(-0.5)
-                Text("管理订阅与节点，一键切换，轻松上网")
+                Text("内置 WARP 无订阅连接，也可管理现有节点")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
             }
@@ -580,6 +580,10 @@ struct HarborProxyWorkspaceView: View {
         if visibleSwitchingNodeID != nil { return "正在切换 · 启动并验证新节点" }
         if proxy.running && proxy.checkingConnectivity {
             return "正在连接 · 本地端口已就绪，检测真实网络中"
+        }
+        if proxy.running && proxy.activeNodeID == HarborIndependentWARP.nodeID,
+           !proxy.healthy {
+            return "WARP 出口验证未通过 · " + proxy.detail
         }
         if proxy.running && !proxy.healthy { return "连接异常 · 真实网络检测未通过" }
         if proxy.running && proxy.activeNodeID != nil && proxy.systemManaged {
@@ -660,6 +664,12 @@ struct HarborProxyWorkspaceView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    if proxy.activeNodeID == HarborIndependentWARP.nodeID,
+                       let exitIP = proxy.warpExitIP, proxy.healthy {
+                        Text("出口 \(exitIP)")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(HarborColors.green)
+                    }
                 }
             }
             Spacer(minLength: 12)
@@ -697,6 +707,16 @@ struct HarborProxyWorkspaceView: View {
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.green, prominence: .secondary))
                 .disabled(proxy.busy)
                 .help("将已验证的当前节点设置为 macOS HTTP、HTTPS 与 SOCKS5 系统代理")
+            }
+            if !proxy.running && !proxy.requiresRecovery {
+                Button {
+                    Task { await proxy.activate(HarborIndependentWARP.nodeID) }
+                } label: {
+                    Label("WARP 一键连接", systemImage: "bolt.horizontal.circle")
+                }
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.green, prominence: .secondary))
+                .disabled(proxy.busy || !proxy.mihomoInstalled)
+                .help("不需要任何订阅节点；首次在线注册，验证 WARP 与外部 HTTPS 后再接管系统代理")
             }
             if proxy.running || proxy.requiresRecovery {
                 Button {

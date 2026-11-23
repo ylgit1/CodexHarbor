@@ -142,6 +142,25 @@ public struct HarborProxyNode: Codable, Identifiable, Sendable, Hashable {
     }
 }
 
+/// A built-in, subscription-free connection identity. It never represents a
+/// discovered server or a third-party subscription. The MASQUE endpoint and
+/// credentials are obtained only through HarborWARPRegistration at activation.
+public enum HarborIndependentWARP {
+    public static let nodeID = "com.codexharbor.builtin.warp"
+
+    public static var node: HarborProxyNode {
+        HarborProxyNode(
+            id: nodeID, name: "Cloudflare WARP · 无订阅",
+            protocolName: "warp", host: "warp.internal", port: 443,
+            credential: "builtin", subscriptionID: ""
+        )
+    }
+
+    public static func isBuiltIn(_ node: HarborProxyNode) -> Bool {
+        node.id == nodeID && node.protocolName == "warp" && node.subscriptionID.isEmpty
+    }
+}
+
 /// Connection equality ignores display metadata and source membership.
 /// Credentials and every transport option remain part of the key.
 public enum HarborProxyNodeDeduplication {

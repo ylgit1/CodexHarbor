@@ -1937,6 +1937,16 @@ final class HarborProxyManager: ObservableObject {
             detail = isWarp
                 ? (warpReport?.reason ?? "WARP 真实出口验证失败，未接管系统代理")
                 : "当前 SOCKS5 节点对 v2rayN 配置测速地址的请求未通过；运行节点未被回退"
+            if isWarp && systemManaged {
+                do {
+                    try HarborSystemProxy.restore(interactive: false)
+                    systemManaged = false
+                    refreshSystemProxyState()
+                } catch {
+                    detail += "；系统代理恢复失败：" + error.localizedDescription
+                    refreshSystemProxyState()
+                }
+            }
         }
     }
 
@@ -2038,8 +2048,15 @@ final class HarborProxyManager: ObservableObject {
             return
         }
         let uniqueIDs = Array(NSOrderedSet(array: ids)) as? [String] ?? ids
-        let targets = uniqueIDs.compactMap { id in nodes.first(where: { $0.id == id }) }
-        guard !targets.isEmpty else { return }
+        // Built-in WARP has a dedicated end-to-end check; Xray batch probing
+        // cannot handle a MASQUE-only node and must never fail other profiles.
+        let targets = uniqueIDs.compactMap { id in
+            nodes.first(where: { $0.id == id && !HarborIndependentWARP.isBuiltIn($0) })
+        }
+        guard !targets.isEmpty else {
+            detail = "内置 WARP 请在连接后使用「网站检测」或连接验证"
+            return
+        }
         guard targets.allSatisfy({ supportsCore(for: $0) }) else {
             detail = "所选节点的代理内核未安装，暂时无法进行真实测速"
             return
@@ -2236,8 +2253,13 @@ final class HarborProxyManager: ObservableObject {
     func refreshExitLocations(for ids: [String]) {
         guard coreInstalled, !busy, !latencyTesting, !exitGeoUpdating else { return }
         let requested = Set(ids)
-        let candidates = nodes.filter { requested.contains($0.id) }
-        guard !candidates.isEmpty else { return }
+        let candidates = nodes.filter {
+            requested.contains($0.id) && !HarborIndependentWARP.isBuiltIn($0)
+        }
+        guard !candidates.isEmpty else {
+            detail = "WARP 出口 IP 已在独立连接验证中获取，无需普通节点地区探测"
+            return
+        }
         exitGeoManualIDs = Set(candidates.map(\.id))
         exitGeoUnrecognizedIDs.subtract(exitGeoManualIDs)
         for id in exitGeoManualIDs { exitGeoFailureReasons.removeValue(forKey: id) }
@@ -2266,6 +2288,7 @@ final class HarborProxyManager: ObservableObject {
         let now = Date.now
         for candidate in candidates {
             guard let current = nodes.first(where: { $0.id == candidate.id }),
+                  !HarborIndependentWARP.isBuiltIn(current),
                   current.endpointSignature == candidate.endpointSignature else { continue }
             let serverIP = nodeServerLocations[current.host.lowercased()]?.ip
             if let cached = nodeExitLocations[current.id],

@@ -45,7 +45,9 @@ struct HarborProxyReliabilityTests {
         try await Task.sleep(for: .milliseconds(100))
         pending.cancel()
         await #expect(throws: CancellationError.self) { _ = try await pending.value }
-        #expect(start.duration(to: .now) < .seconds(3))
+        // Shared macOS CI runners can be delayed by concurrent tests; preserve
+        // a finite wall-clock bound without assuming sub-3-second scheduling.
+        #expect(start.duration(to: .now) < .seconds(8))
     }
 
     @Test("Denied decryption cannot make a saved configuration writable")

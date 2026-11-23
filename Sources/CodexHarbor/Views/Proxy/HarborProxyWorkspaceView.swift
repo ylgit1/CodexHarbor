@@ -581,9 +581,9 @@ struct HarborProxyWorkspaceView: View {
         if proxy.running && proxy.checkingConnectivity {
             return "正在连接 · 本地端口已就绪，检测真实网络中"
         }
-        if proxy.running && HarborIndependentWARP.isBuiltIn(proxy.activeNode ?? HarborIndependentWARP.node),
-           proxy.activeNodeID == HarborIndependentWARP.nodeID, !proxy.healthy {
-            return "WARP 出口验证未通过 · 尚未接管系统代理"
+        if proxy.running && proxy.activeNodeID == HarborIndependentWARP.nodeID,
+           !proxy.healthy {
+            return "WARP 出口验证未通过 · " + proxy.detail
         }
         if proxy.running && !proxy.healthy { return "连接异常 · 真实网络检测未通过" }
         if proxy.running && proxy.activeNodeID != nil && proxy.systemManaged {
@@ -664,6 +664,12 @@ struct HarborProxyWorkspaceView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    if proxy.activeNodeID == HarborIndependentWARP.nodeID,
+                       let exitIP = proxy.warpExitIP, proxy.healthy {
+                        Text("出口 \(exitIP)")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(HarborColors.green)
+                    }
                 }
             }
             Spacer(minLength: 12)

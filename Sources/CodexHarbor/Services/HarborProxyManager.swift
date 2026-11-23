@@ -221,6 +221,7 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var running = false
     @Published private(set) var healthy = false
     @Published private(set) var checkingConnectivity = false
+    @Published private(set) var warpExitIP: String?
     @Published private(set) var websiteChecking = false
     @Published private(set) var busy = false
     @Published private(set) var systemManaged = false
@@ -392,7 +393,12 @@ final class HarborProxyManager: ObservableObject {
     private func runningConfigMatches(_ id: String, path: URL?) -> Bool {
         guard let node = nodes.first(where: { $0.id == id }),
               let path, let data = try? Data(contentsOf: path) else { return false }
-        return node.protocolName == "openvpn"
+        return HarborIndependentWARP.isBuiltIn(node)
+            ? activeWARPProfile.map {
+                HarborWARPConfig.matches(configuration: data, profile: $0,
+                                        httpPort: localPort ?? configuredHTTPPort)
+              } ?? false
+            : node.protocolName == "openvpn"
             ? HarborMihomoConfig.matches(configuration: data, node: node,
                                          underlaySocksPort: underlayPort.map { $0 + 1 },
                                          warpProfile: activeWARPProfile)
@@ -484,7 +490,8 @@ final class HarborProxyManager: ObservableObject {
     }
 
     func supportsCore(for node: HarborProxyNode) -> Bool {
-        node.protocolName == "openvpn" ? mihomoInstalled : coreInstalled
+        (node.protocolName == "openvpn" || HarborIndependentWARP.isBuiltIn(node))
+            ? mihomoInstalled : coreInstalled
     }
 
     /// Restores the packaged runtime without downloading or changing system proxy.
@@ -657,6 +664,14 @@ final class HarborProxyManager: ObservableObject {
                     mergeDuplicateMetadata(distinct.replacementIDs, keeping: distinct.nodes)
                     nodes = distinct.nodes
                 }
+                // Built-in WARP requires no subscriptions and is not auto-selected.
+                nodes.removeAll {
+                    $0.id == HarborIndependentWARP.nodeID &&
+                    !HarborIndependentWARP.isBuiltIn($0)
+                }
+                if !nodes.contains(where: HarborIndependentWARP.isBuiltIn) {
+                    nodes.append(HarborIndependentWARP.node)
+                }
                 configurationLoaded = true
                 var namesChanged = false
                 for subscription in subscriptions {
@@ -801,7 +816,9 @@ final class HarborProxyManager: ObservableObject {
         guard configurationLoaded else { return }
         // VPN Gate already supplies an origin country. Its large, short-lived
         // IP list should not consume the separate GeoIP provider's quota.
-        let hosts = Array(Set(nodes.filter { $0.protocolName != "openvpn" }
+        let hosts = Array(Set(nodes.filter {
+            $0.protocolName != "openvpn" && !HarborIndependentWARP.isBuiltIn($0)
+        }
             .map { $0.host.lowercased() }.filter { !$0.isEmpty })).sorted()
         geoRefreshTask = Task(priority: .utility) { [weak self] in
             // Multiple subscription aliases can resolve to one IP. Never
@@ -1596,7 +1613,8 @@ final class HarborProxyManager: ObservableObject {
             }
         }
 
-        if requestedNode.protocolName == "openvpn", !mihomoInstalled {
+        if (requestedNode.protocolName == "openvpn" ||
+            HarborIndependentWARP.isBuiltIn(requestedNode)), !mihomoInstalled {
             detail = "Mihomo 内核未安装，原连接保持不变"
             return
         }
@@ -1673,6 +1691,10 @@ final class HarborProxyManager: ObservableObject {
     }
 
     func remove(_ id: String) {
+        guard id != HarborIndependentWARP.nodeID else {
+            detail = "内置 WARP 不能删除"
+            return
+        }
         guard id != selectedID || !running else { detail = "请先切换或关闭当前节点"; return }
         nodes.removeAll { $0.id == id }
         if selectedID == id { selectedID = nodes.first?.id }
@@ -1711,7 +1733,7 @@ final class HarborProxyManager: ObservableObject {
             return
         }
         guard supportsCore(for: node) else {
-            detail = node.protocolName == "openvpn"
+            detail = (node.protocolName == "openvpn" || HarborIndependentWARP.isBuiltIn(node))
                 ? "请从安装包恢复内置 Mihomo 内核" : "请从安装包恢复内置 Xray 内核"
             return
         }
@@ -1720,6 +1742,15 @@ final class HarborProxyManager: ObservableObject {
         do {
             let port = try choosePort()
             let isOpenVPN = node.protocolName == "openvpn"
+            let isStandaloneWARP = HarborIndependentWARP.isBuiltIn(node)
+            if isStandaloneWARP {
+                let cancellation = HarborLatencyCancellation()
+                activationPreflightCancellation = cancellation
+                defer { activationPreflightCancellation = nil }
+                let tunnel = try await prepareIndependentVPNGateTunnel(cancellation: cancellation)
+                activeWARPProfile = tunnel.profile
+                tunnel.close()
+            }
             if isOpenVPN, underlayNodeID == nil {
                 let cancellation = HarborLatencyCancellation()
                 activationPreflightCancellation = cancellation
@@ -1739,7 +1770,9 @@ final class HarborProxyManager: ObservableObject {
                 }
                 try await startUnderlay(base)
             }
-            let config = try isOpenVPN
+            let config = try isStandaloneWARP
+                ? HarborWARPConfig.make(profile: activeWARPProfile!, httpPort: port)
+                : isOpenVPN
                 ? HarborMihomoConfig.make(node: node, httpPort: port,
                                           underlaySocksPort: underlayPort.map { $0 + 1 },
                                           warpProfile: activeWARPProfile)
@@ -1752,9 +1785,11 @@ final class HarborProxyManager: ObservableObject {
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
             configPath = file
             let process = Process()
-            process.executableURL = root.appendingPathComponent(isOpenVPN ? "mihomo" : "xray")
+            process.executableURL = root.appendingPathComponent(
+                (isOpenVPN || isStandaloneWARP) ? "mihomo" : "xray")
             process.currentDirectoryURL = root
-            process.arguments = isOpenVPN ? ["-f", file.path] : ["run", "-config", file.path]
+            process.arguments = (isOpenVPN || isStandaloneWARP)
+                ? ["-f", file.path] : ["run", "-config", file.path]
             process.standardOutput = FileHandle.nullDevice
             // A private O_APPEND file survives host-app restarts without a pipe
             // SIGPIPE. The low-frequency liveness monitor bounds its size.
@@ -1806,6 +1841,7 @@ final class HarborProxyManager: ObservableObject {
             // Commit UI identity only after the listener belongs to the new
             // process and its complete outbound configuration matches the node.
             activeNodeID = node.id
+            warpExitIP = nil
             selectedID = node.id
             if isOpenVPN { vpnGateUnderlayNodeID = underlayPort == nil ? nil : underlayNodeID }
             persist()
@@ -1852,10 +1888,17 @@ final class HarborProxyManager: ObservableObject {
         generation: UInt64,
         systemProxyInteractive: Bool
     ) async {
-        let reachable = activeNode?.protocolName == "openvpn"
-            ? await HarborMihomoLatencyTester.checkActiveSOCKS(
+        let isWarp = activeNode.map(HarborIndependentWARP.isBuiltIn) ?? false
+        let warpReport = isWarp ? await HarborWARPConnectivity.check(httpPort: port) : nil
+        let reachable: Bool
+        if let warpReport {
+            reachable = warpReport.verified
+        } else if activeNode?.protocolName == "openvpn" {
+            reachable = await HarborMihomoLatencyTester.checkActiveSOCKS(
                 port: port + 1, failureLog: runtimeErrorLogURL)
-            : await HarborNodeLatencyTester.checkActiveSOCKS(port: port + 1)
+        } else {
+            reachable = await HarborNodeLatencyTester.checkActiveSOCKS(port: port + 1)
+        }
         lastActiveHealthCheckAt = .now
         guard generation == connectionGeneration,
               running, localPort == port else { return }
@@ -1875,20 +1918,25 @@ final class HarborProxyManager: ObservableObject {
         }
         checkingConnectivity = false
         healthy = reachable
+        warpExitIP = isWarp ? warpReport?.exitIP : nil
         proxyAudit(reachable ? "health_success" : "health_failed",
                    nodeID: activeNodeID, note: "method=v2rayn_realping_socks")
         if reachable {
             status = "已连接"
-            detail = "HTTP 127.0.0.1:\(port) · SOCKS5 \(port + 1)"
-            if let activeNode { enqueueExitGeoRefresh(for: [activeNode]) }
+            detail = isWarp
+                ? "WARP 独立出口已验证 \(warpExitIP ?? "IP 待识别") · HTTP \(port) / SOCKS5 \(port + 1)"
+                : "HTTP 127.0.0.1:\(port) · SOCKS5 \(port + 1)"
+            if let activeNode, !isWarp { enqueueExitGeoRefresh(for: [activeNode]) }
             if autoManageSystemProxy && !systemManaged {
                 enableSystemProxy(interactive: systemProxyInteractive)
             }
         } else {
             // Inbound identity and node selection remain committed; a probe
             // failure does not mean the Xray outbound changed to another node.
-            status = "节点已切换 · 真实测速未通过"
-            detail = "当前 SOCKS5 节点对 v2rayN 配置测速地址的请求未通过；运行节点未被回退"
+            status = isWarp ? "WARP 出口验证失败" : "节点已切换 · 真实测速未通过"
+            detail = isWarp
+                ? (warpReport?.reason ?? "WARP 真实出口验证失败，未接管系统代理")
+                : "当前 SOCKS5 节点对 v2rayN 配置测速地址的请求未通过；运行节点未被回退"
         }
     }
 
@@ -1914,16 +1962,26 @@ final class HarborProxyManager: ObservableObject {
     func verify() async {
         guard running, let port = localPort, !busy else { return }
         busy = true; defer { busy = false }
-        let reachable = activeNode?.protocolName == "openvpn"
-            ? await HarborMihomoLatencyTester.checkActiveSOCKS(port: port + 1)
-            : await HarborNodeLatencyTester.checkActiveSOCKS(port: port + 1)
+        let isWarp = activeNode.map(HarborIndependentWARP.isBuiltIn) ?? false
+        let warpReport = isWarp ? await HarborWARPConnectivity.check(httpPort: port) : nil
+        let reachable: Bool
+        if let warpReport {
+            reachable = warpReport.verified
+        } else if activeNode?.protocolName == "openvpn" {
+            reachable = await HarborMihomoLatencyTester.checkActiveSOCKS(port: port + 1)
+        } else {
+            reachable = await HarborNodeLatencyTester.checkActiveSOCKS(port: port + 1)
+        }
         healthy = reachable && activeNodeID != nil && runningConfigMatches(activeNodeID!, path: configPath)
+        warpExitIP = isWarp ? warpReport?.exitIP : nil
         proxyAudit(healthy ? "manual_verify_success" : "manual_verify_failed",
                    nodeID: activeNodeID, note: "method=v2rayn_realping_socks")
-        status = healthy ? "已连接" : "节点已切换 · 真实测速未通过"
-        detail = healthy
-            ? "当前节点通过 v2rayN 真实测速地址验证"
-            : "内核已启动，当前节点对 v2rayN 真实测速地址的请求未通过"
+        status = healthy ? "已连接" : (isWarp ? "WARP 出口验证失败" : "节点已切换 · 真实测速未通过")
+        detail = isWarp
+            ? (healthy ? "WARP 独立出口已验证 \(warpExitIP ?? "")"
+                       : (warpReport?.reason ?? "WARP 外网验证未通过"))
+            : (healthy ? "当前节点通过 v2rayN 真实测速地址验证"
+                       : "内核已启动，当前节点对 v2rayN 真实测速地址的请求未通过")
     }
 
     func testRealLatency(_ ids: [String]) async {
@@ -2744,6 +2802,7 @@ final class HarborProxyManager: ObservableObject {
         underlayConfigPath = nil
         adoptedUnderlayPID = nil
         activeWARPProfile = nil
+        warpExitIP = nil
         if let configPath { try? FileManager.default.removeItem(at: configPath) }
         try? FileManager.default.removeItem(at: runtimeRecordURL)
         configPath = nil; localPort = nil
@@ -2785,7 +2844,12 @@ final class HarborProxyManager: ObservableObject {
         let configData = configPath.flatMap { try? Data(contentsOf: $0) }
         let matched = configData.flatMap { data in
             nodes.first { node in
-                node.protocolName == "openvpn"
+                HarborIndependentWARP.isBuiltIn(node)
+                    ? activeWARPProfile.map {
+                        HarborWARPConfig.matches(configuration: data, profile: $0,
+                                                httpPort: configuredHTTPPort)
+                      } ?? false
+                    : node.protocolName == "openvpn"
                     ? HarborMihomoConfig.matches(
                         configuration: data, node: node,
                         underlaySocksPort: record.underlay.map { $0.httpPort + 1 },
@@ -2794,6 +2858,7 @@ final class HarborProxyManager: ObservableObject {
             }
         }
         activeNodeID = matched?.id
+        warpExitIP = nil
         healthy = false
         checkingConnectivity = matched != nil
         status = matched == nil ? "运行节点未能匹配保存的配置" : "已启动 · 正在检测网络"

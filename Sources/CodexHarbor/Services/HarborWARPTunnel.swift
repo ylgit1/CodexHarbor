@@ -15,12 +15,13 @@ final class HarborWARPTunnel: @unchecked Sendable {
     private let parent: HarborLatencyCancellation
     private let parentObserver: UUID
     private let engineObserver: UUID
+    private let lease: UUID
     private let lock = NSLock()
     private var closed = false
 
     private init(profile: HarborWARPProfile, httpPort: Int, engine: Process, directory: URL,
                  cancellation: HarborLatencyCancellation, parent: HarborLatencyCancellation,
-                 parentObserver: UUID, engineObserver: UUID) {
+                 parentObserver: UUID, engineObserver: UUID, lease: UUID) {
         self.profile = profile
         self.httpPort = httpPort
         self.engine = engine
@@ -29,25 +30,24 @@ final class HarborWARPTunnel: @unchecked Sendable {
         self.parent = parent
         self.parentObserver = parentObserver
         self.engineObserver = engineObserver
+        self.lease = lease
     }
 
-    func close() {
-        lock.lock()
-        guard !closed else { lock.unlock(); return }
-        closed = true
-        lock.unlock()
+    func close() async {
+        guard lock.withLock({
+            if closed { return false }
+            closed = true
+            return true
+        }) else { return }
         parent.removeObserver(parentObserver)
         cancellation.removeObserver(engineObserver)
         cancellation.cancel()
-        let engine = engine, directory = directory, port = httpPort
-        Task.detached(priority: .utility) {
-            HarborProbeProcessReaper.stop(engine)
+        if await HarborProxyCommand.stop(engine) {
             try? FileManager.default.removeItem(at: directory)
-            HarborNodeLatencyTester.releasePortPair(port)
+            HarborNodeLatencyTester.releasePortPair(httpPort)
+            await HarborProbeBudget.engines.release(lease)
         }
     }
-
-    deinit { close() }
 
     static func prepare(account: HarborWARPAccount, preferred: HarborWARPEndpoint?,
                         root: URL, cancellation: HarborLatencyCancellation) async throws -> HarborWARPTunnel {
@@ -55,15 +55,23 @@ final class HarborWARPTunnel: @unchecked Sendable {
         let primary = HarborWARPEndpoint.candidates(preferred: preferred)
         // A lost QUIC handshake is common on filtered networks. Give each
         // QUIC path three bounded chances without enrolling another identity.
-        let retry = primary.filter { $0.transport == .h3 }
-        let endpoints = primary + retry + retry
+        let endpoints = primary
+        let deadline = ContinuousClock.now + .seconds(32)
+        let attempts = HarborLatencyCancellation()
+        let observer = cancellation.observe { attempts.cancel() }
+        defer { if let observer { cancellation.removeObserver(observer) } }
+        let timer = Task {
+            do { try await Task.sleep(until: deadline, clock: .continuous) } catch { return }
+            attempts.cancel()
+        }
+        defer { timer.cancel() }
         let result = await withTaskGroup(of: HarborWARPTunnel?.self) { group in
             var next = 0
             var winner: HarborWARPTunnel?
             func enqueue(_ endpoint: HarborWARPEndpoint) {
                 group.addTask {
                     await connect(profile: HarborWARPProfile(account: account, endpoint: endpoint),
-                                  root: root, parent: cancellation)
+                                  root: root, parent: attempts)
                 }
             }
             // Keep the previous success first while racing one alternative;
@@ -77,17 +85,17 @@ final class HarborWARPTunnel: @unchecked Sendable {
                     winner = tunnel
                     group.cancelAll()
                 } else {
-                    tunnel?.close()
+                    await tunnel?.close()
                 }
                 if winner == nil, next < endpoints.count,
-                   !cancellation.isCancelled, !Task.isCancelled {
+                   !attempts.isCancelled, !Task.isCancelled {
                     enqueue(endpoints[next]); next += 1
                 }
             }
             return winner
         }
         guard let result, !cancellation.isCancelled, !Task.isCancelled else {
-            result?.close()
+            await result?.close()
             if cancellation.isCancelled || Task.isCancelled { throw CancellationError() }
             throw HarborProxyError.invalid("独立通道暂时无法连接，已尝试 TCP 与 QUIC；请稍后重新筛选")
         }
@@ -98,10 +106,18 @@ final class HarborWARPTunnel: @unchecked Sendable {
                                 parent: HarborLatencyCancellation) async -> HarborWARPTunnel? {
         let cancellation = HarborLatencyCancellation()
         guard let parentObserver = parent.observe({ cancellation.cancel() }) else { return nil }
+        guard let lease = await HarborProbeBudget.engines.acquire(cancellation) else {
+            parent.removeObserver(parentObserver)
+            return nil
+        }
         return await withTaskCancellationHandler {
+            let released = HarborLatencyCancellation()
             let tunnel = await Task.detached(priority: .utility) { () -> HarborWARPTunnel? in
                 guard !cancellation.isCancelled,
-                      let port = HarborNodeLatencyTester.reservePortPair() else { return nil }
+                      let port = HarborNodeLatencyTester.reservePortPair() else {
+                    released.cancel()
+                    return nil
+                }
                 let directory = root.appendingPathComponent("warp-probe-\(UUID().uuidString)", isDirectory: true)
                 let file = directory.appendingPathComponent("config.json")
                 let engine = Process()
@@ -110,9 +126,11 @@ final class HarborWARPTunnel: @unchecked Sendable {
                 defer {
                     if !keep {
                         if let observer { cancellation.removeObserver(observer) }
-                        HarborProbeProcessReaper.stop(engine)
-                        try? FileManager.default.removeItem(at: directory)
-                        HarborNodeLatencyTester.releasePortPair(port)
+                        if HarborProxyCommand.stopBlocking(engine) {
+                            try? FileManager.default.removeItem(at: directory)
+                            HarborNodeLatencyTester.releasePortPair(port)
+                            released.cancel()
+                        }
                     }
                 }
                 do {
@@ -143,12 +161,16 @@ final class HarborWARPTunnel: @unchecked Sendable {
                     return HarborWARPTunnel(
                         profile: profile, httpPort: port, engine: engine, directory: directory,
                         cancellation: cancellation, parent: parent,
-                        parentObserver: parentObserver, engineObserver: observer)
+                        parentObserver: parentObserver, engineObserver: observer, lease: lease)
                 } catch { return nil }
             }.value
-            guard let tunnel else { parent.removeObserver(parentObserver); return nil }
+            guard let tunnel else {
+                parent.removeObserver(parentObserver)
+                if released.isCancelled { await HarborProbeBudget.engines.release(lease) }
+                return nil
+            }
             guard await tunnel.verify(), !Task.isCancelled, !cancellation.isCancelled else {
-                tunnel.close()
+                await tunnel.close()
                 return nil
             }
             return tunnel
@@ -158,33 +180,42 @@ final class HarborWARPTunnel: @unchecked Sendable {
     }
 
     private func verify() async -> Bool {
-        guard !cancellation.isCancelled else { return false }
-        let session = URLSession(configuration: HarborProxyHTTP.configuration(httpPort: httpPort))
-        let observer = cancellation.observe { session.invalidateAndCancel() }
-        defer {
-            if let observer { cancellation.removeObserver(observer) }
-            session.invalidateAndCancel()
-        }
+        guard !cancellation.isCancelled,
+              let lease = await HarborProbeBudget.requests.acquire(cancellation) else { return false }
+        let result = await verifyEndpoints()
+        await HarborProbeBudget.requests.release(lease)
+        return result
+    }
+
+    private func verifyEndpoints() async -> Bool {
+        let port = httpPort
+        let task = Task { () -> Bool in
         do {
             var trace = URLRequest(url: URL(string: "https://www.cloudflare.com/cdn-cgi/trace")!)
             trace.timeoutInterval = 6
-            let (data, response) = try await session.data(for: trace)
-            guard (response as? HTTPURLResponse)?.statusCode == 200,
-                  HarborProxyHTTP.verifiesWARPTrace(data),
+            let (data, _) = try await HarborProxyHTTPBody.data(for: trace,
+                configuration: HarborProxyHTTP.configuration(httpPort: port), limit: 4_096,
+                timeout: 6, status: 200..<201)
+            guard HarborProxyHTTP.verifiesWARPTrace(data),
                   !cancellation.isCancelled else { return false }
             // A successful WARP trace alone does not prove general Internet
             // access. Also require a non-Cloudflare HTTPS request.
             var check = URLRequest(url: URL(string: "https://www.gstatic.com/generate_204")!)
             check.timeoutInterval = 6
-            let (body, result) = try await session.data(for: check)
-            return (result as? HTTPURLResponse)?.statusCode == 204
-                && body.isEmpty && !cancellation.isCancelled
+            let (body, _) = try await HarborProxyHTTPBody.data(for: check,
+                configuration: HarborProxyHTTP.configuration(httpPort: port), limit: 64,
+                timeout: 6, status: 204..<205)
+            return body.isEmpty && !cancellation.isCancelled
         } catch { return false }
+        }
+        let observer = cancellation.observe { task.cancel() }
+        defer { if let observer { cancellation.removeObserver(observer) } }
+        return await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
     }
 
     /// Recover only our recorded, orphaned probe cores. Normal live probes
     /// belong to this process and are left alone.
-    static func cleanupOrphans(root: URL) {
+    static func cleanupOrphans(root: URL) async {
         let fm = FileManager.default
         guard let directories = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return }
         for directory in directories where directory.lastPathComponent.hasPrefix("warp-probe-") {
@@ -192,25 +223,19 @@ final class HarborWARPTunnel: @unchecked Sendable {
             guard let text = try? String(contentsOf: pidFile, encoding: .utf8),
                   let pid = Int32(text), pid > 0 else { continue }
             if Darwin.kill(pid, 0) == 0 {
-                let ps = Process(), output = Pipe()
-                ps.executableURL = URL(fileURLWithPath: "/bin/ps")
-                ps.arguments = ["-ww", "-p", String(pid), "-o", "ppid=", "-o", "command="]
-                ps.standardOutput = output
-                ps.standardError = FileHandle.nullDevice
                 do {
-                    try ps.run()
-                    ps.waitUntilExit()
-                    let line = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                    let output = try await HarborProxyCommand.run(URL(fileURLWithPath: "/bin/ps"),
+                        arguments: ["-ww", "-p", String(pid), "-o", "ppid=", "-o", "command="], timeout: 1)
+                    let line = String(decoding: output.data, as: UTF8.self)
                     let fields = line.split(maxSplits: 1, whereSeparator: \.isWhitespace)
                     guard fields.count == 2, fields[0] == "1",
                           fields[1].contains(root.appendingPathComponent("mihomo").path),
                           fields[1].contains("-d " + directory.path),
                           fields[1].contains("-f " + directory.appendingPathComponent("config.json").path) else { continue }
                     _ = Darwin.kill(pid, SIGTERM)
+                    try? await Task.sleep(for: .milliseconds(250))
                 } catch { continue }
-                // Leave the record for a later retry if the old process has
-                // not exited. Do not delete credentials underneath a live core.
-                continue
+                if Darwin.kill(pid, 0) == 0 { continue }
             }
             try? fm.removeItem(at: directory)
         }

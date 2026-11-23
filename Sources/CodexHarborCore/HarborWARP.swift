@@ -214,14 +214,9 @@ public enum HarborWARPRegistration {
     private static let base = "https://api.cloudflareclient.com/v0a4471/reg"
 
     public static func register(transport: Transport? = nil) async throws -> HarborWARPAccount {
-        let session = URLSession(configuration: HarborProxyHTTP.configuration())
-        defer { session.invalidateAndCancel() }
         let send: Transport = transport ?? { request in
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                throw HarborProxyError.invalid("独立通道注册响应无效")
-            }
-            return (data, http)
+            try await HarborProxyHTTPBody.data(for: request,
+                configuration: HarborProxyHTTP.configuration(), limit: 65_536, timeout: 12)
         }
         let bootstrapKey = Curve25519.KeyAgreement.PrivateKey()
         let key = P256.Signing.PrivateKey()

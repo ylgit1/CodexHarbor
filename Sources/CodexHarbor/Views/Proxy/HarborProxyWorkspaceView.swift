@@ -3,7 +3,7 @@ import AppKit
 import Combine
 import CodexHarborCore
 
-private struct ServerAddress: Hashable {
+private struct ServerAddress: Hashable, Sendable {
     let host: String
     let port: Int
 
@@ -14,7 +14,7 @@ private struct ServerAddress: Hashable {
 }
 
 /// Keep each connection configuration available within its server address.
-private struct AddressGroup: Identifiable {
+private struct AddressGroup: Identifiable, Sendable {
     let id: ServerAddress
     var nodes: [HarborProxyNode]
 
@@ -47,6 +47,7 @@ struct HarborProxyWorkspaceView: View {
     @State private var protocolFilter = "全部"
     @State private var latencyFilter = "全部"
     @State private var showUnavailable = true
+    @State private var batchScope: BatchScope = .filtered
     // The table keeps its last committed ordering while a batch is running.
     @State private var frozenLatencyResults: [String: HarborProxyProbeResult]?
     @State private var page = 1
@@ -58,7 +59,7 @@ struct HarborProxyWorkspaceView: View {
     @State private var subscriptionURL = ""
     @State private var editingSubscriptionID: String?
     @State private var subscriptionError: String?
-    @State private var subscriptionSaving = false
+    @State private var editorSaving = false
     @State private var nodeLinks = ""
     @State private var forcedDomainText = ""
     @State private var forcedDomainError: String?
@@ -87,9 +88,13 @@ struct HarborProxyWorkspaceView: View {
     @MainActor
     private final class CatalogRefreshScheduler {
         var task: Task<Void, Never>?
+        var generation = UUID()
+        var needsRefresh = false
     }
 
-    private struct CatalogPresentation {
+    private struct CatalogPresentation: Sendable {
+        var filter: CatalogFilter?
+        var filteredNodes: [HarborProxyNode] = []
         var sourceNodes: [HarborProxyNode] = []
         var sourceAddressCount = 0
         var categoryAddressCount = 0
@@ -98,6 +103,7 @@ struct HarborProxyWorkspaceView: View {
         var categoryCounts: [NodeCategory: Int] = [:]
         var regionCounts: [String: Int] = [:]
         var subscriptionCounts: [String: Int] = [:]
+        var subscriptionProfileCounts: [String: Int] = [:]
         var subscriptionUsableCounts: [String: Int] = [:]
         var allNodeCount = 0
         var favoriteCount = 0
@@ -111,7 +117,7 @@ struct HarborProxyWorkspaceView: View {
     private struct DeletionTarget: Identifiable { let id: String }
     private struct RenameTarget: Identifiable { let id: String }
 
-    private enum NodeCategory: String, CaseIterable {
+    private enum NodeCategory: String, CaseIterable, Sendable {
         case all = "全部"
         case residential = "住宅候选"
         case volunteer = "志愿节点"
@@ -122,6 +128,13 @@ struct HarborProxyWorkspaceView: View {
     private enum Editor: String, Identifiable {
         case subscription, editSubscription, links, importChoice, routing, ports
         var id: String { rawValue }
+    }
+
+    private enum BatchScope: String, CaseIterable, Identifiable {
+        case filtered = "筛选结果"
+        case source = "当前列表（全部）"
+        case selected = "选中的配置"
+        var id: Self { self }
     }
 
     private let favoritesKey = HarborProxyManager.favoriteNodeIDsKey
@@ -136,9 +149,47 @@ struct HarborProxyWorkspaceView: View {
     private var protocols: [String] { catalog.protocols }
     private var regions: [String] { catalog.regions }
 
-    private var currentGroupIsTesting: Bool {
-        proxy.latencyTesting && catalog.sourceNodes.contains {
-            proxy.latencyBatchIDs.contains($0.id)
+    private struct CatalogFilter: Equatable, Sendable {
+        let groupID: String?
+        let favoritesOnly: Bool
+        let keyword: String
+        let category: NodeCategory
+        let region: String
+        let protocolFilter: String
+        let latencyFilter: String
+        let showUnavailable: Bool
+    }
+
+    private struct CatalogInput: Sendable {
+        let nodes: [HarborProxyNode]
+        let results: [String: HarborProxyProbeResult]
+        let subscriptions: [HarborProxySubscription]
+        let evidence: [String: HarborProxyNetworkEvidence]
+        let serverLocations: [String: HarborProxyIPLocation]
+        let exits: [String: HarborProxyExitLocation]
+        let unknownExits: Set<String>
+        let favorites: Set<String>
+        let scope: HarborProxyManager.MeasurementScope
+        let filter: CatalogFilter
+    }
+
+    private var catalogFilter: CatalogFilter {
+        CatalogFilter(groupID: groupID, favoritesOnly: favoritesOnly, keyword: keyword,
+                      category: category, region: region, protocolFilter: protocolFilter,
+                      latencyFilter: latencyFilter, showUnavailable: showUnavailable)
+    }
+
+    private var batchNodes: [HarborProxyNode] {
+        guard let existing = catalog.filter, existing.groupID == groupID,
+              existing.favoritesOnly == favoritesOnly else { return [] }
+        switch batchScope {
+        case .filtered: return existing == catalogFilter ? catalog.filteredNodes : []
+        case .source: return sourceGroupNodes
+        case .selected:
+            guard let previewNodeID, let node = sourceGroupNodes.first(where: { $0.id == previewNodeID }) else {
+                return []
+            }
+            return [node]
         }
     }
 
@@ -163,36 +214,61 @@ struct HarborProxyWorkspaceView: View {
 
     /// Deliberately coalesce noisy progress publications (hundreds of results
     /// in a batch) without delaying direct user actions such as filter changes.
-    private func scheduleCatalogRefresh() {
+    private func scheduleCatalogRefresh(debounce: Bool = true) {
+        if debounce, refreshScheduler.task != nil {
+            refreshScheduler.needsRefresh = true
+            return
+        }
         refreshScheduler.task?.cancel()
+        let generation = UUID()
+        refreshScheduler.generation = generation
+        refreshScheduler.needsRefresh = false
         refreshScheduler.task = Task { @MainActor in
-            do { try await Task.sleep(for: .milliseconds(140)) }
-            catch { return }
-            rebuildCatalog()
+            defer {
+                if refreshScheduler.generation == generation {
+                    refreshScheduler.task = nil
+                    if !Task.isCancelled && refreshScheduler.needsRefresh { scheduleCatalogRefresh() }
+                }
+            }
+            if debounce {
+                do { try await Task.sleep(for: .milliseconds(140)) } catch { return }
+            }
+            guard !Task.isCancelled else { return }
+            refreshScheduler.needsRefresh = false
+            let input = CatalogInput(nodes: proxy.nodes, results: displayedProbeResults,
+                                     subscriptions: proxy.subscriptions, evidence: proxy.nodeNetworkEvidence,
+                                     serverLocations: proxy.nodeServerLocations, exits: proxy.nodeExitLocations,
+                                     unknownExits: proxy.exitGeoUnrecognizedIDs, favorites: favorites,
+                                     scope: proxy.measurementScope, filter: catalogFilter)
+            let worker = Task.detached(priority: .userInitiated) { Self.makeCatalog(input) }
+            let result = await withTaskCancellationHandler { await worker.value } onCancel: { worker.cancel() }
+            guard !Task.isCancelled, let result else { return }
+            catalog = result
+            if region != "全部", !result.regions.contains(region) { region = "全部" }
         }
     }
 
-    private func rebuildCatalog() {
-        refreshScheduler.task?.cancel()
-        refreshScheduler.task = nil
-        let nodes = proxy.nodes
-        let results = displayedProbeResults
-        let sources = Dictionary(uniqueKeysWithValues: proxy.subscriptions.map {
-            ($0.id, HarborProxyCommunitySource.matching($0.url))
+    private func rebuildCatalog() { scheduleCatalogRefresh(debounce: false) }
+
+    nonisolated private static func makeCatalog(_ input: CatalogInput) -> CatalogPresentation? {
+        let (nodes, results, favorites, scope) = (input.nodes, input.results, input.favorites, input.scope)
+        let filter = input.filter
+        let usable = Set(nodes.compactMap { node in
+            results[node.id].map { $0.isUsable() && scope.accepts($0, for: node) } == true ? node.id : nil
         })
-        let evidence = proxy.nodeNetworkEvidence
-        let serverLocations = proxy.nodeServerLocations
-        let exitLocations = proxy.nodeExitLocations
-        let unknownExits = proxy.exitGeoUnrecognizedIDs
-        let query = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sources = Dictionary(input.subscriptions.map {
+            ($0.id, HarborProxyCommunitySource.matching($0.url))
+        }, uniquingKeysWith: { first, _ in first })
+        let query = filter.keyword.trimmingCharacters(in: .whitespacesAndNewlines)
         var snapshot = CatalogPresentation.empty
+        snapshot.filter = filter
 
         // Coalesce identical connection configurations before grouping the
         // display by server address. Keep protocol variants available for probing.
         func priority(_ node: HarborProxyNode) -> Int {
-            if node.id == proxy.activeNodeID { return 8 }
+            if node.id == scope.activeID { return 8 }
             if favorites.contains(node.id) { return 4 }
-            if results[node.id]?.succeeded == true { return 2 }
+            if usable.contains(node.id) { return 2 }
             return node.customName == nil ? 0 : 1
         }
         let sourceNodes = HarborProxyNodeDeduplication.coalesce(
@@ -209,19 +285,21 @@ struct HarborProxyWorkspaceView: View {
         snapshot.favoriteCount = addressCount(favoriteNodes)
         for (id, members) in Dictionary(grouping: sourceNodes, by: \.subscriptionID) {
             snapshot.subscriptionCounts[id] = addressCount(members)
+            snapshot.subscriptionProfileCounts[id] = members.count
             snapshot.subscriptionUsableCounts[id] = addressCount(
-                members.filter { results[$0.id]?.succeeded == true }
+                members.filter { usable.contains($0.id) }
             )
         }
         let visibleSource: [HarborProxyNode]
-        if let groupID {
+        if let groupID = filter.groupID {
             visibleSource = sourceNodes.filter { $0.subscriptionID == groupID }
         } else {
-            visibleSource = favoritesOnly ? favoriteNodes : allNodes
+            visibleSource = filter.favoritesOnly ? favoriteNodes : allNodes
         }
         snapshot.sourceNodes = visibleSource
         snapshot.sourceAddressCount = addressCount(visibleSource)
         var categoryAddresses: [NodeCategory: Set<ServerAddress>] = [:]
+        var unavailable = Set<String>()
         var availableNodes: [HarborProxyNode] = []
         for node in visibleSource {
             let kind: NodeCategory
@@ -230,7 +308,7 @@ struct HarborProxyWorkspaceView: View {
                 if node.security == "vpngate-datacenter" {
                     kind = .datacenter
                 } else {
-                    switch evidence[node.host]?.kind {
+                    switch input.evidence[node.host].flatMap({ $0.isFresh() ? $0.kind : nil }) {
                     case .residential: kind = .residential
                     case .hosting: kind = .datacenter
                     default: kind = .volunteer
@@ -241,9 +319,10 @@ struct HarborProxyWorkspaceView: View {
             }
             snapshot.categoryByID[node.id] = kind
             categoryAddresses[kind, default: []].insert(ServerAddress(node))
-            if results[node.id]?.isConfirmedUnavailable == true {
+            if results[node.id].map({ $0.isConfirmedUnavailable && scope.accepts($0, for: node) }) == true {
+                unavailable.insert(node.id)
                 snapshot.unavailableCount += 1
-                if !showUnavailable { continue }
+                if !filter.showUnavailable { continue }
             }
             availableNodes.append(node)
         }
@@ -252,7 +331,7 @@ struct HarborProxyWorkspaceView: View {
             Array(Set(availableNodes.map { $0.protocolName.uppercased() })).sorted()
         let categoryIndex = snapshot.categoryByID
         let categoryNodes = availableNodes.filter {
-            category == .all || categoryIndex[$0.id] == category
+            filter.category == .all || categoryIndex[$0.id] == filter.category
         }
         snapshot.categoryAddressCount = addressCount(categoryNodes)
 
@@ -261,12 +340,13 @@ struct HarborProxyWorkspaceView: View {
         var nodeRegions: [String: String] = [:]
         var regionAddresses: [String: Set<ServerAddress>] = [:]
         for node in categoryNodes {
-            let server = serverLocations[node.host.lowercased()]
-            let exit = exitLocations[node.id]?.verifiedLocation(
-                for: node, resolvedServerIP: server?.ip
-            )
+            guard !Task.isCancelled else { return nil }
+            let server = input.serverLocations[node.host.lowercased()]
+            let exit = scope.verifiedExit(input.exits[node.id], for: node, resolvedIP: server?.ip)
             let location: String
-            if unknownExits.contains(node.id) {
+            if let exit {
+                location = exit.displayRegion
+            } else if input.unknownExits.contains(node.id) {
                 location = HarborVPNGate.publisherLocation(for: node)?.displayRegion ?? "未识别"
             } else if node.protocolName == "openvpn" {
                 location = exit?.displayRegion
@@ -287,16 +367,16 @@ struct HarborProxyWorkspaceView: View {
             + names.subtracting(Set(priority)).sorted()
 
         let candidates = categoryNodes.filter { node in
-            if region != "全部" && nodeRegions[node.id] != region { return false }
-            if protocolFilter != "全部" && node.protocolName.uppercased() != protocolFilter { return false }
-            if latencyFilter != "全部" {
-                guard let delay = results[node.id]?.milliseconds else { return false }
-                if latencyFilter == "快速" &&
+            if filter.region != "全部" && nodeRegions[node.id] != filter.region { return false }
+            if filter.protocolFilter != "全部" && node.protocolName.uppercased() != filter.protocolFilter { return false }
+            if filter.latencyFilter != "全部" {
+                guard usable.contains(node.id), let delay = results[node.id]?.milliseconds else { return false }
+                if filter.latencyFilter == "快速" &&
                     delay >= HarborProxyLatencyPolicy.goodUpperBoundMilliseconds { return false }
-                if latencyFilter == "一般" &&
+                if filter.latencyFilter == "一般" &&
                     (delay < HarborProxyLatencyPolicy.goodUpperBoundMilliseconds ||
                      delay >= HarborProxyLatencyPolicy.warningUpperBoundMilliseconds) { return false }
-                if latencyFilter == "较慢" &&
+                if filter.latencyFilter == "较慢" &&
                     delay < HarborProxyLatencyPolicy.warningUpperBoundMilliseconds { return false }
             }
             return query.isEmpty ||
@@ -306,10 +386,13 @@ struct HarborProxyWorkspaceView: View {
                 Int(query) == node.port ||
                 node.protocolName.localizedCaseInsensitiveContains(query)
         }
+        snapshot.filteredNodes = candidates
         snapshot.shownGroups = AddressGroup.group(
-            HarborProxySubscriptionRefreshPolicy.initialLatencyOrder(candidates, results: results)
+            HarborProxySubscriptionRefreshPolicy.initialLatencyOrder(candidates, results: results.filter {
+                usable.contains($0.key) || ($0.value.isConfirmedUnavailable && unavailable.contains($0.key))
+            })
         )
-        catalog = snapshot
+        return snapshot
     }
 
     private var missingCommunitySources: [HarborProxyCommunitySource] {
@@ -341,6 +424,8 @@ struct HarborProxyWorkspaceView: View {
             scheduleCatalogRefresh()
         }
         .onReceive(proxy.$activeNodeID) { _ in scheduleCatalogRefresh() }
+        .onReceive(proxy.$healthy) { _ in scheduleCatalogRefresh() }
+        .onReceive(proxy.$probeNetworkChangedAt) { _ in scheduleCatalogRefresh() }
         .onReceive(proxy.$subscriptions) { _ in scheduleCatalogRefresh() }
         .onReceive(proxy.$probeResults) { _ in scheduleCatalogRefresh() }
         .onReceive(proxy.$nodeServerLocations) { _ in scheduleCatalogRefresh() }
@@ -371,7 +456,6 @@ struct HarborProxyWorkspaceView: View {
         .onChange(of: category) { _, _ in
             page = 1
             rebuildCatalog()
-            if region != "全部" && !regions.contains(region) { region = "全部" }
         }
         .onChange(of: availableCategories) { _, choices in
             if !choices.contains(category) { category = .all }
@@ -438,7 +522,7 @@ struct HarborProxyWorkspaceView: View {
             let id = target.id
             if let subscription = proxy.subscriptions.first(where: { $0.id == id }) {
                 let count = proxy.nodes.filter { $0.subscriptionID == id }.count
-                let inUse = proxy.running && proxy.activeNode?.subscriptionID == id
+                let inUse = proxy.nodes.contains { $0.subscriptionID == id && proxy.isInUse($0.id) }
                 HarborDestructiveConfirmDialog(
                     title: "删除订阅「\(subscription.name)」？",
                     message: deletionError ?? (inUse
@@ -480,6 +564,7 @@ struct HarborProxyWorkspaceView: View {
         return VStack(alignment: .leading, spacing: 9) {
             header.frame(width: contentWidth, height: 42)
             currentNode.frame(width: contentWidth, height: 68)
+            configurationNotice
             HStack(alignment: .top, spacing: 11) {
                 subscriptionSidebar.frame(width: sidebarWidth)
                 nodeTable(compact: compact, showRegion: tableWidth >= 600,
@@ -490,11 +575,30 @@ struct HarborProxyWorkspaceView: View {
             .frame(width: contentWidth, alignment: .leading)
             .frame(minHeight: 0, maxHeight: .infinity)
             .layoutPriority(1)
+            .disabled(!proxy.configurationLoaded)
         }
         .frame(width: contentWidth, height: max(0, size.height - 13), alignment: .topLeading)
         .padding(.horizontal, outerInset)
         .padding(.top, 3)
         .padding(.bottom, 10)
+    }
+
+    @ViewBuilder private var configurationNotice: some View {
+        if let message = proxy.configurationLoadError ?? proxy.configurationSaveError {
+            HStack(spacing: 10) {
+                Label(message, systemImage: "exclamationmark.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(HarborColors.orange)
+                Spacer(minLength: 8)
+                Button(proxy.configurationLoaded ? "重试保存" : "重试读取") {
+                    if proxy.configurationLoaded { proxy.retryConfigurationSave() }
+                    else { Task { await proxy.retryConfigurationLoad() } }
+                }
+                .buttonStyle(HarborActionButtonStyle(tint: HarborColors.orange, prominence: .secondary))
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+        }
     }
 
     private var header: some View {
@@ -577,6 +681,9 @@ struct HarborProxyWorkspaceView: View {
 
     private var proxyConnectionStatus: String {
         if proxy.requiresRecovery { return "请先恢复系统代理设置，避免网络异常" }
+        if !proxy.configurationLoaded {
+            return proxy.configurationLoadError == nil ? "正在读取代理配置…" : "代理配置暂不可读取"
+        }
         if visibleSwitchingNodeID != nil { return "正在切换 · 启动并验证新节点" }
         if proxy.running && proxy.checkingConnectivity {
             return "正在连接 · 本地端口已就绪，检测真实网络中"
@@ -609,7 +716,7 @@ struct HarborProxyWorkspaceView: View {
         }
         let prefix = proxy.running && proxy.activeNodeID == node.id ? "" : "上次 "
         return prefix + HarborProxyMeasurementLabel.measured(latency)
-            + (result.isStale() ? " · 旧" : "")
+            + (!proxy.isUsable(result, for: node) ? " · 待复测" : "")
     }
 
     private var proxyLatencyColor: Color {
@@ -695,12 +802,12 @@ struct HarborProxyWorkspaceView: View {
                     .font(.system(size: 12.5))
                     .frame(width: 29, height: 30)
             }
-            .disabled(proxy.busy || portUpdating)
+            .disabled(!proxy.configurationLoaded || proxy.busy || portUpdating)
             .buttonStyle(HarborInteractivePlainButtonStyle(tint: HarborColors.blue, cornerRadius: 7))
             .help("设置固定代理监听端口，默认 HTTP 18080 / SOCKS5 18081")
             if proxy.running && proxy.healthy && !proxy.systemManaged {
                 Button {
-                    proxy.enableSystemProxy(interactive: true)
+                    Task { await proxy.enableSystemProxy(interactive: true) }
                 } label: {
                     Label("接管系统代理", systemImage: "network.badge.shield.half.filled")
                 }
@@ -708,7 +815,8 @@ struct HarborProxyWorkspaceView: View {
                 .disabled(proxy.busy)
                 .help("将已验证的当前节点设置为 macOS HTTP、HTTPS 与 SOCKS5 系统代理")
             }
-            if !proxy.running && !proxy.requiresRecovery {
+            if !proxy.running && !proxy.requiresRecovery &&
+               visibleSwitchingNodeID == nil && proxy.configurationLoaded {
                 Button {
                     Task { await proxy.activate(HarborIndependentWARP.nodeID) }
                 } label: {
@@ -716,17 +824,16 @@ struct HarborProxyWorkspaceView: View {
                 }
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.green, prominence: .secondary))
                 .disabled(proxy.busy || !proxy.mihomoInstalled)
-                .help("不需要任何订阅节点；首次在线注册，验证 WARP 与外部 HTTPS 后再接管系统代理")
+                .help("无需订阅节点；注册并验证 WARP 真实出口及外部 HTTPS 后才接管系统代理")
             }
-            if proxy.running || proxy.requiresRecovery {
+            if proxy.running || proxy.requiresRecovery || visibleSwitchingNodeID != nil {
                 Button {
                     Task { await proxy.clearProxy(interactive: true) }
                 } label: {
-                    Label("清理代理", systemImage: "trash")
+                    Label(visibleSwitchingNodeID != nil ? "停止切换" : "清理代理", systemImage: "stop.circle")
                 }
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.red, prominence: .secondary))
-                .disabled(proxy.busy)
-                .help("恢复 Harbor 接管前的系统代理设置，并停止 Harbor 的 Xray")
+                .help("取消正在进行的切换，恢复 Harbor 接管前的系统代理设置，并停止 Harbor 的连接")
             } else {
                 Button {
                     if proxy.subscriptions.isEmpty && proxy.nodes.isEmpty {
@@ -743,6 +850,7 @@ struct HarborProxyWorkspaceView: View {
                     Label("配置代理", systemImage: "arrow.right.circle")
                 }
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
+                .disabled(!proxy.configurationLoaded)
                 .help("前往下方节点列表，点击节点行建立连接")
             }
         }
@@ -889,19 +997,19 @@ struct HarborProxyWorkspaceView: View {
             .scrollIndicators(.never)
             .frame(minHeight: 0, maxHeight: .infinity)
 
-            if !proxy.coreInstalled {
+            if proxy.configurationLoaded && (!proxy.coreInstalled || !proxy.mihomoInstalled) {
                 VStack(alignment: .leading, spacing: 7) {
-                    Text(proxy.installingCore ? "正在恢复 Xray…" : "内置 Xray 尚未就绪")
+                    Text(proxy.installingCore ? "正在恢复内核…" : "代理内核尚未全部就绪")
                         .font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(.secondary)
                     Button {
                         Task { await proxy.installBundledXray() }
                     } label: {
-                        Label(proxy.installingCore ? "恢复中…" : "从安装包恢复 Xray",
+                        Label(proxy.installingCore ? "恢复中…" : "从安装包修复内核",
                               systemImage: "shippingbox")
                     }
                     .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-                    .disabled(proxy.busy || proxy.installingCore || proxy.requiresRecovery)
+                    .disabled(proxy.busy || proxy.installingCore || proxy.requiresRecovery || proxy.running)
                     Text(proxy.detail.isEmpty ? "无需网络，也不需要预先安装 v2rayN" : proxy.detail)
                         .font(.system(size: 9.5))
                         .foregroundStyle(.secondary)
@@ -918,15 +1026,19 @@ struct HarborProxyWorkspaceView: View {
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 0)
-                Picker("代理路由", selection: $proxy.routingRules) {
+                Picker("代理路由", selection: Binding(get: { proxy.routingRules }, set: { value in
+                    guard proxy.routingRules != value else { return }
+                    proxy.routingRules = value
+                    Task { await proxy.reapplyRouting() }
+                })) {
                     Text("规则").tag(true)
                     Text("全局").tag(false)
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
                 .frame(width: 83)
-                .disabled(proxy.running)
-                .help("规则：国内域名和 IP 直连，其余默认代理；全局：除局域网和私有 IP 外默认走代理。强制代理站点在两种模式中均优先，切换后下次连接生效。")
+                .disabled(proxy.busy || proxy.requiresRecovery)
+                .help("规则模式默认直连国内和局域网；全局模式默认代理外部网络。切换时会验证新规则。")
                 Button {
                     forcedDomainText = proxy.forcedProxyDomains.joined(separator: "\n")
                     forcedDomainError = nil
@@ -1004,6 +1116,7 @@ struct HarborProxyWorkspaceView: View {
         let selected = groupID == item.id
         let tint = subscriptionTints[index % subscriptionTints.count]
         let count = catalog.subscriptionCounts[item.id, default: 0]
+        let profiles = catalog.subscriptionProfileCounts[item.id, default: 0]
         let usable = catalog.subscriptionUsableCounts[item.id, default: 0]
 
         // One full-width clickable surface. The count belongs inside the
@@ -1026,17 +1139,12 @@ struct HarborProxyWorkspaceView: View {
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                     if HarborProxyCommunitySource.matching(item.url) != nil {
-                        Text("\(count) 候选 · \(usable) 可用")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    } else if let updated = proxy.subscriptionUpdatedAt[item.id] {
-                        Text(updated.formatted(date: .omitted, time: .shortened) + " 更新")
+                        Text("\(count) 候选地址 · \(usable) 可用")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     } else {
-                        Text("\(count) 个节点")
+                        Text("\(count) 地址 · \(profiles) 配置")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -1049,6 +1157,10 @@ struct HarborProxyWorkspaceView: View {
                     .monospacedDigit()
                     .frame(minWidth: 22, alignment: .trailing)
             }
+            .help("\(count) 个地址，\(profiles) 个配置，\(usable) 个地址近期测速通过" +
+                  (proxy.subscriptionUpdatedAt[item.id].map {
+                      "；上次更新：" + $0.formatted(date: .abbreviated, time: .shortened)
+                  } ?? ""))
             .padding(.horizontal, 10)
             .frame(maxWidth: .infinity, minHeight: 61)
             .contentShape(RoundedRectangle(cornerRadius: 9))
@@ -1173,7 +1285,11 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func regionActions(narrow: Bool, compact: Bool) -> some View {
-        HStack(spacing: 5) {
+        let targets = batchNodes
+        let hasXray = proxy.coreInstalled
+        let hasMihomo = proxy.mihomoInstalled
+        let testableCount = targets.count { $0.protocolName == "openvpn" ? hasMihomo : hasXray }
+        return HStack(spacing: 5) {
             if category == .residential || category == .volunteer || groupID.flatMap({ id in
                 proxy.subscriptions.first(where: { $0.id == id })
             }).flatMap({ HarborProxyCommunitySource.matching($0.url) }) == .vpnGate {
@@ -1187,20 +1303,38 @@ struct HarborProxyWorkspaceView: View {
                 }
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
                 .disabled(proxy.busy || proxy.latencyTesting)
-                .help("自动准备独立通道，再获取 VPN Gate 志愿候选、识别家宽入口并真实测速；无需先启用订阅节点")
+                .help("获取 VPN Gate 志愿候选，识别家宽入口并真实测速。可使用当前代理，未连接时自动尝试独立通道。")
             }
-            if currentGroupIsTesting {
+            Menu {
+                Picker("批量操作范围", selection: $batchScope) {
+                    ForEach(BatchScope.allCases) { scope in Text(scope.rawValue).tag(scope) }
+                }
+            } label: {
+                if compact {
+                    Image(systemName: "scope")
+                        .accessibilityLabel("批量操作范围：\(batchScope.rawValue)")
+                } else {
+                    Label("范围 \(targets.count)", systemImage: "scope")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+            }
+            .fixedSize()
+            .help("\(batchScope.rawValue)：\(targets.count) 个配置，\(testableCount) 个可测；范围包含所有匹配的分页")
+
+            if proxy.latencyTesting {
                 Button { proxy.cancelLatencyTests() } label: {
-                    Label("停止 \(proxy.latencyCompleted)/\(proxy.latencyTotal)",
+                    Label(proxy.latencyStopping ? "正在停止…" : "停止 \(proxy.latencyCompleted)/\(proxy.latencyTotal)",
                           systemImage: "stop.circle")
                         .font(.system(size: 10.5, weight: .medium))
                         .lineLimit(1)
                         .fixedSize(horizontal: true, vertical: false)
                 }
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.orange, prominence: .secondary))
+                .disabled(proxy.latencyStopping)
             } else {
                 Button {
-                    Task { await proxy.testRealLatency(sourceGroupNodes.map(\.id)) }
+                    Task { await proxy.testRealLatency(targets.map(\.id)) }
                 } label: {
                     Label("测速", systemImage: "speedometer")
                         .font(.system(size: 10.5, weight: .medium))
@@ -1208,11 +1342,8 @@ struct HarborProxyWorkspaceView: View {
                         .fixedSize(horizontal: true, vertical: false)
                 }
                 .buttonStyle(HarborActionButtonStyle(tint: HarborColors.green, prominence: .secondary))
-                .disabled(sourceGroupNodes.isEmpty || proxy.busy || proxy.latencyTesting
-                          || !sourceGroupNodes.allSatisfy({ proxy.supportsCore(for: $0) }))
-                .help(proxy.latencyTesting
-                      ? "其他订阅正在测速；切回该订阅可查看进度或停止"
-                      : "通过独立代理内核的 SOCKS5 发起真实请求；不改变当前节点或系统代理")
+                .disabled(testableCount == 0 || proxy.busy)
+                .help("对所选范围发起真实代理请求；缺少对应内核的配置会跳过，当前连接保持不变")
             }
 
             Button {
@@ -1225,32 +1356,29 @@ struct HarborProxyWorkspaceView: View {
                     .fixedSize(horizontal: true, vertical: false)
             }
             .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-            .disabled(!proxy.running || !proxy.healthy || proxy.busy
+            .disabled(!proxy.running || proxy.busy
                       || proxy.websiteChecking || proxy.checkingConnectivity)
-            .help("通过当前实际 SOCKS5 出口检查 YouTube 和 ChatGPT 的 HTTPS 返回码；不切换节点")
+            .help("通过当前实际代理出口检查 YouTube 和 ChatGPT 的 HTTPS 返回结果")
 
             Button {
                 if proxy.exitGeoUpdating {
                     proxy.cancelExitGeoRefresh()
                 } else {
-                    proxy.refreshExitLocations(for: sourceGroupNodes.map(\.id))
+                    proxy.refreshExitLocations(for: targets.map(\.id))
                 }
             } label: {
-                Label(proxy.exitGeoUpdating
+                Label(proxy.exitGeoCleaningUp ? "正在停止…" : (proxy.exitGeoUpdating
                       ? "停止识别 \(proxy.exitGeoCompleted)/\(proxy.exitGeoTotal)"
-                      : (compact ? "出口地区" : "更新出口地区"),
+                      : (compact ? "出口地区" : "更新出口地区")),
                       systemImage: proxy.exitGeoUpdating ? "stop.circle" : "globe.americas")
                     .font(.system(size: 10.5, weight: .medium))
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
             }
             .buttonStyle(HarborActionButtonStyle(tint: HarborColors.blue, prominence: .secondary))
-            .disabled(!proxy.exitGeoUpdating && (
-                sourceGroupNodes.isEmpty || proxy.busy || proxy.latencyTesting
-                || !sourceGroupNodes.allSatisfy({ proxy.supportsCore(for: $0) })
-            ))
+            .disabled(proxy.exitGeoCleaningUp || (!proxy.exitGeoUpdating && (testableCount == 0 || proxy.busy)))
             .help(proxy.exitGeoUpdating
-                  ? "立即停止本次出口地区识别；未完成节点标记为未识别"
+                  ? "停止本次识别，未完成的配置保留上次结果"
                   : "分批独立检测真实出口 IP；耗时取决于节点数量，可随时停止。悬停地区可查看失败原因")
 
             if narrow { Spacer(minLength: 6) }
@@ -1279,6 +1407,22 @@ struct HarborProxyWorkspaceView: View {
             .padding(.leading, 5)
         }
         .padding(.horizontal, 10)
+    }
+
+    private var emptyCatalogMessage: String {
+        if unavailableCount > 0 && !showUnavailable { return "连续测速失败的配置已隐藏" }
+        if let groupID, sourceGroupNodes.isEmpty {
+            let isVPNGate = proxy.subscriptions.first { $0.id == groupID }
+                .flatMap { HarborProxyCommunitySource.matching($0.url) } == .vpnGate
+            return isVPNGate ? "还没有获取到 VPN Gate 候选地址" : "此订阅还没有加载到节点"
+        }
+        if favoritesOnly && favorites.isEmpty { return "还没有收藏的节点" }
+        return proxy.nodes.isEmpty ? "暂无节点，可添加订阅" : "没有符合筛选条件的节点"
+    }
+
+    private var operationSummaries: [String] {
+        [proxy.detail.contains("HTTP 127.0.0.1:") ? "" : proxy.detail,
+         proxy.latencySummary, proxy.exitGeoSummary, proxy.websiteSummary].filter { !$0.isEmpty }
     }
 
     private func modeButton(_ symbol: String, selected: Bool,
@@ -1410,11 +1554,7 @@ struct HarborProxyWorkspaceView: View {
                     VStack(spacing: 9) {
                         Image(systemName: "line.3.horizontal.decrease.circle")
                             .font(.system(size: 24, weight: .ultraLight))
-                        Text(unavailableCount > 0 && !showUnavailable
-                             ? "候选节点未通过真实测速，已暂时隐藏"
-                             : (proxy.nodes.isEmpty ? "暂无节点，可添加公开候选来源"
-                                : (groupID == nil && favoritesOnly && favorites.isEmpty
-                                   ? "还没有收藏的节点" : "没有符合条件的节点")))
+                        Text(emptyCatalogMessage)
                             .font(.system(size: 11))
                         if unavailableCount > 0 && !showUnavailable {
                             Button("查看失败节点并重试") {
@@ -1455,16 +1595,20 @@ struct HarborProxyWorkspaceView: View {
             }
             .frame(minHeight: 0, maxHeight: .infinity)
 
-            if !proxy.detail.isEmpty && !proxy.detail.contains("HTTP 127.0.0.1:") {
-                Text(proxy.detail)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(proxy.detail)
-                    .padding(.horizontal, 14)
-                    .frame(height: 20, alignment: .leading)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            let summaries = operationSummaries
+            if !summaries.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(Array(summaries.enumerated()), id: \.offset) { _, summary in
+                        Text(summary)
+                            .lineLimit(1)
+                            .help(summary)
+                    }
+                }
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             pagination(totalCount: groups.count, currentPage: selectedPage, maxPage: lastPage)
@@ -1607,29 +1751,23 @@ struct HarborProxyWorkspaceView: View {
                     }
                     if compact {
                         Text(realLatencyText(
-                            delay: delay, probe: probe, connected: connected,
-                            connecting: connecting, nodeID: node.id,
-                            isOpenVPN: node.protocolName == "openvpn"))
+                            delay: delay, probe: probe, connecting: connecting, node: node))
                         .font(.system(size: 9.2, weight: .medium))
                         .monospacedDigit()
                         .foregroundStyle(realLatencyTextColor(
-                            delay: delay, probe: probe, connected: connected,
-                            connecting: connecting, nodeID: node.id))
+                            delay: delay, probe: probe, connecting: connecting, node: node))
                         .lineLimit(1)
-                        .help(probe?.realFailureReason ?? "真实代理请求延迟")
+                        .help(latencyHint(probe, for: node))
                         .frame(width: 88, alignment: .leading)
                     } else {
                         Text(realLatencyText(
-                            delay: delay, probe: probe, connected: connected,
-                            connecting: connecting, nodeID: node.id,
-                            isOpenVPN: node.protocolName == "openvpn"))
+                            delay: delay, probe: probe, connecting: connecting, node: node))
                             .font(.system(size: 10.3, weight: connected || delay != nil ? .semibold : .regular))
                             .monospacedDigit()
                             .foregroundStyle(realLatencyTextColor(
-                                delay: delay, probe: probe, connected: connected,
-                                connecting: connecting, nodeID: node.id))
+                                delay: delay, probe: probe, connecting: connecting, node: node))
                             .lineLimit(1)
-                            .help(probe?.realFailureReason ?? "真实代理请求延迟")
+                            .help(latencyHint(probe, for: node))
                             .frame(width: 102, alignment: .leading)
                     }
                 }
@@ -1766,16 +1904,13 @@ struct HarborProxyWorkspaceView: View {
                             .help(regionHint(node))
                         Spacer(minLength: 2)
                         Text(realLatencyText(
-                            delay: delay, probe: probe, connected: connected,
-                            connecting: connecting, nodeID: node.id,
-                            isOpenVPN: node.protocolName == "openvpn"))
+                            delay: delay, probe: probe, connecting: connecting, node: node))
                             .lineLimit(1)
                             .font(.system(size: 10.5, weight: delay == nil ? .regular : .semibold))
                             .monospacedDigit()
                             .foregroundStyle(realLatencyTextColor(
-                                delay: delay, probe: probe, connected: connected,
-                                connecting: connecting, nodeID: node.id))
-                            .help(probe?.realFailureReason ?? "真实代理请求延迟")
+                                delay: delay, probe: probe, connecting: connecting, node: node))
+                            .help(latencyHint(probe, for: node))
                     }
                     .font(.system(size: 9.5))
                 }
@@ -1971,33 +2106,34 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private func realLatencyText(delay: Int?, probe: HarborProxyProbeResult?,
-                                 connected: Bool, connecting: Bool, nodeID: String,
-                                 isOpenVPN: Bool) -> String {
+                                 connecting: Bool, node: HarborProxyNode) -> String {
         if connecting { return "切换中" }
-        if proxy.latencyTestingIDs.contains(nodeID) {
+        if proxy.latencyTestingIDs.contains(node.id) {
             return "测速中"
         }
         if let delay {
-            return "\(delay) ms" + (probe?.isStale() == true ? " · 旧" : "")
+            return "\(delay) ms" + (probe.map { !proxy.isUsable($0, for: node) } == true ? " · 旧" : "")
         }
         guard probe?.realTested == true else { return "未测速" }
-        if isOpenVPN, let reason = probe?.realFailureReason {
+        if node.protocolName == "openvpn", let reason = probe?.realFailureReason {
             if reason.contains("握手") { return "握手超时" }
             if reason.contains("HTTPS") { return "出口验证失败" }
             if reason.contains("Mihomo") { return "内核启动失败" }
         }
-        return probe?.isConfirmedUnavailable == true ? "不可用" : "待复测"
+        return probe.map { proxy.isUnavailable($0, for: node) } == true ? "不可用" : "待复测"
     }
 
     private func realLatencyTextColor(delay: Int?, probe: HarborProxyProbeResult?,
-                                      connected: Bool, connecting: Bool, nodeID: String) -> Color {
+                                      connecting: Bool, node: HarborProxyNode) -> Color {
         if connecting { return HarborColors.orange }
-        if proxy.latencyTestingIDs.contains(nodeID) {
+        if proxy.latencyTestingIDs.contains(node.id) {
             return HarborColors.orange
         }
-        if let delay { return latencyColor(delay) }
+        if let delay {
+            return probe.map { proxy.isUsable($0, for: node) } == true ? latencyColor(delay) : .secondary
+        }
         guard probe?.realTested == true else { return Color.secondary }
-        return probe?.isConfirmedUnavailable == true ? HarborColors.red : HarborColors.orange
+        return probe.map { proxy.isUnavailable($0, for: node) } == true ? HarborColors.red : HarborColors.orange
     }
 
     private func regionEmoji(_ name: String) -> String {
@@ -2034,61 +2170,50 @@ struct HarborProxyWorkspaceView: View {
         showUnavailable = true
     }
 
-    private func location(of node: HarborProxyNode) -> String {
-        if proxy.exitGeoUnrecognizedIDs.contains(node.id) {
-            return HarborVPNGate.publisherLocation(for: node)?.displayRegion ?? "未识别"
-        }
-        if node.protocolName == "openvpn" {
-            return proxy.exitLocation(for: node)?.displayRegion
-                ?? HarborVPNGate.publisherLocation(for: node)?.displayRegion
-                ?? HarborProxyAutomaticName.unresolvedRegion
-        }
-        if categoryOf(node) == .residential {
-            return proxy.exitLocation(for: node)?.displayRegion
-                ?? HarborProxyAutomaticName.unresolvedRegion
-        }
-        return proxy.serverLocation(for: node)?.displayRegion
-            ?? HarborProxyAutomaticName.unresolvedRegion
-    }
-
     private func locationLabel(of node: HarborProxyNode) -> String {
-        let source = HarborVPNGate.publisherLocation(for: node)
-        if proxy.exitGeoUnrecognizedIDs.contains(node.id), source == nil {
-            return "未识别"
+        if let exit = proxy.exitLocation(for: node) { return exit.displayRegion }
+        if let source = HarborVPNGate.publisherLocation(for: node) { return source.displayRegion + "·来源" }
+        if proxy.exitGeoUnrecognizedIDs.contains(node.id) { return "未识别" }
+        if categoryOf(node) != .residential, let entrance = proxy.entranceLocation(for: node),
+           entrance.verifiedCountryCode != nil {
+            return entrance.displayRegion + "·入口"
         }
-        let region = location(of: node)
-        if source != nil, proxy.exitLocation(for: node) == nil {
-            return region + "·来源"
-        }
-        guard region != HarborProxyAutomaticName.unresolvedRegion,
-              proxy.exitLocation(for: node) == nil else { return region }
-        return region + "·入口"
+        return HarborProxyAutomaticName.unresolvedRegion
     }
 
     private func regionHint(_ node: HarborProxyNode) -> String {
-        if proxy.exitGeoUnrecognizedIDs.contains(node.id) {
-            let reason = proxy.exitGeoFailureReasons[node.id] ?? "请求超时或识别失败"
-            if let source = HarborVPNGate.publisherLocation(for: node) {
-                return "\(reason)；当前显示 VPN Gate 发布的来源国家：\(source.displayRegion)，并非已验证出口。可重新识别"
-            }
-            return "实际出口地区未识别：\(reason)；可手动重新识别"
-        }
+        let reason = proxy.exitGeoFailureReasons[node.id].map { "；最近一次未更新：" + $0 } ?? ""
         if let exit = proxy.exitLocation(for: node) {
-            return "普通网站检测到的出口 IP：\(exit.ip) · 优先显示出口地区"
+            let checked = proxy.nodeExitLocations[node.id]?.observedAt.formatted(date: .abbreviated, time: .shortened)
+            return "已验证出口 IP：\(exit.ip)" + (checked.map { "；验证于 " + $0 } ?? "") + reason
+        }
+        if let prior = proxy.observedExit(for: node) {
+            return (prior.verifiedCountryCode == nil
+                ? "已检测到出口 IP：\(prior.ip)，地区尚未确认"
+                : "上次观察到出口 IP：\(prior.ip)（\(prior.displayRegion)），待复测") + reason
         }
         if let source = HarborVPNGate.publisherLocation(for: node) {
-            return "VPN Gate 发布者报告的来源国家：\(source.displayRegion)；实际出口尚未确认"
+            return "VPN Gate 发布的来源：\(source.displayRegion)；出口尚未确认" + reason
         }
-        if categoryOf(node) == .residential {
-            return "住宅候选节点的实际出口尚未确认；识别前不按入口地区筛选"
+        if let location = proxy.entranceLocation(for: node) {
+            return "节点入口 IP：\(location.ip)；出口尚未确认" + reason
         }
-        if let location = proxy.serverLocation(for: node) {
-            if location.countryCode == "ZZ" {
-                return "节点服务器 IP：\(location.ip) · 正在识别归属地"
-            }
-            return "节点服务器 IP：\(location.ip) · 出口未确认，使用服务器地区"
+        return "出口 IP 尚未确认" + reason
+    }
+
+    private func latencyHint(_ probe: HarborProxyProbeResult?, for node: HarborProxyNode) -> String {
+        guard let probe, probe.realTested else { return "还没有真实代理测速结果" }
+        let route: String
+        switch probe.probeRouteID {
+        case "direct": route = " · 直接连接到志愿节点"
+        case let value? where value.hasPrefix("underlay:"): route = " · 通过其他代理连接志愿节点"
+        case let value? where value.hasPrefix("warp:"): route = " · 通过独立通道连接志愿节点"
+        default: route = ""
         }
-        return "出口 IP 尚未确认；将独立识别，失败时使用服务器 IP 地区"
+        let date = (probe.realCheckedAt ?? probe.checkedAt).formatted(date: .abbreviated, time: .shortened)
+        let result = probe.realFailureReason ?? "已测请求延迟"
+        let freshness = probe.succeeded && !proxy.isUsable(probe, for: node) ? " · 待复测" : ""
+        return result + route + " · " + date + freshness
     }
 
     // A centered, padded form with the same visual language as hosted-key setup.
@@ -2113,7 +2238,7 @@ struct HarborProxyWorkspaceView: View {
                     tint: Color.primary, cornerRadius: 9))
                 .help("关闭弹窗")
                 .accessibilityLabel("关闭弹窗")
-                .disabled(subscriptionSaving || portUpdating)
+                .disabled(editorSaving || portUpdating)
             }
             .frame(height: 34)
             .padding(.bottom, mode == .ports ? 9 : 22)
@@ -2184,12 +2309,25 @@ struct HarborProxyWorkspaceView: View {
                     }
                 }
             } else if mode == .ports {
-                VStack(alignment: .leading, spacing: 7) {
+                VStack(alignment: .leading, spacing: 10) {
                     TextField("HTTP 端口（例如 18080）", text: $listenPortText)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(size: 13, design: .monospaced))
                         .frame(height: 38)
                         .accessibilityLabel("HTTP 代理监听端口")
+                    Toggle("打开 Harbor 时恢复上次连接", isOn: Binding(
+                        get: { proxy.resumeConnectionOnLaunch },
+                        set: { proxy.setResumeConnectionOnLaunch($0) }
+                    ))
+                    .font(.system(size: 11))
+                    Button("从安装包修复代理内核") {
+                        editor = nil
+                        Task { await proxy.installBundledXray() }
+                    }
+                    .font(.system(size: 11))
+                    .disabled(proxy.running || proxy.requiresRecovery || proxy.busy || proxy.latencyTesting
+                              || proxy.exitGeoUpdating || proxy.exitGeoCleaningUp)
+                    .help("先停止当前连接和检测，再校验并修复内置 Xray、Mihomo 和地区资源")
                     if let listenPortError {
                         Text(listenPortError)
                             .font(.system(size: 11))
@@ -2238,6 +2376,12 @@ struct HarborProxyWorkspaceView: View {
                     Text("每行一条链接，不影响已连接的代理")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    if let subscriptionError {
+                        Text(subscriptionError)
+                            .font(.system(size: 11))
+                            .foregroundStyle(HarborColors.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
 
@@ -2250,7 +2394,7 @@ struct HarborProxyWorkspaceView: View {
                 Spacer()
                 Button("取消") { editor = nil }
                     .keyboardShortcut(.cancelAction)
-                    .disabled(subscriptionSaving || portUpdating)
+                    .disabled(editorSaving || portUpdating)
                     .buttonStyle(HarborActionButtonStyle(
                         tint: .secondary, prominence: .secondary))
                 if mode == .ports {
@@ -2284,16 +2428,8 @@ struct HarborProxyWorkspaceView: View {
                         do {
                             let changed = domains != proxy.forcedProxyDomains
                             try proxy.updateForcedProxyDomains(domains)
-                            // A running batch has its own rule snapshot.
-                            // Save immediately without forcing a node switch
-                            // while an isolated probe is still cleaning up.
-                            let reconnectID = changed && proxy.running &&
-                                !proxy.latencyTesting
-                                ? proxy.selectedID : nil
                             editor = nil
-                            if let reconnectID {
-                                Task { await proxy.select(reconnectID) }
-                            }
+                            if changed { Task { await proxy.reapplyRouting() } }
                         } catch {
                             forcedDomainError = error.localizedDescription
                         }
@@ -2323,11 +2459,11 @@ struct HarborProxyWorkspaceView: View {
                             guard let id = editingSubscriptionID else { return }
                             let name = subscriptionName
                             let url = subscriptionURL
-                            subscriptionSaving = true
+                            editorSaving = true
                             subscriptionError = nil
                             Task {
                                 let saved = await proxy.updateSubscription(id, name: name, url: url)
-                                subscriptionSaving = false
+                                editorSaving = false
                                 if saved {
                                     editingSubscriptionID = nil
                                     subscriptionName = ""
@@ -2339,18 +2475,30 @@ struct HarborProxyWorkspaceView: View {
                             }
                             return
                         } else {
-                            proxy.addLinks(nodeLinks)
-                            nodeLinks = ""
+                            let links = nodeLinks
+                            editorSaving = true
+                            subscriptionError = nil
+                            Task {
+                                let saved = await proxy.addLinks(links)
+                                editorSaving = false
+                                if saved {
+                                    nodeLinks = ""
+                                    editor = nil
+                                } else {
+                                    subscriptionError = proxy.detail
+                                }
+                            }
+                            return
                         }
                         editor = nil
                     } label: {
                         HStack(spacing: 7) {
-                            if mode == .editSubscription && subscriptionSaving {
+                            if editorSaving {
                                 ProgressView().controlSize(.small)
                             }
                             Text(mode == .editSubscription
-                                 ? (subscriptionSaving ? "正在更新节点…" : "保存订阅")
-                                 : (mode == .subscription ? "添加订阅" : "导入节点"))
+                                 ? (editorSaving ? "正在更新节点…" : "保存订阅")
+                                 : (mode == .subscription ? "添加订阅" : (editorSaving ? "正在导入…" : "导入节点")))
                         }
                     }
                     .keyboardShortcut(.defaultAction)
@@ -2359,8 +2507,8 @@ struct HarborProxyWorkspaceView: View {
                     .disabled((mode == .subscription || mode == .editSubscription)
                               ? (subscriptionName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                                  || subscriptionURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                 || subscriptionSaving || proxy.busy || proxy.latencyTesting)
-                              : nodeLinks.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                 || editorSaving || proxy.busy || proxy.latencyTesting)
+                              : (editorSaving || proxy.busy || nodeLinks.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
                 }
             }
             .frame(height: 35)
@@ -2373,7 +2521,7 @@ struct HarborProxyWorkspaceView: View {
                : (mode == .importChoice ? 356
                   : (mode == .routing ? 440 : (mode == .links ? 375 : 370))))
         .onExitCommand {
-            if !subscriptionSaving && !portUpdating { editor = nil }
+            if !editorSaving && !portUpdating { editor = nil }
         }
     }
 

@@ -81,6 +81,10 @@ public struct HarborProxyActivationQueue: Sendable {
         defer { pending = nil }
         return pending
     }
+
+    public mutating func clear() {
+        pending = nil
+    }
 }
 
 public struct HarborProxyNode: Codable, Identifiable, Sendable, Hashable {
@@ -381,6 +385,10 @@ public struct HarborProxyNetworkEvidence: Codable, Equatable, Sendable {
         self.checkedAt = checkedAt
     }
 
+    public func isFresh(now: Date = .now) -> Bool {
+        now.timeIntervalSince(checkedAt) < 24 * 60 * 60
+    }
+
     public static func classify(userType: String?, connectionType: String?,
                                 isAnycast: Bool?) -> Kind {
         if isAnycast == true { return .hosting }
@@ -405,6 +413,7 @@ public enum HarborProxySubscriptionReconciler {
         public let selectedID: String?
         public let retainedActiveNode: Bool
         public let replacementIDs: [String: String]
+        public let rotatedFavoriteIDs: [String: String]
     }
 
     public static func replace(
@@ -413,7 +422,8 @@ public enum HarborProxySubscriptionReconciler {
         subscriptionID: String,
         selectedID: String?,
         keepActiveConnection: Bool,
-        preferredNodeIDs: Set<String> = []
+        preferredNodeIDs: Set<String> = [],
+        protectedNodeIDs: Set<String> = []
     ) -> Result {
         let previous = current.filter { $0.subscriptionID == subscriptionID }
         let coalesced = HarborProxyNodeDeduplication.coalesce(previous) { node in
@@ -424,10 +434,24 @@ public enum HarborProxySubscriptionReconciler {
         let previousByEndpoint = Dictionary(uniqueKeysWithValues: coalesced.nodes.map {
             (HarborProxyNodeDeduplication.endpoint($0), $0)
         })
+        let retainedIDs = protectedNodeIDs.union(keepActiveConnection ? Set([selectedID].compactMap { $0 }) : [])
+        let candidates = HarborProxyNodeDeduplication.coalesce(incoming).nodes.map { item in
+            var node = item
+            node.subscriptionID = subscriptionID
+            return node
+        }
+        func rotationKey(_ node: HarborProxyNode) -> HarborProxyNode {
+            var key = HarborProxyNodeDeduplication.endpoint(node)
+            key.credential = ""
+            return key
+        }
+        let previousByRotation = Dictionary(grouping: coalesced.nodes.filter { $0.protocolName != "openvpn" }, by: rotationKey)
+        let incomingByRotation = Dictionary(grouping: candidates, by: rotationKey)
+        var rotatedFavoriteIDs: [String: String] = [:]
         var usedIDs = Set(current.filter { $0.subscriptionID != subscriptionID }.map(\.id))
         let oldIDs = Set(previous.map(\.id))
         var refreshed: [HarborProxyNode] = []
-        for supplied in HarborProxyNodeDeduplication.coalesce(incoming).nodes {
+        for supplied in candidates {
             var node = supplied
             node.subscriptionID = subscriptionID
             let key = HarborProxyNodeDeduplication.endpoint(node)
@@ -436,7 +460,20 @@ public enum HarborProxySubscriptionReconciler {
                 node.host = existing.host
                 node.customName = existing.customName ?? node.customName
                 node.automaticName = existing.automaticName
-            } else if oldIDs.contains(node.id) {
+            } else if let previous = previousByRotation[rotationKey(node)], previous.count == 1,
+                      incomingByRotation[rotationKey(node)]?.count == 1, let existing = previous.first {
+                node.customName = existing.customName ?? node.customName
+                node.automaticName = existing.automaticName
+                if !retainedIDs.contains(existing.id) {
+                    node.id = existing.id
+                } else if oldIDs.contains(node.id) || retainedIDs.contains(node.id) {
+                    node.id = UUID().uuidString
+                }
+                while !usedIDs.insert(node.id).inserted { node.id = UUID().uuidString }
+                if node.id != existing.id { rotatedFavoriteIDs[existing.id] = node.id }
+                refreshed.append(node)
+                continue
+            } else if oldIDs.contains(node.id) || retainedIDs.contains(node.id) {
                 node.id = UUID().uuidString
             }
             while !usedIDs.insert(node.id).inserted { node.id = UUID().uuidString }
@@ -467,10 +504,18 @@ public enum HarborProxySubscriptionReconciler {
                 chosen = refreshed.first?.id ?? other.first?.id
             }
         }
+        for protectedID in protectedNodeIDs where protectedID != selectedID {
+            guard let old = previous.first(where: { $0.id == protectedID }),
+                  !refreshed.contains(where: { $0.id == protectedID }) else { continue }
+            var active = old
+            active.subscriptionID = ""
+            other.append(active)
+        }
         let keptIDs = Set(refreshed.map(\.id))
         return Result(nodes: other + refreshed, selectedID: chosen,
                       retainedActiveNode: retainedActive,
-                      replacementIDs: coalesced.replacementIDs.filter { keptIDs.contains($0.value) })
+                      replacementIDs: coalesced.replacementIDs.filter { keptIDs.contains($0.value) },
+                      rotatedFavoriteIDs: rotatedFavoriteIDs)
     }
 }
 
@@ -490,17 +535,42 @@ public enum HarborProxyError: LocalizedError {
 }
 
 public enum HarborProxyLinks {
+    public static let maximumNodes = 2_000
+
     public static func parse(_ text: String) -> [HarborProxyNode] {
+        parseReport(text).nodes
+    }
+
+    public static func parseReport(_ text: String) -> (nodes: [HarborProxyNode], rejected: Int) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let body = (!trimmed.contains("://") ? base64(trimmed).flatMap { String(data: $0, encoding: .utf8) } : nil) ?? trimmed
-        return body.components(separatedBy: .newlines).compactMap { raw in
-            let input = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lines = body.split(whereSeparator: \.isNewline).lazy
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+        var nodes: [HarborProxyNode] = []
+        var rejected = 0
+        for line in lines {
+            if nodes.count < maximumNodes, let node = parseLine(line) {
+                nodes.append(node)
+            } else {
+                rejected += 1
+            }
+        }
+        return (nodes, rejected)
+    }
+
+    private static func parseLine(_ input: String) -> HarborProxyNode? {
+        guard input.utf8.count <= 16_384 else { return nil }
+        return {
             if input.hasPrefix("ss://") {
                 // SIP002: base64(method:password)@host:port or base64(all).
                 let details = String(input.dropFirst(5))
                 let hash = details.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
                 let name = hash.count > 1 ? String(hash[1]).removingPercentEncoding ?? "" : ""
-                let authority = String(hash[0].split(separator: "?", maxSplits: 1)[0])
+                guard let authorityPart = hash.first?.split(
+                    separator: "?", maxSplits: 1, omittingEmptySubsequences: false
+                ).first, !authorityPart.isEmpty else { return nil }
+                let authority = String(authorityPart)
                 let expanded: String
                 if let separator = authority.firstIndex(of: "@") {
                     let auth = String(authority[..<separator])
@@ -515,7 +585,8 @@ public enum HarborProxyLinks {
                 let endpoint = String(expanded[expanded.index(after: separator)...])
                 guard let colon = secretPart.firstIndex(of: ":"),
                       let destination = URLComponents(string: "ss://" + endpoint),
-                      let host = destination.host, let port = destination.port else { return nil }
+                      let host = destination.host, !host.isEmpty,
+                      let port = destination.port, (1...65535).contains(port) else { return nil }
                 let method = String(secretPart[..<colon])
                 let password = String(secretPart[secretPart.index(after: colon)...])
                 guard !method.isEmpty, !password.isEmpty else { return nil }
@@ -525,8 +596,10 @@ public enum HarborProxyLinks {
             }
             if input.hasPrefix("vmess://"), let data = base64(String(input.dropFirst(8))),
                let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let host = o["add"] as? String, let credential = o["id"] as? String,
-               let port = Int(String(describing: o["port"] ?? "")) {
+               let host = o["add"] as? String, !host.isEmpty,
+               let credential = o["id"] as? String, !credential.isEmpty,
+               let port = Int(String(describing: o["port"] ?? "")), (1...65535).contains(port),
+               ["", "tcp", "ws", "grpc"].contains(o["net"] as? String ?? "tcp") {
                 return HarborProxyNode(name: o["ps"] as? String ?? host, protocolName: "vmess",
                     host: host, port: port, credential: credential,
                     encryption: o["scy"] as? String ?? "auto", network: o["net"] as? String ?? "tcp",
@@ -536,10 +609,11 @@ public enum HarborProxyLinks {
             }
             guard let url = URLComponents(string: input),
                   let proto = url.scheme?.lowercased(), ["vless", "trojan"].contains(proto),
-                  let host = url.host, let port = url.port,
+                  let host = url.host, !host.isEmpty, let port = url.port, (1...65535).contains(port),
                   let auth = url.user?.removingPercentEncoding, !auth.isEmpty else { return nil }
             let query = Dictionary(url.queryItems?.map { ($0.name, $0.value ?? "") } ?? [],
                                    uniquingKeysWith: { _, new in new })
+            guard ["", "tcp", "ws", "grpc"].contains(query["type"] ?? "tcp") else { return nil }
             return HarborProxyNode(name: url.fragment?.removingPercentEncoding ?? host,
                 protocolName: proto, host: host, port: port, credential: auth,
                 encryption: query["encryption"] ?? "none", network: query["type"] ?? "tcp",
@@ -547,7 +621,7 @@ public enum HarborProxyLinks {
                 sni: query["sni"] ?? "", headerHost: query["host"] ?? "",
                 path: query["path"] ?? query["serviceName"] ?? "", fingerprint: query["fp"] ?? "",
                 publicKey: query["pbk"] ?? "", shortID: query["sid"] ?? "", flow: query["flow"] ?? "")
-        }
+        }()
     }
 
     private static func base64(_ value: String) -> Data? {
@@ -561,36 +635,51 @@ public enum HarborV2rayNReader {
     public static func read(at root: URL) throws -> HarborV2rayNImport {
         let configuration = root.appendingPathComponent("guiConfigs/guiNConfig.json")
         let database = root.appendingPathComponent("guiConfigs/guiNDB.db")
-        let json = try Data(contentsOf: configuration)
+        let jsonHandle = try FileHandle(forReadingFrom: configuration)
+        defer { try? jsonHandle.close() }
+        let maximumConfigBytes = 4 * 1_024 * 1_024
+        guard let json = try jsonHandle.read(upToCount: maximumConfigBytes + 1), json.count <= maximumConfigBytes else {
+            throw HarborProxyError.invalid("v2rayN 配置文件过大或为空")
+        }
         let preferences = try JSONSerialization.jsonObject(with: json) as? [String: Any] ?? [:]
-        var db: OpaquePointer?
-        guard sqlite3_open_v2(database.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK,
-              let db else { throw HarborProxyError.invalid("无法以只读方式打开 v2rayN 数据库") }
-        defer { sqlite3_close(db) }
-        func rows(_ query: String, columns: [String]) throws -> [[String: String]] {
+        var opened: OpaquePointer?
+        let code = sqlite3_open_v2(database.path, &opened, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil)
+        defer { if let opened { sqlite3_close(opened) } }
+        guard code == SQLITE_OK, let db = opened else {
+            throw HarborProxyError.invalid("无法以只读方式打开 v2rayN 数据库")
+        }
+        sqlite3_limit(db, SQLITE_LIMIT_LENGTH, 64 * 1_024)
+        var totalBytes = 0
+        func rows(_ query: String, columns: [String], limit: Int) throws -> [[String: String]] {
             var statement: OpaquePointer?
             guard sqlite3_prepare_v2(db, query, -1, &statement, nil) == SQLITE_OK else {
                 throw HarborProxyError.invalid("v2rayN 数据库结构不兼容")
             }
             defer { sqlite3_finalize(statement) }
             var result: [[String: String]] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while true {
+                let code = sqlite3_step(statement)
+                if code == SQLITE_DONE { return result }
+                guard code == SQLITE_ROW else { throw HarborProxyError.invalid("无法读取完整的 v2rayN 记录") }
+                guard result.count < limit else { throw HarborProxyError.invalid("v2rayN 记录数量超出导入限制") }
                 var entry: [String: String] = [:]
                 for (i, field) in columns.enumerated() {
                     if let pointer = sqlite3_column_text(statement, Int32(i)) {
-                        entry[field] = String(cString: pointer)
-                    } else if sqlite3_column_type(statement, Int32(i)) == SQLITE_INTEGER {
-                        entry[field] = String(sqlite3_column_int(statement, Int32(i)))
+                        let bytes = Int(sqlite3_column_bytes(statement, Int32(i)))
+                        totalBytes += bytes
+                        guard totalBytes <= 8 * 1_024 * 1_024 else {
+                            throw HarborProxyError.invalid("v2rayN 记录内容超出导入大小限制")
+                        }
+                        entry[field] = String(decoding: UnsafeBufferPointer(start: pointer, count: bytes), as: UTF8.self)
                     }
                 }
                 result.append(entry)
             }
-            return result
         }
         let fields = ["IndexId","ConfigType","Address","Port","Id","AlterId","Security","Network",
                       "Remarks","RequestHost","Path","StreamSecurity","Subid","Flow","Sni",
                       "Fingerprint","PublicKey","ShortId"]
-        let originals = try rows("SELECT \(fields.joined(separator: ",")) FROM ProfileItem", columns: fields)
+        let originals = try rows("SELECT \(fields.joined(separator: ",")) FROM ProfileItem", columns: fields, limit: 12_000)
         var unsupported = 0
         let nodes = originals.compactMap { item -> HarborProxyNode? in
             // v2rayN's ConfigType 5 is VLESS. Explicitly skip unknown formats.
@@ -612,7 +701,7 @@ public enum HarborV2rayNReader {
                 subscriptionID: item["Subid"] ?? "")
         }
         let subscriptionFields = ["Id","Remarks","Url"]
-        let subscriptions = try rows("SELECT Id, Remarks, Url FROM SubItem", columns: subscriptionFields)
+        let subscriptions = try rows("SELECT Id, Remarks, Url FROM SubItem", columns: subscriptionFields, limit: 200)
             .compactMap { item -> HarborProxySubscription? in
                 guard let url = item["Url"], url.hasPrefix("https://") else { return nil }
                 return HarborProxySubscription(id: item["Id"] ?? UUID().uuidString,
@@ -627,8 +716,37 @@ public enum HarborV2rayNReader {
 /// A domain entry covers the apex hostname and all its subdomains.
 public enum HarborProxyDomainRules {
     public static let defaults = ["gitee.com", "gitee.io"]
+    public static let localNetworks = [
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16",
+        "100.64.0.0/10", "::1/128", "fc00::/7", "fe80::/10"
+    ]
+
+    public static func localHostAliases(in hostsFile: String, forced: [String] = []) -> [String] {
+        localHostAddresses(in: hostsFile, forced: forced).keys.sorted()
+    }
+
+    public static func localHostAddresses(in hostsFile: String, forced: [String] = []) -> [String: [String]] {
+        var result: [String: [String]] = [:]
+        let forced = forced.map { $0.lowercased() }
+        for line in hostsFile.split(whereSeparator: \.isNewline) {
+            let fields = line.prefix(while: { $0 != "#" }).split(whereSeparator: \.isWhitespace)
+            guard let raw = fields.first, let ip = HarborIPAddress.normalizedLiteral(String(raw)),
+                  HarborIPAddress.isLocal(ip) else { continue }
+            for field in fields.dropFirst() {
+                let host = field.lowercased()
+                guard !host.isEmpty, host.utf8.count < 254, HarborIPAddress.normalizedLiteral(host) == nil,
+                      host.utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) || [45, 46, 95].contains($0) }),
+                      !forced.contains(where: { host == $0 || host.hasSuffix("." + $0) }),
+                      result[host] != nil || result.count < 256 else { continue }
+                let addresses = result[host] ?? []
+                if addresses.count < 8, !addresses.contains(ip) { result[host, default: []].append(ip) }
+            }
+        }
+        return result
+    }
 
     public static func normalized(_ domains: [String]) throws -> [String] {
+        guard domains.count <= 256 else { throw HarborProxyError.invalid("强制代理域名最多支持 256 项") }
         var seen = Set<String>()
         var result: [String] = []
         for value in domains {
@@ -674,7 +792,7 @@ public enum HarborXrayConfig {
     /// v2rayN's real-ping batch uses one mixed SOCKS/HTTP inbound per node,
     /// routes each inbound to its matching outbound, and starts one Xray.
     public static func makeRealPingBatch(nodes: [HarborProxyNode], basePort: Int) throws -> Data {
-        guard !nodes.isEmpty, nodes.count <= 1_000,
+        guard !nodes.isEmpty, nodes.count <= HarborProxyLatencyPolicy.realPingBatchSize,
               (1024...65_535).contains(basePort),
               basePort + nodes.count - 1 <= 65_534 else {
             throw HarborProxyError.invalid("测速节点或端口无效")
@@ -714,7 +832,8 @@ public enum HarborXrayConfig {
                             forcedProxyDomains: [String] = HarborProxyDomainRules.defaults,
                             routeVerificationViaProxy: Bool = false,
                             routeAllViaProxy: Bool = false,
-                            verificationHost: String? = nil) throws -> Data {
+                            verificationHost: String? = nil,
+                            localHosts: [String] = []) throws -> Data {
         guard (1024...65534).contains(httpPort), (1...65535).contains(node.port),
               !node.host.isEmpty, !node.credential.isEmpty else {
             throw HarborProxyError.invalid("代理节点无效")
@@ -773,6 +892,10 @@ public enum HarborXrayConfig {
                           "outboundTag": "proxy"])
         }
         if !routeAllViaProxy {
+            if !localHosts.isEmpty {
+                rules.append(["type": "field", "domain": localHosts.map { "full:\($0)" },
+                              "outboundTag": "direct"])
+            }
             rules.append(["type": "field", "ip": ["geoip:private"], "outboundTag": "direct"])
         }
         if ruleMode && !routeAllViaProxy {

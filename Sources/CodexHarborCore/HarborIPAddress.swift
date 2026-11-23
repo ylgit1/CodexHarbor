@@ -29,6 +29,22 @@ public enum HarborIPAddress {
         return first == second
     }
 
+    public static func isLocal(_ host: String) -> Bool {
+        guard let ip = normalizedLiteral(host) else { return false }
+        if ip.hasPrefix("::ffff:") { return isLocal(String(ip.dropFirst(7))) }
+        if ip.contains(":") {
+            return ip == "::1" || ip == "::" || ip.hasPrefix("fc") || ip.hasPrefix("fd")
+                || ["fe8", "fe9", "fea", "feb"].contains { ip.hasPrefix($0) }
+        }
+        let parts = ip.split(separator: ".").compactMap { Int($0) }
+        guard parts.count == 4 else { return false }
+        return [0, 10, 127].contains(parts[0])
+            || (parts[0] == 169 && parts[1] == 254)
+            || (parts[0] == 172 && (16...31).contains(parts[1]))
+            || (parts[0] == 192 && parts[1] == 168)
+            || (parts[0] == 100 && (64...127).contains(parts[1]))
+    }
+
     /// Strip URL-style brackets only for valid IP literals; preserve DNS names.
     public static func socketHost(_ host: String) -> String {
         normalizedLiteral(host) ?? host.trimmingCharacters(in: .whitespacesAndNewlines)

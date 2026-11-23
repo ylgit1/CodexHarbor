@@ -9,15 +9,17 @@ final class HarborApplicationDelegate: NSObject, NSApplicationDelegate {
     private var terminationInProgress = false
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if terminationInProgress { return .terminateNow }
+        if terminationInProgress { return .terminateLater }
         terminationInProgress = true
         // Never present an authorization dialog or modal when quitting.
         // If macOS refuses a noninteractive proxy restore, stop() preserves
         // Xray so the system does not point to an unavailable proxy endpoint.
         Task { @MainActor in
-            if !(await HarborProxyManager.shared.stop(interactive: false)) {
+            let proxy = HarborProxyManager.shared
+            if !(await proxy.stop(interactive: false)) {
                 NSLog("CodexHarbor: system proxy could not be restored without interaction; leaving Xray alive for network safety")
             }
+            await proxy.flushConfigurationBeforeQuit()
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater

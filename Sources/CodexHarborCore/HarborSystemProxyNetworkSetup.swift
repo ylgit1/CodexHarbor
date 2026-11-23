@@ -21,7 +21,8 @@ public enum HarborSystemProxyNetworkSetup {
         (lhs as? NSObject) == (rhs as? NSObject)
     }
 
-    public static func matches(_ current: [String: Any], _ expected: [String: Any]) -> Bool {
+    public static func matches(_ current: [String: Any], _ expected: [String: Any],
+                               includeBypass: Bool = true) -> Bool {
         for item in protocols {
             let key = item.name
             guard enabled(current, key + "Enable") == enabled(expected, key + "Enable") else { return false }
@@ -34,8 +35,67 @@ public enum HarborSystemProxyNetworkSetup {
         }
         guard enabled(current, "ProxyAutoConfigEnable") == enabled(expected, "ProxyAutoConfigEnable"),
               enabled(current, "ProxyAutoDiscoveryEnable") == enabled(expected, "ProxyAutoDiscoveryEnable") else { return false }
-        return (current["ExceptionsList"] as? [String] ?? []) ==
+        return !includeBypass || (current["ExceptionsList"] as? [String] ?? []) ==
             (expected["ExceptionsList"] as? [String] ?? [])
+    }
+
+    public static func usesLoopback(_ current: [String: Any], httpPort: Int, all: Bool = false) -> Bool {
+        let checks = protocols.map { item in
+            let key = item.name
+            return enabled(current, key + "Enable")
+                && current[key + "Proxy"] as? String == "127.0.0.1"
+                && port(current, key + "Port") == httpPort + (key == "SOCKS" ? 1 : 0)
+        }
+        if !all { return checks.contains(true) }
+        return !checks.contains(false) && !enabled(current, "ProxyAutoConfigEnable")
+            && !enabled(current, "ProxyAutoDiscoveryEnable")
+    }
+
+    public static func desiredBypass(_ baseline: [String], automatic: [String], forced: [String]) -> [String] {
+        var seen = Set<String>()
+        return (baseline + automatic).filter { pattern in
+            let normalized = pattern.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let domain = normalized.trimmingCharacters(in: CharacterSet(charactersIn: "*."))
+            let wildcard = normalized.hasPrefix("*.") || normalized.hasPrefix(".")
+            guard forced.isEmpty || normalized != "*" else { return false }
+            return !forced.contains {
+                domain == $0 || domain.hasSuffix("." + $0) || (wildcard && $0.hasSuffix("." + domain))
+            } && seen.insert(normalized).inserted
+        }
+    }
+
+    public static func restoreBypass(current: [String], original: [String], managed: [String]) -> [String] {
+        let addedByHarbor = Set(managed).subtracting(original)
+        let removedByHarbor = Set(original).subtracting(managed)
+        if current == managed { return original }
+        if current == original { return original }
+        return current.filter { !addedByHarbor.contains($0) }
+            + original.filter { removedByHarbor.contains($0) && !current.contains($0) }
+    }
+
+    public static func restoreValues(
+        current: [String: Any], original: [String: Any], managed: [String: Any]
+    ) -> [String: Any] {
+        var result = current
+        for item in protocols {
+            let key = item.name
+            if enabled(managed, key + "Enable"),
+               let host = managed[key + "Proxy"] as? String,
+               current[key + "Proxy"] as? String == host,
+               let number = port(managed, key + "Port"), port(current, key + "Port") == number {
+                result[key + "Proxy"] = original[key + "Proxy"]
+                result[key + "Port"] = original[key + "Port"]
+                if enabled(current, key + "Enable") == enabled(managed, key + "Enable") {
+                    result[key + "Enable"] = original[key + "Enable"]
+                }
+            }
+        }
+        result["ExceptionsList"] = restoreBypass(
+            current: current["ExceptionsList"] as? [String] ?? [],
+            original: original["ExceptionsList"] as? [String] ?? [],
+            managed: managed["ExceptionsList"] as? [String] ?? []
+        )
+        return result
     }
 
     /// A command failure can leave a mix of original and Harbor values. Permit

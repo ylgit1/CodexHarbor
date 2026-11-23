@@ -22,7 +22,7 @@ struct MenuBarView: View {
                 .disabled(model.isBusy)
             }
             if proxy.requiresRecovery {
-                Button("恢复系统代理设置") { proxy.clearSystemProxy() }
+                Button("恢复系统代理设置") { Task { await proxy.clearSystemProxy() } }
             }
 
             Divider()
@@ -68,7 +68,7 @@ struct MenuBarView: View {
                     Text("当前节点：\(node.displayName)")
                 }
                 if proxy.running {
-                    Button("关闭代理") { Task { _ = await proxy.stop() } }
+                    Button("关闭代理") { Task { await proxy.clearProxy() } }
                         .disabled(proxy.busy)
                 } else {
                     Button("开启代理") {

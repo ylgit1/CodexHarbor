@@ -43,20 +43,22 @@ public enum HarborProxyLatencyPolicy {
     // A batch shares one Xray process, so HTTP probes are inexpensive. Thirty-two
     // concurrent nodes keeps large subscriptions responsive without creating
     // one process per node or flooding the target with every node at once.
-    public static let parallelCount = 32
+    public static let parallelCount = 12
 
     /// An OpenVPN probe owns an isolated Mihomo process (unlike the shared
     /// Xray real-ping batch). Bound concurrency by CPU and RAM so a large
     /// VPN Gate pool can run in parallel without starving the active proxy.
-    /// Modern Apple Silicon Macs with >= 16 GiB use up to 8 simultaneous
-    /// probes; machines with less RAM use a smaller pool.
     public static func openVPNParallelCount(processors: Int, physicalMemory: UInt64) -> Int {
         let gib: UInt64 = 1_024 * 1_024 * 1_024
-        let memoryLimit = physicalMemory >= 16 * gib ? 8 : (physicalMemory >= 8 * gib ? 6 : 3)
-        return max(1, min(8, max(1, processors), memoryLimit))
+        let memoryLimit = physicalMemory >= 16 * gib ? 4 : (physicalMemory >= 8 * gib ? 3 : 2)
+        return max(1, min(max(1, processors), memoryLimit))
     }
 
-    public static let realPingBatchSize = 1_000
+    public static let realPingBatchSize = 32
+    public static let temporaryEngineLimit = 4
+    public static let probeRequestLimit = 12
+    public static let batchDeadlineSeconds = 300
+    public static let standaloneParallelCount = 2
     // v2rayN ConnectionHandler.GetRealPingTime uses Global.LocalFetch (5s)
     // for two requests to the configured SpeedPingTestUrl.
     public static let requestTimeoutSeconds = 5
@@ -82,7 +84,7 @@ public struct HarborProxyLatencyQueue: Sendable {
     }
 
     public mutating func initialIndices() -> Range<Int> {
-        let end = min(count, limit)
+        let end = max(next, min(count, limit))
         let indices = next..<end
         next = end
         return indices
@@ -98,14 +100,14 @@ public struct HarborProxyLatencyQueue: Sendable {
 public enum HarborProxyGeoIPPolicy {
     public static let serverDNSCacheInterval: TimeInterval = 6 * 60 * 60
     public static let exitRefreshInterval: TimeInterval = 7 * 24 * 60 * 60
-    public static let exitParallelCount = 8
+    public static let exitParallelCount = 4
     public static let exitBatchSize = 32
 
-    /// Include independent startup and both IP/GeoIP fallbacks for every
-    /// concurrency wave. Large subscriptions must not share a 75-second cap.
+    /// Allow multiple waves in a large subscription with a hard ceiling.
     public static func exitBatchDeadlineSeconds(nodeCount: Int) -> Int {
-        let waves = max(1, (max(0, nodeCount) + exitParallelCount - 1) / exitParallelCount)
-        return max(75, waves * 45)
+        let count = min(max(0, nodeCount), exitParallelCount * 10)
+        let waves = max(1, (count + exitParallelCount - 1) / exitParallelCount)
+        return min(HarborProxyLatencyPolicy.batchDeadlineSeconds, max(75, waves * 45))
     }
     public static let exitFailureRetryIntervals: [TimeInterval] = [
         10, 60, 10 * 60, 60 * 60
@@ -156,9 +158,12 @@ public struct HarborProxyProbeResult: Codable, Sendable, Equatable {
     /// Optional for encrypted probe records saved by older app versions.
     public var probeRouteID: String?
     public var succeeded: Bool { milliseconds != nil }
+    public func isUsable(on routeID: String? = nil, now: Date = .now) -> Bool {
+        realTested && succeeded && !isStale(now: now) && (routeID == nil || probeRouteID == routeID)
+    }
     /// A single transient failure remains visible and is eligible for retry.
     public var isConfirmedUnavailable: Bool {
-        realTested && !succeeded && (consecutiveRealFailures ?? 1) >= 2
+        realTested && !succeeded && !isStale() && (consecutiveRealFailures ?? 1) >= 2
     }
     public var isAwaitingRetry: Bool {
         realTested && !succeeded && !isConfirmedUnavailable
@@ -190,7 +195,8 @@ public struct HarborProxyProbeResult: Codable, Sendable, Equatable {
 
     public func isStale(now: Date = .now) -> Bool {
         guard let checked = effectiveRealCheckedAt else { return true }
-        return now.timeIntervalSince(checked) >= HarborProxyLatencyPolicy.staleRealResultInterval
+        let age = now.timeIntervalSince(checked)
+        return age < 0 || age >= HarborProxyLatencyPolicy.staleRealResultInterval
     }
 }
 
@@ -311,25 +317,33 @@ public struct HarborProxyExitLocation: Codable, Equatable, Sendable {
     public let endpointSignature: String
     public let observedAt: Date
     public let resolvedServerIP: String?
+    public let probeRouteID: String?
     // Missing on observations made with the old Cloudflare-hosted probe.
     private let probeVersion: Int?
 
     public init(location: HarborProxyIPLocation, endpointSignature: String,
-                observedAt: Date = .now, resolvedServerIP: String? = nil) {
+                observedAt: Date = .now, resolvedServerIP: String? = nil, probeRouteID: String? = nil) {
         self.location = location
         self.endpointSignature = endpointSignature
         self.observedAt = observedAt
         self.resolvedServerIP = resolvedServerIP
+        self.probeRouteID = probeRouteID
         self.probeVersion = 2
     }
 
     public func verifiedLocation(for node: HarborProxyNode, resolvedServerIP currentIP: String? = nil,
                                  now: Date = .now)
         -> HarborProxyIPLocation? {
+        guard (0..<HarborProxyGeoIPPolicy.exitRefreshInterval).contains(now.timeIntervalSince(observedAt)),
+              location.verifiedCountryCode != nil else { return nil }
+        return observedLocation(for: node, resolvedServerIP: currentIP)
+    }
+
+    public func observedLocation(for node: HarborProxyNode, resolvedServerIP currentIP: String? = nil)
+        -> HarborProxyIPLocation? {
         guard probeVersion == 2,
               !endpointSignature.isEmpty,
-              endpointSignature == node.endpointSignature,
-              location.verifiedCountryCode != nil else {
+              endpointSignature == node.endpointSignature else {
             return nil
         }
         if let resolvedServerIP, let currentIP,
@@ -342,8 +356,7 @@ public struct HarborProxyExitLocation: Codable, Equatable, Sendable {
         guard verifiedLocation(for: node, resolvedServerIP: currentIP, now: now) != nil else {
             return true
         }
-        return resolvedServerIP == nil
-            || now.timeIntervalSince(observedAt) >= HarborProxyGeoIPPolicy.exitRefreshInterval
+        return false
     }
 }
 

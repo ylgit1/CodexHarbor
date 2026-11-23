@@ -42,6 +42,43 @@ struct HarborWARPTests {
             network: "tcp", security: "vpngate-unverified", path: "JP")
     }
 
+    @Test("A fresh machine has a stable subscription-free WARP node")
+    func builtInNode() {
+        let node = HarborIndependentWARP.node
+        #expect(node.id == HarborIndependentWARP.nodeID)
+        #expect(node.subscriptionID.isEmpty)
+        #expect(node.protocolName == "warp")
+        #expect(HarborIndependentWARP.isBuiltIn(node))
+        var imported = node
+        imported.id = UUID().uuidString
+        #expect(!HarborIndependentWARP.isBuiltIn(imported))
+    }
+
+    @Test("WARP-only config has a local listener and fails identity mismatch")
+    func standaloneConfig() throws {
+        let value = account()
+        let profile = HarborWARPProfile(account: value, endpoint: .init(host: "162.159.198.2"))
+        let data = try HarborWARPConfig.make(profile: profile, httpPort: 18080)
+        let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let proxies = try #require(object["proxies"] as? [[String: Any]])
+        #expect(proxies.count == 1)
+        #expect(proxies[0]["type"] as? String == "masque")
+        #expect(object["port"] as? Int == 18080)
+        #expect(object["socks-port"] as? Int == 18081)
+        #expect(object["allow-lan"] as? Bool == false)
+        #expect(object["rules"] as? [String] == ["MATCH,warp"])
+        #expect(HarborWARPConfig.matches(configuration: data, profile: profile, httpPort: 18080))
+        #expect(!HarborWARPConfig.matches(configuration: data, profile: profile, httpPort: 18082))
+        let other = HarborWARPProfile(account: value, endpoint: .init(host: "162.159.198.1"))
+        #expect(!HarborWARPConfig.matches(configuration: data, profile: other, httpPort: 18080))
+    }
+
+    @Test("Trace parsing uses only the dedicated IP field")
+    func traceIP() {
+        #expect(HarborWARPConnectivity.exitIP(from: Data("ip=1.2.3.4\nwarp=on\n".utf8)) == "1.2.3.4")
+        #expect(HarborWARPConnectivity.exitIP(from: Data("other=ip=2.2.2.2\n".utf8)) == nil)
+    }
+
     @Test("Fresh registration switches from WireGuard enrollment to a unique MASQUE public key")
     func registration() async throws {
         let recorder = WARPEnrollmentRecorder()

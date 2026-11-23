@@ -25,10 +25,14 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 
 - [最新 DMG · GitHub 公共下载（无需登录）](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg)
 - [Gitee 发行版安装包（按版本选择附件）](https://gitee.com/yangxiaoyong01/CodexHarbor/releases)
-- [v0.1.35 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.35/Codex-Harbor-v0.1.35-arm64.dmg)
+- [v0.1.36 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.36/Codex-Harbor-v0.1.36-arm64.dmg)
 - Gitee 发布附件独立于 GitHub，需要单独上传和核验；以发行版页面显示的实际附件为准，未同步完成时请先从 GitHub 下载。
 
-可用 SHA-256 校验清单核验 v0.1.35 DMG 的完整性。[下载校验清单](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.35/SHA256SUMS)
+可用 SHA-256 校验清单核验 v0.1.36 DMG 的完整性。[下载校验清单](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.36/SHA256SUMS)
+
+**v0.1.36 更新**
+
+合并本地未提交的 24 个代理可靠性改动（20 个修改文件、4 个新增文件），保留 v0.1.35 的无订阅 Cloudflare WARP 独立连接。增强网络状态持久化、连接前验证和失败回退、系统代理所有权保护、超时与取消、批量测速和出口检测，并增加针对性可靠性测试。完成 macOS CI、Release 构建及 DMG 校验后发布。
 
 **v0.1.35 更新**
 

@@ -9,6 +9,7 @@ public enum HarborProxyConnectionType: Sendable, Equatable {
     case vpnGateVolunteer
     case vpnGateDatacenter
     case imported
+    case builtInWARP
 
     public var title: String {
         switch self {
@@ -18,6 +19,7 @@ public enum HarborProxyConnectionType: Sendable, Equatable {
         case .vpnGateVolunteer: "VPN Gate · 志愿节点"
         case .vpnGateDatacenter: "VPN Gate · 机房候选"
         case .imported: "手动导入"
+        case .builtInWARP: "内置 WARP"
         }
     }
 
@@ -29,6 +31,7 @@ public enum HarborProxyConnectionType: Sendable, Equatable {
         case .vpnGateVolunteer: "VPN Gate 志愿节点，尚未识别为家宽入口。"
         case .vpnGateDatacenter: "VPN Gate 志愿节点，来源或公开网络数据将其标记为机房候选。"
         case .imported: "通过节点链接手动导入，未关联订阅。"
+        case .builtInWARP: "不依赖节点订阅；出口由 Cloudflare WARP 提供，国家和可用性不保证。"
         }
     }
 
@@ -37,6 +40,7 @@ public enum HarborProxyConnectionType: Sendable, Equatable {
         subscription: HarborProxySubscription?,
         evidence: HarborProxyNetworkEvidence?
     ) -> Self {
+        if HarborIndependentWARP.isBuiltIn(node) { return .builtInWARP }
         guard let subscription, subscription.id == node.subscriptionID else {
             return node.subscriptionID.isEmpty ? .imported : .subscription
         }

@@ -21,7 +21,7 @@ enum HarborVPNGateNetworkClassifier {
 
     static func classify(_ nodes: [HarborProxyNode],
                          cached: [String: HarborProxyNetworkEvidence],
-                         proxyPort: Int?) async -> [String: HarborProxyNetworkEvidence] {
+                         proxyPort: Int?, cancellation: HarborLatencyCancellation) async -> [String: HarborProxyNetworkEvidence] {
         let fresh = cached.filter { Date.now.timeIntervalSince($0.value.checkedAt) < 24 * 60 * 60 }
         let ips = HarborVPNGate.unclassifiedVolunteerIPs(
             in: nodes, cached: Set(fresh.keys), limit: 48)
@@ -32,32 +32,42 @@ enum HarborVPNGateNetworkClassifier {
             for _ in 0..<min(4, ips.count) {
                 let ip = ips[next]
                 next += 1
-                group.addTask { (ip, await lookup(ip: ip, proxyPort: proxyPort)) }
+                group.addTask { (ip, await lookup(ip: ip, proxyPort: proxyPort, cancellation: cancellation)) }
             }
             while let (ip, evidence) = await group.next() {
+                if cancellation.isCancelled || Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
                 if let evidence { updates[ip] = evidence }
                 if next < ips.count {
                     let ip = ips[next]
                     next += 1
-                    group.addTask { (ip, await lookup(ip: ip, proxyPort: proxyPort)) }
+                    group.addTask { (ip, await lookup(ip: ip, proxyPort: proxyPort, cancellation: cancellation)) }
                 }
             }
         }
         return updates
     }
 
-    private static func lookup(ip: String, proxyPort: Int?) async -> HarborProxyNetworkEvidence? {
+    private static func lookup(ip: String, proxyPort: Int?,
+                               cancellation: HarborLatencyCancellation) async -> HarborProxyNetworkEvidence? {
         guard var url = URLComponents(string: "https://ip-info.com/json") else { return nil }
         url.queryItems = [URLQueryItem(name: "ip", value: ip)]
         guard let endpoint = url.url else { return nil }
-        let configuration = HarborProxyHTTP.configuration(httpPort: proxyPort)
-        let session = URLSession(configuration: configuration)
-        defer { session.invalidateAndCancel() }
-        var request = URLRequest(url: endpoint)
-        request.timeoutInterval = 5
-        guard let (data, response) = try? await session.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200,
-              data.count <= 4_096,
+        guard let lease = await HarborProbeBudget.requests.acquire(cancellation) else { return nil }
+        let load = Task {
+            try await HarborProxyHTTPBody.data(for: URLRequest(url: endpoint),
+                configuration: HarborProxyHTTP.configuration(httpPort: proxyPort),
+                limit: 4_096, timeout: 5, status: 200..<201)
+        }
+        let observer = cancellation.observe { load.cancel() }
+        let result = await withTaskCancellationHandler {
+            try? await load.value
+        } onCancel: { load.cancel() }
+        if let observer { cancellation.removeObserver(observer) }
+        await HarborProbeBudget.requests.release(lease)
+        guard !cancellation.isCancelled, let (data, _) = result,
               let value = try? JSONDecoder().decode(Response.self, from: data),
               value.ip == ip else { return nil }
         return HarborProxyNetworkEvidence(

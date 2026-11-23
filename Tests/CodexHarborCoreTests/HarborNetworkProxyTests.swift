@@ -128,7 +128,7 @@ struct HarborNetworkProxyTests {
 
     @Test("Failed exit IP lookups back off instead of blocking for one hour")
     func exitGeoIPRetryBackoff() {
-        #expect(HarborProxyGeoIPPolicy.exitParallelCount == 8)
+        #expect(HarborProxyGeoIPPolicy.exitParallelCount == 4)
         #expect(HarborProxyGeoIPPolicy.retryInterval(afterFailures: 1) == 10)
         #expect(HarborProxyGeoIPPolicy.retryInterval(afterFailures: 2) == 60)
         #expect(HarborProxyGeoIPPolicy.retryInterval(afterFailures: 3) == 600)
@@ -162,7 +162,7 @@ struct HarborNetworkProxyTests {
         #expect(HarborProxyMeasurementLabel.measured(197) == "197 ms")
         #expect(HarborProxyMeasurementLabel.explanation.contains("SOCKS5"))
         #expect(HarborProxyMeasurementLabel.explanation.contains("v2rayN"))
-        #expect(HarborProxyLatencyPolicy.parallelCount == 32)
+        #expect(HarborProxyLatencyPolicy.parallelCount == 12)
         #expect(HarborProxyLatencyPolicy.requestTimeoutSeconds == 5)
         #expect(HarborProxyLatencyPolicy.realPingRequestCount == 2)
         #expect(HarborProxyLatencyPolicy.realPingPauseMilliseconds == 100)
@@ -177,11 +177,12 @@ struct HarborNetworkProxyTests {
     @Test("Real proxy probe queue refills each completed slot without a wave barrier")
     func proxyProbeQueueRefills() {
         var queue = HarborProxyLatencyQueue(count: 65, limit: HarborProxyLatencyPolicy.parallelCount)
-        #expect(Array(queue.initialIndices()) == Array(0..<32))
+        #expect(Array(queue.initialIndices()) == Array(0..<12))
         #expect(queue.initialIndices().isEmpty)
-        #expect(queue.nextIndex() == 32)
-        #expect(queue.nextIndex() == 33)
-        #expect((0..<31).compactMap { _ in queue.nextIndex() } == Array(34..<65))
+        #expect(queue.nextIndex() == 12)
+        #expect(queue.nextIndex() == 13)
+        #expect(queue.initialIndices().isEmpty)
+        #expect((0..<51).compactMap { _ in queue.nextIndex() } == Array(14..<65))
         #expect(queue.nextIndex() == nil)
 
         var small = HarborProxyLatencyQueue(count: 2, limit: 32)
@@ -192,24 +193,22 @@ struct HarborNetworkProxyTests {
         #expect(empty.nextIndex() == nil)
     }
 
-    @Test("OpenVPN probes scale to eight on large Macs but respect CPU and RAM limits")
+    @Test("OpenVPN probes respect the shared engine, CPU and RAM limits")
     func openVPNParallelismIsBounded() {
         let gib: UInt64 = 1_024 * 1_024 * 1_024
         let policy = HarborProxyLatencyPolicy.openVPNParallelCount
-        #expect(policy(8, 16 * gib) == 8)
-        #expect(policy(10, 32 * gib) == 8)
-        #expect(policy(8, 8 * gib) == 6)
-        #expect(policy(8, 4 * gib) == 3)
+        #expect(policy(8, 16 * gib) == HarborProxyLatencyPolicy.temporaryEngineLimit)
+        #expect(policy(10, 32 * gib) == 4)
+        #expect(policy(8, 8 * gib) == 3)
+        #expect(policy(8, 4 * gib) == 2)
         #expect(policy(2, 16 * gib) == 2)
         #expect(policy(1, 16 * gib) == 1)
 
-        // With eight slots the next relay is dispatched immediately when one
-        // finishes, instead of waiting for the other seven in that batch.
         var queue = HarborProxyLatencyQueue(count: 24, limit: policy(8, 16 * gib))
-        #expect(Array(queue.initialIndices()) == Array(0..<8))
-        #expect(queue.nextIndex() == 8)
-        #expect(queue.nextIndex() == 9)
-        #expect((0..<14).compactMap { _ in queue.nextIndex() } == Array(10..<24))
+        #expect(Array(queue.initialIndices()) == Array(0..<4))
+        #expect(queue.nextIndex() == 4)
+        #expect(queue.nextIndex() == 5)
+        #expect((0..<18).compactMap { _ in queue.nextIndex() } == Array(6..<24))
         #expect(queue.nextIndex() == nil)
     }
 
@@ -257,15 +256,15 @@ struct HarborNetworkProxyTests {
         #expect(outbounds.map { $0["tag"] as? String } == ["proxy18200", "proxy18201"])
         #expect(rules.map { $0["inboundTag"] as? [String] } == [["mixed18200"], ["mixed18201"]])
         #expect(rules.map { $0["outboundTag"] as? String } == ["proxy18200", "proxy18201"])
-        #expect(HarborProxyLatencyPolicy.realPingBatchSize == 1_000)
+        #expect(HarborProxyLatencyPolicy.realPingBatchSize == 32)
     }
 
-    @Test("Exit-region deadline allows every wave in a large subscription")
+    @Test("Exit-region batches have a deadline even for very large subscriptions")
     func exitRegionBatchDeadline() {
         #expect(HarborProxyGeoIPPolicy.exitBatchDeadlineSeconds(nodeCount: 1) >= 75)
-        #expect(HarborProxyGeoIPPolicy.exitBatchDeadlineSeconds(nodeCount: 360) >= 45 * 45)
-        #expect(HarborProxyGeoIPPolicy.exitBatchDeadlineSeconds(nodeCount: 360)
-            > HarborProxyGeoIPPolicy.exitBatchDeadlineSeconds(nodeCount: 32))
+        #expect(HarborProxyGeoIPPolicy.exitBatchDeadlineSeconds(nodeCount: .max) == 300)
+        #expect(HarborProxyGeoIPPolicy.exitBatchDeadlineSeconds(nodeCount: 16)
+            > HarborProxyGeoIPPolicy.exitBatchDeadlineSeconds(nodeCount: 2))
     }
 
     @Test("Failed real probes use bounded retry backoff")
@@ -537,10 +536,18 @@ struct HarborNetworkProxyTests {
         #expect(proxies[0]["dialer-proxy"] as? String == "underlay")
         #expect(proxies[0]["handshake-timeout"] as? Int == 30)
         #expect(proxies[1]["port"] as? Int == 18201)
+        #expect(proxies[1]["udp"] as? Bool == true)
         #expect(HarborMihomoConfig.matches(configuration: chained, node: node,
                                            underlaySocksPort: 18201))
         #expect(!HarborMihomoConfig.matches(configuration: chained, node: node,
                                             underlaySocksPort: 18203))
+        var legacyProxies = proxies
+        legacyProxies[1].removeValue(forKey: "udp")
+        var legacyUnderlay = parsed
+        legacyUnderlay["proxies"] = legacyProxies
+        let legacyUnderlayBytes = try JSONSerialization.data(withJSONObject: legacyUnderlay)
+        #expect(HarborMihomoConfig.matches(configuration: legacyUnderlayBytes, node: node,
+                                           underlaySocksPort: 18201))
         var changed = node
         changed.credential = "invalid"
         #expect(!HarborMihomoConfig.matches(configuration: config, node: changed))

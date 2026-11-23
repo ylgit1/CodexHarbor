@@ -149,6 +149,7 @@ public enum HarborVPNGateProbePolicy {
         // old red verdict or inherit their previous failure counter.
         let untested = ranked.filter { node in
             guard let result = results[node.id], result.realTested else { return true }
+            if result.isUsable(on: "direct") { return false }
             return probeRouteID != nil && result.probeRouteID != probeRouteID
         }
         let failed = ranked.enumerated().filter { _, node in
@@ -170,10 +171,11 @@ public enum HarborVPNGateProbePolicy {
 
     private static func classRank(_ node: HarborProxyNode,
                                   evidence: [String: HarborProxyNetworkEvidence]) -> Int {
-        if evidence[node.host]?.kind == .residential { return 0 }
-        if node.security == "vpngate-datacenter" || evidence[node.host]?.kind == .hosting {
+        let kind = evidence[node.host].flatMap { $0.isFresh() ? $0.kind : nil }
+        if node.security == "vpngate-datacenter" || kind == .hosting {
             return 2
         }
+        if kind == .residential { return 0 }
         return 1
     }
 }
@@ -259,7 +261,12 @@ public struct OpenVPNProfile: Sendable {
 public enum HarborMihomoConfig {
     public static func make(node: HarborProxyNode, httpPort: Int,
                             underlaySocksPort: Int? = nil,
-                            warpProfile: HarborWARPProfile? = nil) throws -> Data {
+                            warpProfile: HarborWARPProfile? = nil,
+                            ruleMode: Bool? = nil,
+                            forcedProxyDomains: [String] = [],
+                            localHosts: [String] = [],
+                            verificationHost: String? = nil,
+                            localHostAddresses: [String: [String]] = [:]) throws -> Data {
         guard node.protocolName == "openvpn", (1024...65534).contains(httpPort),
               let data = Data(base64Encoded: node.credential),
               let text = String(data: data, encoding: .utf8),
@@ -296,14 +303,14 @@ public enum HarborMihomoConfig {
         if let underlaySocksPort {
             proxies.append([
                 "name": "underlay", "type": "socks5", "server": "127.0.0.1",
-                "port": underlaySocksPort
+                "port": underlaySocksPort, "udp": true
             ])
         }
         // Resolve destination domains inside Mihomo instead of inheriting the
         // macOS resolver. The DoH upstreams are explicitly sent through the
         // selected OpenVPN outbound. IP-literal DoH URLs need no bootstrap
         // lookup on a local network whose DNS may return poisoned addresses.
-        let dns: [String: Any] = [
+        var dns: [String: Any] = [
             "enable": true,
             "ipv6": false,
             "enhanced-mode": "redir-host",
@@ -317,11 +324,28 @@ public enum HarborMihomoConfig {
                 "https://8.8.4.4/dns-query#selected"
             ]
         ]
-        let config: [String: Any] = [
+        var rules: [String] = []
+        if let ruleMode {
+            let forced = try HarborProxyDomainRules.normalized(forcedProxyDomains)
+            rules += forced.map { "DOMAIN-SUFFIX,\($0),selected" }
+            if let verificationHost { rules.append("DOMAIN,\(verificationHost),selected") }
+            rules += localHosts.map { "DOMAIN,\($0),DIRECT" }
+            rules += HarborProxyDomainRules.localNetworks.map {
+                let family = $0.contains(":") ? "IP-CIDR6" : "IP-CIDR"
+                return "\(family),\($0),DIRECT,no-resolve"
+            }
+            if ruleMode { rules += ["GEOSITE,CN,DIRECT", "GEOIP,CN,DIRECT"] }
+            dns["direct-nameserver"] = ["system"]
+        }
+        rules.append("MATCH,selected")
+        var config: [String: Any] = [
             "port": httpPort, "socks-port": httpPort + 1,
-            "allow-lan": false, "mode": "rule", "log-level": "warning",
-            "dns": dns, "proxies": proxies, "rules": ["MATCH,selected"]
+            "allow-lan": false, "bind-address": "127.0.0.1",
+            "mode": "rule", "log-level": "warning",
+            "dns": dns, "proxies": proxies, "rules": rules
         ]
+        if ruleMode == true { config["geodata-mode"] = true }
+        if !localHostAddresses.isEmpty { config["hosts"] = localHostAddresses }
         // JSON is valid YAML; it also avoids hand-quoting certificate blocks.
         return try JSONSerialization.data(withJSONObject: config,
                                           options: [.sortedKeys, .withoutEscapingSlashes])
@@ -340,10 +364,20 @@ public enum HarborMihomoConfig {
               let wanted = expectedObject["proxies"] as? [[String: Any]],
               let actualDNS = actualObject["dns"] as? [String: Any],
               let wantedDNS = expectedObject["dns"] as? [String: Any],
-              actual.count == wanted.count,
-              NSDictionary(dictionary: actualDNS).isEqual(to: wantedDNS) else { return false }
+              actual.count == wanted.count else { return false }
+        var comparableDNS = actualDNS
+        if comparableDNS["direct-nameserver"] as? [String] == ["system"] {
+            comparableDNS.removeValue(forKey: "direct-nameserver")
+        }
+        guard NSDictionary(dictionary: comparableDNS).isEqual(to: wantedDNS) else { return false }
         return zip(actual, wanted).allSatisfy { pair in
-            NSDictionary(dictionary: pair.0).isEqual(to: pair.1)
+            var expectedProxy = pair.1
+            // Older running underlays omitted UDP. Adopt them with their
+            // original capabilities, without restarting a working relay.
+            if expectedProxy["name"] as? String == "underlay", pair.0["udp"] == nil {
+                expectedProxy.removeValue(forKey: "udp")
+            }
+            return NSDictionary(dictionary: pair.0).isEqual(to: expectedProxy)
         }
     }
 }

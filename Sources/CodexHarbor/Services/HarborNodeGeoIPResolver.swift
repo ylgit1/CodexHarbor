@@ -6,6 +6,38 @@ import Darwin
 /// DNS is resolved off the main actor; the HTTPS country lookup is made only
 /// for previously unseen IPs. No timer, per-row lookup or Xray process.
 enum HarborNodeGeoIPResolver {
+    private static let dnsQueue = DispatchQueue(label: "com.codexharbor.proxy.dns", qos: .utility)
+    private static let dnsSlot = DispatchSemaphore(value: 1)
+
+    private final class DNSQuery: @unchecked Sendable {
+        private let lock = NSLock()
+        private var completed = false
+        private var result: String?
+        private var continuation: CheckedContinuation<String?, Never>?
+
+        func attach(_ continuation: CheckedContinuation<String?, Never>) {
+            lock.lock()
+            if completed {
+                let result = result
+                lock.unlock()
+                continuation.resume(returning: result)
+            } else {
+                self.continuation = continuation
+                lock.unlock()
+            }
+        }
+
+        func finish(_ value: String?) {
+            lock.lock()
+            guard !completed else { lock.unlock(); return }
+            completed = true
+            result = value
+            let pending = continuation
+            continuation = nil
+            lock.unlock()
+            pending?.resume(returning: value)
+        }
+    }
     private struct Response: Decodable {
         let success: Bool
         let ip: String?
@@ -13,45 +45,62 @@ enum HarborNodeGeoIPResolver {
     }
 
     static func resolvedIP(for host: String) async -> String? {
-        await Task.detached(priority: .utility) {
-            let name = HarborIPAddress.socketHost(host)
-            guard !name.isEmpty, name.utf8.count < 254 else { return nil as String? }
-            // A literal IPv6 address (including URL-style [brackets]) needs
-            // no DNS lookup and must not be passed to getaddrinfo with brackets.
-            if let literal = HarborIPAddress.normalizedLiteral(name) {
-                return isPublic(literal) ? literal : nil
-            }
-            var hints = addrinfo()
-            hints.ai_family = AF_UNSPEC
-            hints.ai_socktype = SOCK_STREAM
-            var list: UnsafeMutablePointer<addrinfo>?
-            guard getaddrinfo(name, nil, &hints, &list) == 0, let head = list else {
-                return nil
-            }
-            defer { freeaddrinfo(head) }
-            var cursor: UnsafeMutablePointer<addrinfo>? = head
-            var ipv6: String?
-            while let current = cursor {
-                let item = current.pointee
-                if item.ai_family == AF_INET, let addr = item.ai_addr {
-                    var raw = UnsafeRawPointer(addr).assumingMemoryBound(to: sockaddr_in.self).pointee.sin_addr
-                    var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-                    if inet_ntop(AF_INET, &raw, &buffer, socklen_t(buffer.count)) != nil {
-                        let ip = String(decoding: buffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
-                        if isPublic(ip) { return ip }
-                    }
-                } else if item.ai_family == AF_INET6, let addr = item.ai_addr {
-                    var raw = UnsafeRawPointer(addr).assumingMemoryBound(to: sockaddr_in6.self).pointee.sin6_addr
-                    var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
-                    if inet_ntop(AF_INET6, &raw, &buffer, socklen_t(buffer.count)) != nil {
-                        let ip = String(decoding: buffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
-                        if isPublic(ip) { ipv6 = ip }
-                    }
+        let name = HarborIPAddress.socketHost(host)
+        guard !Task.isCancelled, !name.isEmpty, name.utf8.count < 254 else { return nil }
+        if let literal = HarborIPAddress.normalizedLiteral(name) { return isPublic(literal) ? literal : nil }
+
+        // getaddrinfo may outlive the request on some networks. Release the
+        // waiter promptly and allow only one OS lookup until it returns.
+        guard claimDNSSlot() else { return nil }
+        let query = DNSQuery()
+        dnsQueue.async {
+            let result = resolveBlocking(name)
+            dnsSlot.signal()
+            query.finish(result)
+        }
+        let timer = Task {
+            do { try await Task.sleep(for: .seconds(5)) } catch { return }
+            query.finish(nil)
+        }
+        defer { timer.cancel() }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { query.attach($0) }
+        } onCancel: { query.finish(nil) }
+    }
+
+    private static func claimDNSSlot() -> Bool { dnsSlot.wait(timeout: .now()) == .success }
+
+    private static func resolveBlocking(_ name: String) -> String? {
+        var hints = addrinfo()
+        hints.ai_family = AF_UNSPEC
+        hints.ai_socktype = SOCK_STREAM
+        var list: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(name, nil, &hints, &list) == 0, let head = list else {
+            return nil
+        }
+        defer { freeaddrinfo(head) }
+        var cursor: UnsafeMutablePointer<addrinfo>? = head
+        var ipv6: String?
+        while let current = cursor {
+            let item = current.pointee
+            if item.ai_family == AF_INET, let addr = item.ai_addr {
+                var raw = UnsafeRawPointer(addr).assumingMemoryBound(to: sockaddr_in.self).pointee.sin_addr
+                var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                if inet_ntop(AF_INET, &raw, &buffer, socklen_t(buffer.count)) != nil {
+                    let ip = String(decoding: buffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+                    if isPublic(ip) { return ip }
                 }
-                cursor = item.ai_next
+            } else if item.ai_family == AF_INET6, let addr = item.ai_addr {
+                var raw = UnsafeRawPointer(addr).assumingMemoryBound(to: sockaddr_in6.self).pointee.sin6_addr
+                var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+                if inet_ntop(AF_INET6, &raw, &buffer, socklen_t(buffer.count)) != nil {
+                    let ip = String(decoding: buffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+                    if isPublic(ip) { ipv6 = ip }
+                }
             }
-            return ipv6
-        }.value
+            cursor = item.ai_next
+        }
+        return ipv6
     }
 
     static func countryCode(for ip: String, proxyPort: Int? = nil,
@@ -67,26 +116,19 @@ enum HarborNodeGeoIPResolver {
         }
         var request = URLRequest(url: url)
         request.timeoutInterval = 6
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 6
-        config.timeoutIntervalForResource = 6
-        config.waitsForConnectivity = false
-        if let proxyPort {
-            config.connectionProxyDictionary = [
-                "HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": proxyPort,
-                "HTTPSEnable": 1, "HTTPSProxy": "127.0.0.1", "HTTPSPort": proxyPort
-            ]
+        guard let lease = await HarborProbeBudget.requests.acquire(cancellation) else { return nil }
+        let load = Task { [request] in
+            try await HarborProxyHTTPBody.data(for: request,
+                configuration: HarborProxyHTTP.configuration(httpPort: proxyPort),
+                limit: 16_384, timeout: 6, status: 200..<201)
         }
-        let session = URLSession(configuration: config)
-        defer { session.invalidateAndCancel() }
-        let observer = cancellation?.observe { session.invalidateAndCancel() }
-        guard cancellation == nil || observer != nil else { return nil }
-        defer {
-            if let observer { cancellation?.removeObserver(observer) }
-        }
-        guard let (data, response) = try? await session.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200,
-              data.count < 16_384,
+        let observer = cancellation?.observe { load.cancel() }
+        let downloaded = await withTaskCancellationHandler {
+            try? await load.value
+        } onCancel: { load.cancel() }
+        if let observer { cancellation?.removeObserver(observer) }
+        await HarborProbeBudget.requests.release(lease)
+        guard let (data, _) = downloaded,
               let result = try? JSONDecoder().decode(Response.self, from: data),
               result.success,
               let returnedIP = result.ip,
@@ -143,8 +185,8 @@ enum HarborNodeGeoIPResolver {
             code = nil
         }
         guard !Task.isCancelled, cancellation?.isCancelled != true,
-              let code else { return nil }
-        return HarborProxyIPLocation(ip: canonical, countryCode: code)
+              !Task.isCancelled else { return nil }
+        return HarborProxyIPLocation(ip: canonical, countryCode: code ?? "ZZ")
     }
 
     private static func exitCountryCode(for ip: String, socksPort: Int,
@@ -166,63 +208,16 @@ enum HarborNodeGeoIPResolver {
 
     private static func exitDataViaCurl(socksPort: Int, url: URL,
                                         cancellation: HarborLatencyCancellation?) async -> Data? {
-        guard !Task.isCancelled, cancellation?.isCancelled != true else { return nil }
-        // Network --max-time does NOT cap waiting for a child process or pipe
-        // reader. Keep the whole process under a wall-clock deadline, and
-        // capture to a private file rather than a potentially stuck pipe.
-        return await Task.detached(priority: .utility) {
-            let curl = Process()
-            curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-            curl.arguments = [
-                "--disable", "--silent", "--fail", "--max-time", "7",
-                "--proxy", "socks5h://127.0.0.1:\(socksPort)",
-                "--noproxy", "", "--url", url.absoluteString
-            ]
-            let outputURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("harbor-exit-\(UUID().uuidString).txt")
-            guard FileManager.default.createFile(
-                atPath: outputURL.path, contents: nil,
-                attributes: [.posixPermissions: 0o600]),
-                let output = try? FileHandle(forWritingTo: outputURL) else {
-                return nil as Data?
-            }
-            defer {
-                try? output.close()
-                try? FileManager.default.removeItem(at: outputURL)
-            }
-            curl.standardOutput = output
-            curl.standardError = FileHandle.nullDevice
-            let observer = cancellation?.observe { [weak curl] in
-                if let curl { HarborProbeProcessReaper.requestStop(curl) }
-            }
-            guard cancellation == nil || observer != nil else { return nil }
-            defer {
-                if let observer { cancellation?.removeObserver(observer) }
-            }
-            guard (try? curl.run()) != nil else { return nil }
-            if cancellation?.isCancelled == true {
-                HarborProbeProcessReaper.requestStop(curl)
-                return nil
-            }
-            let deadline = Date.now.addingTimeInterval(9)
-            while curl.isRunning && Date.now < deadline &&
-                    cancellation?.isCancelled != true {
-                try? await Task.sleep(for: .milliseconds(50))
-            }
-            let exitedOnTime = !curl.isRunning &&
-                cancellation?.isCancelled != true
-            if !exitedOnTime {
-                HarborProbeProcessReaper.requestStop(curl)
-                let grace = Date.now.addingTimeInterval(1.1)
-                while curl.isRunning && Date.now < grace {
-                    try? await Task.sleep(for: .milliseconds(50))
-                }
-            }
-            guard exitedOnTime, curl.terminationStatus == 0,
-                let data = try? Data(contentsOf: outputURL),
-                data.count < 4_096 else { return nil }
-            return data
-        }.value
+        guard !Task.isCancelled, cancellation?.isCancelled != true,
+              let lease = await HarborProbeBudget.requests.acquire(cancellation) else { return nil }
+        let output = try? await HarborProxyCommand.run(
+            URL(fileURLWithPath: "/usr/bin/curl"), arguments: [
+                "--disable", "--silent", "--fail", "--max-time", "7", "--max-filesize", "4096",
+                "--proxy", "socks5h://127.0.0.1:\(socksPort)", "--noproxy", "", "--url", url.absoluteString
+            ], timeout: 8, outputLimit: 4_096, cancelled: { cancellation?.isCancelled == true })
+        await HarborProbeBudget.requests.release(lease)
+        guard !Task.isCancelled, cancellation?.isCancelled != true, let output, output.status == 0 else { return nil }
+        return output.data
     }
 
     static func isPublic(_ ip: String) -> Bool {

@@ -25,10 +25,14 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 
 - [最新 DMG · GitHub 公共下载（无需登录）](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg)
 - [Gitee 发行版安装包（按版本选择附件）](https://gitee.com/yangxiaoyong01/CodexHarbor/releases)
-- [v0.1.34 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.34/Codex-Harbor-v0.1.34-arm64.dmg)
+- [v0.1.35 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.35/Codex-Harbor-v0.1.35-arm64.dmg)
 - Gitee 发布附件独立于 GitHub，需要单独上传和核验；以发行版页面显示的实际附件为准，未同步完成时请先从 GitHub 下载。
 
-可用 SHA-256 校验清单核验 v0.1.34 DMG 的完整性。[下载校验清单](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.34/SHA256SUMS)
+可用 SHA-256 校验清单核验 v0.1.35 DMG 的完整性。[下载校验清单](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.35/SHA256SUMS)
+
+**v0.1.35 更新**
+
+新增无订阅 Cloudflare WARP 一键连接原型，安装后可直接选择内置 WARP，无需导入订阅节点。复用独立 WARP/MASQUE 注册与 Mihomo，只有真实 WARP 标记和非 Cloudflare HTTPS 检测同时通过后才接管 macOS 系统代理，并显示出口 IP 或失败原因。此原型不保证中国大陆网络、出口国家或特定网站的可用性，需按实际运营商网络测试。
 
 **v0.1.34 更新**
 

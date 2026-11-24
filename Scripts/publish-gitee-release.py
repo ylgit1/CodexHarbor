@@ -113,7 +113,8 @@ def upload_attachment(release_id: int, asset: Path, token: str, attempt: int = 0
     # without the upstream accepting the body. Disable it explicitly. The
     # hosted runner uploaded faster over HTTP/1.1 than HTTP/2.
     protocol = "--http1.1" if attempt == 0 else "--http2"
-    upload_timeout = 2400
+    # Allow a full upload even when cross-border bandwidth is below 15 KB/s.
+    upload_timeout = 5400
     try:
         result = subprocess.run(
             [

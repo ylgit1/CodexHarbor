@@ -42,10 +42,18 @@ jobs:
             exit 2
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
-      - name: Build Apple Silicon app and verify signature
+      - name: Validate exact release source
+        shell: bash
         run: |
-          ./Scripts/build-app.sh fast --no-install
-          codesign --verify --deep --strict 'dist/Codex Harbor.app'
+          set -euo pipefail
+          git diff --check HEAD^ HEAD
+          /bin/zsh -n Scripts/build-app.sh
+          /bin/zsh -n Scripts/create-dmg.sh
+          /bin/zsh -n Scripts/verify-dmg.sh
+          plutil -lint Resources/Info.plist
+          swift test --parallel --jobs "$CODEX_HARBOR_BUILD_JOBS"
+      - name: Build and sign Apple Silicon app once
+        run: ./Scripts/build-app.sh fast --no-install
       - name: Create versioned installer and verify mounted copy
         shell: bash
         run: |

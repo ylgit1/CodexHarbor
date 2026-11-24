@@ -25,10 +25,14 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 
 - [最新 DMG · GitHub 公共下载（无需登录）](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg)
 - [Gitee 发行版安装包（按版本选择附件）](https://gitee.com/yangxiaoyong01/CodexHarbor/releases)
-- [v0.1.36 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.36/Codex-Harbor-v0.1.36-arm64.dmg)
+- [v0.1.37 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.37/Codex-Harbor-v0.1.37-arm64.dmg)
 - Gitee 发布附件独立于 GitHub，需要单独上传和核验；以发行版页面显示的实际附件为准，未同步完成时请先从 GitHub 下载。
 
-可用 SHA-256 校验清单核验 v0.1.36 DMG 的完整性。[下载校验清单](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.36/SHA256SUMS)
+可用 SHA-256 校验清单核验 v0.1.37 DMG 的完整性。[下载校验清单](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.37/SHA256SUMS)
+
+**v0.1.37 更新**
+
+修复 VPN Gate 家宽自动筛选回归：恢复独立 WARP 优先验证、SOCKS 入口排序和多轮重试，改进分类及测速时间预算，并保留历史测速、取消和连接回退保护。普通 CI 不再重复生成 Release 安装包；正式发布统一测试、编译、签名、生成并验证 DMG，再分发同一份安装包至 GitHub/Gitee。DMG 默认压缩级别调整为 6，并对磁盘映像资源暂忙进行有限重试。
 
 **v0.1.36 更新**
 

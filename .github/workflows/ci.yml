@@ -3,35 +3,54 @@ name: CodexHarbor CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: codex-harbor-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   macos-validation:
+    # The release workflow tests the exact versioned commit before publishing.
+    # Do not compile or package it a second time in ordinary CI.
+    if: >-
+      github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'release: v')
     runs-on: macos-15
-    timeout-minutes: 35
+    timeout-minutes: 25
+    env:
+      CODEX_HARBOR_BUILD_JOBS: '4'
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
-      - name: Toolchain
-        run: swift --version
-      - name: Unit and integration tests
-        run: swift test --parallel
-      - name: Release build and package verification
+          fetch-depth: 2
+      - name: Check source changes and packaging scripts
+        shell: bash
         env:
-          CODEX_HARBOR_BUILD_JOBS: "4"
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
-          ./Scripts/build-app.sh fast --no-install
-          codesign --verify --deep --strict "dist/Codex Harbor.app"
-          plutil -lint "dist/Codex Harbor.app/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "dist/Codex Harbor.app/Contents/Info.plist"
-      - name: DMG distribution verification
-        run: |
-          ./Scripts/create-dmg.sh
-          ./Scripts/verify-dmg.sh "$(./Scripts/create-dmg.sh --print-path)"
-      - name: Check formatting errors
-        run: git diff --check
+          set -euo pipefail
+          base="${BEFORE_SHA:-}"
+          if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
+            base=$(git rev-parse HEAD^ 2>/dev/null || true)
+          fi
+          if [[ -n "$base" ]]; then
+            if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+              git fetch --no-tags --depth=1 origin "$base"
+            fi
+            git diff --check "$base" HEAD
+          fi
+          /bin/zsh -n Scripts/build-app.sh
+          /bin/zsh -n Scripts/create-dmg.sh
+          /bin/zsh -n Scripts/verify-dmg.sh
+          plutil -lint Resources/Info.plist
+      - name: Unit and integration tests
+        run: swift test --parallel --jobs "$CODEX_HARBOR_BUILD_JOBS"
+      - name: Check application and helper compilation (incremental debug)
+        run: swift build --jobs "$CODEX_HARBOR_BUILD_JOBS"

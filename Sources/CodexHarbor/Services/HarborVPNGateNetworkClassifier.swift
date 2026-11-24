@@ -22,7 +22,7 @@ enum HarborVPNGateNetworkClassifier {
     static func classify(_ nodes: [HarborProxyNode],
                          cached: [String: HarborProxyNetworkEvidence],
                          proxyPort: Int?, cancellation: HarborLatencyCancellation) async -> [String: HarborProxyNetworkEvidence] {
-        let fresh = cached.filter { Date.now.timeIntervalSince($0.value.checkedAt) < 24 * 60 * 60 }
+        let fresh = cached.filter { $0.value.isFresh() }
         let ips = HarborVPNGate.unclassifiedVolunteerIPs(
             in: nodes, cached: Set(fresh.keys), limit: 48)
         guard !ips.isEmpty else { return [:] }

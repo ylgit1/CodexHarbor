@@ -17,7 +17,15 @@ install_app=true
 if [[ "${2:-}" == "--no-install" ]]; then
   install_app=false
 fi
-jobs="${CODEX_HARBOR_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+# Avoid overloading smaller Macs; keep an explicit override for CI.
+cpu_count="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+memory_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 8589934592)"
+job_cap=4
+if (( memory_bytes >= 17179869184 )); then job_cap=6
+elif (( memory_bytes < 8589934592 )); then job_cap=2
+fi
+default_jobs=$((cpu_count < job_cap ? cpu_count : job_cap))
+jobs="${CODEX_HARBOR_BUILD_JOBS:-$default_jobs}"
 
 acquire_build_lock() {
   # A fresh checkout has no .build parent directory. Create it before locking.

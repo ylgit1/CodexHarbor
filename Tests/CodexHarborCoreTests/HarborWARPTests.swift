@@ -42,6 +42,19 @@ struct HarborWARPTests {
             network: "tcp", security: "vpngate-unverified", path: "JP")
     }
 
+    @Test("WARP discovery preserves preferred path and retries QUIC endpoints")
+    func discoveryRetries() {
+        let preferred = HarborWARPEndpoint(host: "162.159.198.1", transport: .h3)
+        let primary = HarborWARPEndpoint.candidates(preferred: preferred)
+        let attempts = HarborWARPEndpoint.discoveryAttempts(preferred: preferred)
+        #expect(attempts.first == preferred)
+        #expect(Array(attempts.prefix(primary.count)) == primary)
+        for endpoint in primary {
+            #expect(attempts.filter { $0 == endpoint }.count == (endpoint.transport == .h3 ? 3 : 1))
+        }
+        #expect(HarborWARPEndpoint.discoveryDeadlineSeconds >= 120)
+    }
+
     @Test("A fresh machine has a stable subscription-free WARP node")
     func builtInNode() {
         let node = HarborIndependentWARP.node

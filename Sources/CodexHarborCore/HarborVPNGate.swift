@@ -137,7 +137,8 @@ public enum HarborVPNGateProbePolicy {
     public static func select(nodes: [HarborProxyNode],
                               evidence: [String: HarborProxyNetworkEvidence],
                               results: [String: HarborProxyProbeResult],
-                              limit: Int, probeRouteID: String? = nil) -> [HarborProxyNode] {
+                              limit: Int, probeRouteID: String? = nil,
+                              acceptedSuccessfulIDs: Set<String>? = nil) -> [HarborProxyNode] {
         guard limit > 0 else { return [] }
         let ranked = nodes.enumerated().sorted { lhs, rhs in
             let left = classRank(lhs.element, evidence: evidence)
@@ -147,6 +148,20 @@ public enum HarborVPNGateProbePolicy {
         // A change from direct to a working SOCKS underlay is a new test path.
         // Previously failed nodes must receive another chance, not retain their
         // old red verdict or inherit their previous failure counter.
+        // The manager knows all currently valid routes and the network epoch.
+        // Rotate attempts across failed routes; do not keep selecting the
+        // first page merely because its last failure used a fallback path.
+        if let acceptedSuccessfulIDs {
+            let pending = ranked.filter { !acceptedSuccessfulIDs.contains($0.id) }
+            let untested = pending.filter { results[$0.id]?.realTested != true }
+            let retry = pending.enumerated().filter { _, node in results[node.id]?.realTested == true }
+                .sorted { lhs, rhs in
+                    let left = results[lhs.element.id]?.effectiveRealCheckedAt ?? .distantPast
+                    let right = results[rhs.element.id]?.effectiveRealCheckedAt ?? .distantPast
+                    return left == right ? lhs.offset < rhs.offset : left < right
+                }.map(\.element)
+            return Array((untested + retry).prefix(limit))
+        }
         let untested = ranked.filter { node in
             guard let result = results[node.id], result.realTested else { return true }
             if result.isUsable(on: "direct") { return false }

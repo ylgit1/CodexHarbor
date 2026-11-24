@@ -353,7 +353,8 @@ final class HarborProxyManager: ObservableObject {
     var selectedNode: HarborProxyNode? { nodes.first { $0.id == selectedID } }
     var activeNode: HarborProxyNode? { nodes.first { $0.id == activeNodeID } }
     private var workingVPNGateUnderlay: (nodeID: String, socksPort: Int, routeID: String)? {
-        guard running, healthy, let activeNode else { return nil }
+        guard running, healthy, let activeNode,
+              !HarborIndependentWARP.isBuiltIn(activeNode) else { return nil }
         let isOpenVPN = activeNode.protocolName == "openvpn"
         guard let port = isOpenVPN ? underlayPort : localPort,
               let nodeID = isOpenVPN ? vpnGateUnderlayNodeID : activeNodeID else { return nil }
@@ -1389,12 +1390,15 @@ final class HarborProxyManager: ObservableObject {
             ? HarborVPNGateProbePolicy.select(
                 nodes: eligible, evidence: nodeNetworkEvidence,
                 results: probeResults, limit: 24,
-                probeRouteID: vpnGateProbeRouteID)
+                probeRouteID: vpnGateProbeRouteID,
+                acceptedSuccessfulIDs: Set(eligible.compactMap { node in
+                    probeResults[node.id].map { isUsable($0, for: node) } == true ? node.id : nil
+                }))
             : Array(eligible.prefix(20))
         guard !candidates.isEmpty else { return }
         await testRealLatency(candidates.map(\.id))
         refreshExitLocations(for: candidates.compactMap { node in
-            probeResults[node.id]?.milliseconds != nil ? node.id : nil
+            probeResults[node.id].map { isUsable($0, for: node) } == true ? node.id : nil
         })
     }
 
@@ -1527,7 +1531,7 @@ final class HarborProxyManager: ObservableObject {
         vpnGateDownloadCancellation = cancellation
         defer { vpnGateDownloadCancellation = nil }
         var request = URLRequest(url: url)
-        request.timeoutInterval = 8
+        request.timeoutInterval = 20
 
         func fetch(httpPort: Int?) async throws -> [HarborProxyNode] {
             let text = try await fetchSubscriptionText(
@@ -1543,45 +1547,58 @@ final class HarborProxyManager: ObservableObject {
         }
 
         let activeProxyPort = running && healthy ? localPort : nil
-        let proxyPorts: [Int?] = activeProxyPort.map { [$0, nil] } ?? [nil]
         var candidates: [HarborProxyNode] = []
         var usedProxyPort: Int?
+        var source = "direct"
         var tunnel: HarborWARPTunnel?
-        detail = "正在获取 VPN Gate 志愿节点名单"
-        for port in proxyPorts {
-            guard !cancellation.isCancelled, !Task.isCancelled else { throw CancellationError() }
-            if let downloaded = try? await fetch(httpPort: port) {
-                candidates = downloaded
-                usedProxyPort = port
-                break
-            }
+        var lastFailure = "独立通道或节点来源暂时不可用"
+        detail = "正在准备独立通道获取 VPN Gate 名单"
+        do {
+            let independent = try await prepareIndependentVPNGateTunnel(cancellation: cancellation)
+            tunnel = independent
+            candidates = try await fetch(httpPort: independent.httpPort)
+            usedProxyPort = independent.httpPort
+            source = "warp"
+        } catch {
+            lastFailure = error.localizedDescription
+            await tunnel?.close()
+            tunnel = nil
         }
         if candidates.isEmpty {
-            guard !cancellation.isCancelled, !Task.isCancelled else { throw CancellationError() }
-            do {
-                let independent = try await prepareIndependentVPNGateTunnel(cancellation: cancellation)
-                tunnel = independent
-                candidates = try await fetch(httpPort: independent.httpPort)
-                usedProxyPort = independent.httpPort
-            } catch {
-                await tunnel?.close()
+            for port in activeProxyPort.map({ [Optional($0), nil] }) ?? [nil] {
                 guard !cancellation.isCancelled, !Task.isCancelled else { throw CancellationError() }
-                throw HarborProxyError.invalid("无法获取 VPN Gate 名单：" + error.localizedDescription)
+                do {
+                    candidates = try await fetch(httpPort: port)
+                    usedProxyPort = port
+                    source = port == nil ? "direct" : "underlay"
+                    break
+                } catch { lastFailure = error.localizedDescription }
             }
         }
-        let deadline = Task {
-            do { try await Task.sleep(for: .seconds(20)) } catch { return }
-            cancellation.cancel()
+        guard !candidates.isEmpty else {
+            await tunnel?.close()
+            throw HarborProxyError.invalid("无法获取 VPN Gate 名单：" + lastFailure)
         }
-        detail = "已获取 \(candidates.count) 个志愿候选，正在识别家宽入口"
+        detail = "已获取 \(candidates.count) 个志愿候选，正在预筛入口"
+        let ranked = await HarborVPNGatePortScanner.rank(
+            candidates, socksPort: usedProxyPort.map { $0 + 1 }, cancellation: cancellation)
+        detail = "正在识别家宽入口类型"
+        let classification = HarborLatencyCancellation()
+        let observer = cancellation.observe { classification.cancel() }
+        let deadline = Task {
+            do { try await Task.sleep(for: .seconds(120)) } catch { return }
+            classification.cancel()
+        }
         let evidence = await HarborVPNGateNetworkClassifier.classify(
-            candidates, cached: nodeNetworkEvidence, proxyPort: usedProxyPort, cancellation: cancellation)
+            ranked, cached: nodeNetworkEvidence, proxyPort: usedProxyPort, cancellation: classification)
         deadline.cancel()
+        if let observer { cancellation.removeObserver(observer) }
         await tunnel?.close()
         try Task.checkCancellation()
-        guard !shuttingDownConnection else { throw CancellationError() }
+        guard !cancellation.isCancelled, !shuttingDownConnection else { throw CancellationError() }
         nodeNetworkEvidence.merge(evidence) { _, latest in latest }
-        return candidates
+        proxyAudit("vpngate_catalog", note: "route=\(source) candidates=\(ranked.count) classified=\(evidence.count) partial=\(classification.isCancelled)")
+        return ranked
     }
 
     private var favoriteNodeIDs: Set<String> {
@@ -2378,8 +2395,13 @@ final class HarborProxyManager: ObservableObject {
         let cancellation = HarborLatencyCancellation()
         latencyCancellation = cancellation
         latencySummary = "正在准备测试 \(targets.count) 个连接配置"
+        let relayCount = targets.filter { $0.protocolName == "openvpn" }.count
+        let relayParallelism = HarborProxyLatencyPolicy.openVPNParallelCount(
+            processors: ProcessInfo.processInfo.activeProcessorCount, physicalMemory: ProcessInfo.processInfo.physicalMemory)
+        let budget = relayCount == 0 ? HarborProxyLatencyPolicy.batchDeadlineSeconds
+            : HarborProxyLatencyPolicy.vpnGateBatchDeadlineSeconds(nodeCount: relayCount, parallelCount: relayParallelism)
         let timer = Task {
-            do { try await Task.sleep(for: .seconds(HarborProxyLatencyPolicy.batchDeadlineSeconds)) } catch { return }
+            do { try await Task.sleep(for: .seconds(budget)) } catch { return }
             if latencyCancellation === cancellation {
                 latencyStopping = true
                 latencySummary = "已到本轮时间上限，正在结束剩余测试"
@@ -2443,63 +2465,88 @@ final class HarborProxyManager: ObservableObject {
         }
 
         if !relays.isEmpty, !cancellation.isCancelled, !Task.isCancelled {
-            let count = HarborProxyLatencyPolicy.openVPNParallelCount(
-                processors: ProcessInfo.processInfo.activeProcessorCount, physicalMemory: ProcessInfo.processInfo.physicalMemory)
-            latencySummary = "正在用本机网络验证 VPN Gate 节点"
-            let tcp = Array(relays.filter { $0.network == "tcp" }.prefix(24))
-            let reachable = await HarborVPNGatePortScanner.reachableIDs(tcp, cancellation: cancellation)
-            let rejected = Set(tcp.map(\.id)).subtracting(reachable)
+            let count = relayParallelism
+            var pending = Set(relays.map(\.id))
             var failures: [String: (HarborNodeDelayReport, String)] = [:]
-            await runLatencyPass(relays, limit: count, cancellation: cancellation) { node in
-                if rejected.contains(node.id) { return .failed("直连入口 TCP 检查未通过") }
-                return await HarborMihomoLatencyTester.measure(node: node, root: root,
-                                                               cancellation: cancellation, seconds: 12)
-            } finish: { node, report in
-                if report.milliseconds != nil { save(node, report, routeID: "direct") }
-                else { failures[node.id] = (report, "direct") }
+            var warpPrepared = false
+            latencySummary = "正在准备 VPN Gate 独立筛选通道"
+            do {
+                let tunnel = try await prepareIndependentVPNGateTunnel(cancellation: cancellation)
+                let profile = tunnel.profile
+                let ranked = await HarborVPNGatePortScanner.rank(
+                    relays, socksPort: tunnel.socksPort, cancellation: cancellation)
+                await tunnel.close()
+                warpPrepared = true
+                latencySummary = "正在通过独立通道验证 VPN Gate 家宽候选"
+                await runLatencyPass(ranked, limit: count, cancellation: cancellation) { node in
+                    await HarborMihomoLatencyTester.measure(node: node, root: root,
+                        cancellation: cancellation, warpProfile: profile)
+                } finish: { node, report in
+                    if report.milliseconds != nil {
+                        pending.remove(node.id)
+                        save(node, report, routeID: profile.routeID, endpoint: profile.endpoint)
+                    } else { failures[node.id] = (report, profile.routeID) }
+                }
+                proxyAudit("vpngate_warp_pass", note: "total=\(relays.count) passed=\(relays.count - pending.count)")
+            } catch {
+                proxyAudit("vpngate_warp_unavailable", note: "cancelled=\(cancellation.isCancelled)")
             }
 
-            if let underlay = workingVPNGateUnderlay, !failures.isEmpty, !cancellation.isCancelled,
+            if let underlay = workingVPNGateUnderlay, !pending.isEmpty, !cancellation.isCancelled,
                await HarborMihomoLatencyTester.underlayReady(socksPort: underlay.socksPort, cancellation: cancellation),
                workingVPNGateUnderlay?.routeID == underlay.routeID {
                 latencySummary = "正在通过当前代理复测 VPN Gate"
-                let retry = relays.filter { failures[$0.id] != nil }
+                let retry = relays.filter { pending.contains($0.id) }
                 await runLatencyPass(retry, limit: count, cancellation: cancellation) { node in
                     await HarborMihomoLatencyTester.measure(node: node, root: root, cancellation: cancellation,
-                                                           underlaySocksPort: underlay.socksPort, seconds: 18)
+                                                           underlaySocksPort: underlay.socksPort, seconds: 28)
                 } finish: { node, report in
                     if report.milliseconds != nil {
-                        failures.removeValue(forKey: node.id)
+                        pending.remove(node.id)
                         save(node, report, routeID: underlay.routeID)
-                    } else { failures[node.id] = (report, underlay.routeID) }
+                    } else if failures[node.id] == nil { failures[node.id] = (report, underlay.routeID) }
                 }
             }
 
-            if !failures.isEmpty, !cancellation.isCancelled, !Task.isCancelled {
-                let retry = relays.filter { failures[$0.id] != nil }
-                latencySummary = "正在准备 VPN Gate 的独立复测通道"
-                do {
-                    let tunnel = try await prepareIndependentVPNGateTunnel(cancellation: cancellation)
-                    let profile = tunnel.profile
-                    await tunnel.close()
-                    latencySummary = "正在通过独立通道复测 VPN Gate"
-                    await runLatencyPass(retry, limit: count, cancellation: cancellation) { node in
-                        await HarborMihomoLatencyTester.measure(node: node, root: root,
-                                                               cancellation: cancellation, warpProfile: profile)
-                    } finish: { node, report in
-                        failures.removeValue(forKey: node.id)
-                        save(node, report, routeID: profile.routeID, endpoint: profile.endpoint)
-                    }
-                } catch {
-                    if !cancellation.isCancelled && !Task.isCancelled {
-                        for node in retry {
-                            if let (report, routeID) = failures[node.id] {
-                                save(node, .failed((report.failure ?? "节点验证失败") + "；独立通道不可用"), routeID: routeID)
-                            }
-                        }
-                    }
+            if !pending.isEmpty, !cancellation.isCancelled, !Task.isCancelled {
+                latencySummary = "正在用本机网络复测剩余 VPN Gate 节点"
+                let retry = relays.filter { pending.contains($0.id) }
+                let ranked = await HarborVPNGatePortScanner.rank(retry, socksPort: nil, cancellation: cancellation)
+                // TCP preflight ranks candidates only. It is not evidence of
+                // an OpenVPN failure and cannot exclude a real HTTPS test.
+                await runLatencyPass(ranked, limit: count, cancellation: cancellation) { node in
+                    await HarborMihomoLatencyTester.measure(node: node, root: root,
+                                                           cancellation: cancellation, seconds: 12)
+                } finish: { node, report in
+                    if report.milliseconds != nil {
+                        pending.remove(node.id)
+                        save(node, report, routeID: "direct")
+                    } else if failures[node.id] == nil { failures[node.id] = (report, "direct") }
                 }
             }
+            if !cancellation.isCancelled, !Task.isCancelled {
+                for node in relays where pending.contains(node.id) {
+                    guard let (report, routeID) = failures[node.id] else { continue }
+                    let reason = (report.failure ?? "节点验证失败") +
+                        (warpPrepared ? "" : "；独立通道暂不可用")
+                    // Failure of an alternative path does not disprove a
+                    // previously verified WARP route when WARP itself is down.
+                    if !warpPrepared, var previous = probeResults[node.id],
+                       previous.succeeded, previous.probeRouteID?.hasPrefix("warp:") == true {
+                        // Retain the historical latency, but make it ineligible
+                        // as a currently verified success until WARP is retested.
+                        previous.realTested = false
+                        previous.realFailureReason = reason
+                        previous.consecutiveRealFailures = 0
+                        probeResults[node.id] = previous
+                        latencyCompleted += 1
+                        lastFailure = reason
+                        continue
+                    }
+                    save(node, .failed(reason), routeID: routeID)
+                }
+            }
+            proxyAudit("vpngate_probe_summary", note: "total=\(relays.count) remaining=\(pending.count) completed=\(latencyCompleted) cancelled=\(cancellation.isCancelled)")
         }
 
         if let finalization, !cancellation.isCancelled, !Task.isCancelled, latencyCompleted == latencyTotal {

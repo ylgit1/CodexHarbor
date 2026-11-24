@@ -25,10 +25,14 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 
 - [最新 DMG · GitHub 公共下载（无需登录）](https://raw.githubusercontent.com/ylgit1/CodexHarbor/release-assets/latest/Codex-Harbor-arm64.dmg)
 - [Gitee 发行版安装包（按版本选择附件）](https://gitee.com/yangxiaoyong01/CodexHarbor/releases)
-- [v0.1.37 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.37/Codex-Harbor-v0.1.37-arm64.dmg)
+- [v0.1.38 固定版本 · GitHub](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.38/Codex-Harbor-v0.1.38-arm64.dmg)
 - Gitee 发布附件独立于 GitHub，需要单独上传和核验；以发行版页面显示的实际附件为准，未同步完成时请先从 GitHub 下载。
 
-可用 SHA-256 校验清单核验 v0.1.37 DMG 的完整性。[下载校验清单](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.37/SHA256SUMS)
+可用 SHA-256 校验清单核验 v0.1.38 DMG 的完整性。[下载校验清单](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.38/SHA256SUMS)
+
+**v0.1.38 更新**
+
+修复 VPN Gate 切换时非阻塞本地端口检测误判；使用有界双端口启动等待，切换前验证独立底座，减少测速资源竞争，改进回退状态和脱敏启动诊断。保留原有端口、真实 HTTPS 验证和系统代理恢复保护。
 
 **v0.1.37 更新**
 

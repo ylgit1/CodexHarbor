@@ -63,6 +63,15 @@ public struct HarborWARPEndpoint: Codable, Equatable, Hashable, Sendable {
         return values.filter { $0.isValid && seen.insert($0).inserted }
     }
 
+    /// Preserve the cached path and retry QUIC paths after the first sweep.
+    public static func discoveryAttempts(preferred: Self? = nil) -> [Self] {
+        let primary = candidates(preferred: preferred)
+        let quic = primary.filter { $0.transport == .h3 }
+        return primary + quic + quic
+    }
+
+    public static let discoveryDeadlineSeconds = 150
+
     public var isValid: Bool {
         guard [443, 4443, 8443, 500, 1701, 4500, 8095].contains(port),
               let ip = HarborIPAddress.normalizedLiteral(host) else { return false }

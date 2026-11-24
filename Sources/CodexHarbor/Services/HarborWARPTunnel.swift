@@ -52,11 +52,9 @@ final class HarborWARPTunnel: @unchecked Sendable {
     static func prepare(account: HarborWARPAccount, preferred: HarborWARPEndpoint?,
                         root: URL, cancellation: HarborLatencyCancellation) async throws -> HarborWARPTunnel {
         try account.validate()
-        let primary = HarborWARPEndpoint.candidates(preferred: preferred)
-        // A lost QUIC handshake is common on filtered networks. Give each
-        // QUIC path three bounded chances without enrolling another identity.
-        let endpoints = primary
-        let deadline = ContinuousClock.now + .seconds(32)
+        let endpoints = HarborWARPEndpoint.discoveryAttempts(preferred: preferred)
+        // Keep the bounded resource pool, but allow the original retry sweep.
+        let deadline = ContinuousClock.now + .seconds(HarborWARPEndpoint.discoveryDeadlineSeconds)
         let attempts = HarborLatencyCancellation()
         let observer = cancellation.observe { attempts.cancel() }
         defer { if let observer { cancellation.removeObserver(observer) } }

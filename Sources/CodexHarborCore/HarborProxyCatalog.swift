@@ -58,6 +58,16 @@ public enum HarborProxyLatencyPolicy {
     public static let temporaryEngineLimit = 4
     public static let probeRequestLimit = 12
     public static let batchDeadlineSeconds = 300
+
+    /// Reserve time for WARP discovery and every relay verification wave,
+    /// including alternative routes. Large manual sweeps remain cancellable.
+    public static func vpnGateBatchDeadlineSeconds(nodeCount: Int, parallelCount: Int) -> Int {
+        let concurrency = max(1, min(temporaryEngineLimit, parallelCount))
+        let boundedCount = min(96, max(0, nodeCount))
+        let waves = (boundedCount + concurrency - 1) / concurrency
+        return min(1_200, max(batchDeadlineSeconds,
+                            HarborWARPEndpoint.discoveryDeadlineSeconds + 45 + waves * 90))
+    }
     public static let standaloneParallelCount = 2
     // v2rayN ConnectionHandler.GetRealPingTime uses Global.LocalFetch (5s)
     // for two requests to the configured SpeedPingTestUrl.

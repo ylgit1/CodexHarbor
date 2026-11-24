@@ -678,6 +678,41 @@ struct HarborNetworkProxyTests {
         #expect(decoded.probeRouteID == nil)
     }
 
+    @Test("VPN Gate skips accepted WARP successes and rechecks stale or invalid routes fairly")
+    func vpnGateAcceptedRouteRotation() {
+        let nodes = (0..<6).map { index in
+            HarborProxyNode(id: "route-\(index)", name: "Relay \(index)",
+                            protocolName: "openvpn", host: "93.184.216.\(index + 1)",
+                            port: 443, credential: "profile", subscriptionID: "gate")
+        }
+        let now = Date.now
+        let results = [
+            nodes[0].id: HarborProxyProbeResult(milliseconds: 100, checkedAt: now, realTested: true,
+                                                probeRouteID: "warp:accepted"),
+            nodes[1].id: HarborProxyProbeResult(milliseconds: nil, checkedAt: now, realTested: true,
+                                                probeRouteID: "direct"),
+            nodes[2].id: HarborProxyProbeResult(milliseconds: nil, checkedAt: now.addingTimeInterval(-60),
+                                                realTested: true, probeRouteID: "warp:old"),
+            nodes[3].id: HarborProxyProbeResult(milliseconds: 200, checkedAt: now.addingTimeInterval(-120),
+                                                realTested: true, probeRouteID: "underlay:old"),
+            nodes[4].id: HarborProxyProbeResult(milliseconds: 90, checkedAt: now, realTested: true,
+                                                probeRouteID: "direct")
+        ]
+        let picked = HarborVPNGateProbePolicy.select(
+            nodes: nodes, evidence: [:], results: results, limit: 4,
+            probeRouteID: "direct", acceptedSuccessfulIDs: [nodes[0].id, nodes[4].id])
+        #expect(picked.map(\.id) == [nodes[5].id, nodes[3].id, nodes[2].id, nodes[1].id])
+    }
+
+    @Test("VPN Gate deadline includes discovery and multiple bounded route waves")
+    func vpnGateDeadline() {
+        let fast = HarborProxyLatencyPolicy.vpnGateBatchDeadlineSeconds(nodeCount: 24, parallelCount: 4)
+        let slow = HarborProxyLatencyPolicy.vpnGateBatchDeadlineSeconds(nodeCount: 24, parallelCount: 2)
+        #expect(fast >= HarborWARPEndpoint.discoveryDeadlineSeconds + 6 * 28)
+        #expect(slow > fast)
+        #expect(HarborProxyLatencyPolicy.vpnGateBatchDeadlineSeconds(nodeCount: 10_000, parallelCount: 0) <= 1_200)
+    }
+
     @Test("VPN Gate rotates oldest failed candidates when the whole pool failed")
     func vpnGateFullyFailedRotation() {
         let nodes = (0..<30).map { index in

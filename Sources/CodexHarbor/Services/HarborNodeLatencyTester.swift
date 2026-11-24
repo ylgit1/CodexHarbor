@@ -355,7 +355,7 @@ enum HarborNodeLatencyTester {
 enum HarborMihomoLatencyTester {
     static func checkActiveSOCKS(port: Int, cancellation: HarborLatencyCancellation? = nil) async -> Bool {
         await warmupAndMeasure(socksPort: port, cancellation: cancellation ?? HarborLatencyCancellation(),
-                               diagnostics: nil, seconds: 12).milliseconds != nil
+                               diagnostics: nil, seconds: 28).milliseconds != nil
     }
 
     static func underlayReady(socksPort: Int, cancellation: HarborLatencyCancellation) async -> Bool {

@@ -479,7 +479,8 @@ final class HarborProxyManager: ObservableObject {
 
     /// A second isolated Xray carries the VPN relay after the former active
     /// listener is stopped. It does not change macOS proxy settings.
-    private func startUnderlay(_ node: HarborProxyNode) async throws {
+    private func startUnderlay(_ node: HarborProxyNode,
+                               cancellation: HarborLatencyCancellation?) async throws {
         guard let port = HarborNodeLatencyTester.reservePortPair() else {
             throw HarborProxyError.invalid("底座代理本地端口不可用")
         }
@@ -501,12 +502,12 @@ final class HarborProxyManager: ObservableObject {
             underlayChild = engine
             underlayConfigPath = file
             underlayPort = port
-            var ready = false
-            for _ in 0..<25 where engine.isRunning {
-                if portListening(port) && portListening(port + 1) { ready = true; break }
-                try? await Task.sleep(for: .milliseconds(150))
+            guard await HarborNodeLatencyTester.awaitListeningPair(
+                port: port, process: engine, cancellation: cancellation) else {
+                proxyAudit("underlay_listener_failed", nodeID: node.id,
+                           note: "alive=\(engine.isRunning)")
+                throw HarborProxyError.invalid("底座代理未能建立 HTTP/SOCKS5 监听")
             }
-            guard ready else { throw HarborProxyError.invalid("底座代理无法启动，请先检查普通节点") }
         } catch {
             if let process, !(await HarborProxyCommand.stop(process)) { throw error }
             underlayChild = nil
@@ -1823,11 +1824,22 @@ final class HarborProxyManager: ObservableObject {
             return
         }
         let policy = await RoutingPolicy.read(ruleMode: routingRules, forcedDomains: forcedProxyDomains)
+        // Pause bulk probing before preflight so activation does not compete
+        // with multiple temporary engines for CPU and connection slots.
+        if latencyTesting { cancelLatencyTests() }
         let route: VPNGateRoute
         do {
             route = try await validateConnection(requestedNode, policy: policy, cancellation: cancellation)
+            let routeKind: String
+            switch route {
+            case .direct: routeKind = "direct"
+            case .underlay: routeKind = "underlay"
+            case .warp: routeKind = "warp"
+            }
+            proxyAudit("switch_preflight_passed", nodeID: id, note: "route=\(routeKind)")
         } catch {
             guard !cancellation.isCancelled, !shuttingDownConnection, !Task.isCancelled else { return }
+            proxyAudit("switch_preflight_failed", nodeID: id, note: "code=\((error as NSError).code)")
             detail = (wasRunning ? "新节点验证失败，原连接保持不变：" : "节点验证失败：") + error.localizedDescription
             return
         }
@@ -1886,8 +1898,13 @@ final class HarborProxyManager: ObservableObject {
                     if wasManaged {
                         await applySystemProxy(interactive: false, policy: rollbackPolicy, reconfigure: true)
                     }
-                    proxyAudit("rollback_restored", nodeID: previousID)
-                    detail = "新节点连接失败：\(failure)；已恢复原连接"
+                    if !wasManaged || (systemManaged && HarborSystemProxy.isOwned()) {
+                        proxyAudit("rollback_restored", nodeID: previousID)
+                        detail = "新节点连接失败：\(failure)；已恢复原连接"
+                    } else {
+                        proxyAudit("rollback_system_proxy_failed", nodeID: previousID)
+                        detail = "新节点连接失败：\(failure)；原本地代理已恢复，但系统代理未恢复：" + detail
+                    }
                 } else {
                     proxyAudit("rollback_failed", nodeID: previousID)
                     detail = "新节点连接失败：\(failure)；原连接恢复失败：" + detail
@@ -1942,8 +1959,8 @@ final class HarborProxyManager: ObservableObject {
             nodes.contains(where: { $0.id == item.nodeID }) ? item : nil
         }
         if let underlay, previous == underlay.routeID {
-            if (try? await validateCandidate(node, policy: policy, underlayPort: underlay.socksPort - 1,
-                                             cancellation: cancellation)) != nil {
+            if (try? await validateCandidateThroughUnderlay(
+                node, baseID: underlay.nodeID, policy: policy, cancellation: cancellation)) != nil {
                 return .underlay(underlay.nodeID)
             }
         }
@@ -1956,8 +1973,8 @@ final class HarborProxyManager: ObservableObject {
         }
         guard !cancellation.isCancelled, !Task.isCancelled else { throw CancellationError() }
         if let underlay, previous != underlay.routeID,
-           (try? await validateCandidate(node, policy: policy, underlayPort: underlay.socksPort - 1,
-                                         cancellation: cancellation)) != nil {
+           (try? await validateCandidateThroughUnderlay(
+               node, baseID: underlay.nodeID, policy: policy, cancellation: cancellation)) != nil {
             return .underlay(underlay.nodeID)
         }
         let tunnel = try await prepareIndependentVPNGateTunnel(
@@ -1966,6 +1983,52 @@ final class HarborProxyManager: ObservableObject {
         await tunnel.close()
         try await validateCandidate(node, policy: policy, warp: profile, cancellation: cancellation)
         return .warp(profile)
+    }
+
+    /// Match the actual runtime topology: an independent Xray base with all
+    /// traffic routed through its outbound, followed by the candidate relay.
+    /// Do not stop the working system listener to discover a base startup error.
+    private func validateCandidateThroughUnderlay(
+        _ node: HarborProxyNode, baseID: String, policy: RoutingPolicy,
+        cancellation: HarborLatencyCancellation
+    ) async throws {
+        guard let base = nodes.first(where: {
+            $0.id == baseID && $0.protocolName != "openvpn" && !HarborIndependentWARP.isBuiltIn($0)
+        }) else { throw HarborProxyError.invalid("底座订阅节点不可用") }
+        guard let lease = await HarborProbeBudget.engines.acquire(cancellation) else { throw CancellationError() }
+        guard let port = HarborNodeLatencyTester.reservePortPair() else {
+            await HarborProbeBudget.engines.release(lease)
+            throw HarborProxyError.invalid("底座验证端口不可用")
+        }
+        let file = root.appendingPathComponent("probe-underlay-\(UUID().uuidString).json")
+        let engine = Process()
+        var failure: (any Error)?
+        do {
+            let config = try HarborXrayConfig.make(
+                node: base, httpPort: port, ruleMode: false, routeAllViaProxy: true)
+            try HarborProbeFiles.write(config, to: file)
+            engine.executableURL = root.appendingPathComponent("xray")
+            engine.currentDirectoryURL = root
+            engine.arguments = ["run", "-config", file.path]
+            engine.standardInput = FileHandle.nullDevice
+            engine.standardOutput = FileHandle.nullDevice
+            engine.standardError = FileHandle.nullDevice
+            guard !cancellation.isCancelled, !Task.isCancelled else { throw CancellationError() }
+            try engine.run()
+            HarborProbeFiles.record(engine, config: file)
+            guard await HarborNodeLatencyTester.awaitListeningPair(
+                port: port, process: engine, cancellation: cancellation) else {
+                throw HarborProxyError.invalid("独立底座验证内核未能监听")
+            }
+            try await validateCandidate(node, policy: policy, underlayPort: port, cancellation: cancellation)
+        } catch { failure = error }
+        guard await HarborProxyCommand.stop(engine) else {
+            throw HarborProxyError.invalid("底座验证内核未退出，已保留清理记录")
+        }
+        HarborProbeFiles.remove(file)
+        HarborNodeLatencyTester.releasePortPair(port)
+        await HarborProbeBudget.engines.release(lease)
+        if let failure { throw failure }
     }
 
     private func validateCandidate(_ node: HarborProxyNode, policy: RoutingPolicy,
@@ -2004,10 +2067,8 @@ final class HarborProxyManager: ObservableObject {
             guard !cancellation.isCancelled, !Task.isCancelled else { throw CancellationError() }
             try engine.run()
             HarborProbeFiles.record(engine, config: file)
-            guard await HarborNodeLatencyTester.awaitListening(
-                port: port, process: engine, cancellation: cancellation),
-                await HarborNodeLatencyTester.awaitListening(
-                    port: port + 1, process: engine, cancellation: cancellation) else {
+            guard await HarborNodeLatencyTester.awaitListeningPair(
+                port: port, process: engine, cancellation: cancellation) else {
                 throw HarborProxyError.invalid("验证内核未能监听本地端口")
             }
             let reachable = openVPN
@@ -2111,9 +2172,10 @@ final class HarborProxyManager: ObservableObject {
         }
         busy = true; defer { busy = false }
         status = "正在连接"; detail = ""
+        var startupStage = "port"
         do {
             guard cancellation?.isCancelled != true, !shuttingDownConnection else { throw CancellationError() }
-            let port = try choosePort(requestedPort ?? configuredHTTPPort)
+            let port = try await choosePort(requestedPort ?? configuredHTTPPort, cancellation: cancellation)
             let isOpenVPN = node.protocolName == "openvpn"
             let isStandaloneWARP = HarborIndependentWARP.isBuiltIn(node)
             let underlayNodeID: String?
@@ -2125,14 +2187,16 @@ final class HarborProxyManager: ObservableObject {
                 activeWARPProfile = nil
             }
             if let underlayNodeID {
+                startupStage = "underlay"
                 guard coreInstalled,
                       let base = nodes.first(where: {
                           $0.id == underlayNodeID && $0.protocolName != "openvpn"
                       }) else {
                     throw HarborProxyError.invalid("住宅节点的底座订阅节点已不存在")
                 }
-                try await startUnderlay(base)
+                try await startUnderlay(base, cancellation: cancellation)
             }
+            startupStage = "configuration"
             let config: Data
             if isStandaloneWARP {
                 guard let profile = activeWARPProfile else {
@@ -2164,8 +2228,10 @@ final class HarborProxyManager: ObservableObject {
                     await self?.handleUnexpectedXrayExit(pid: pid)
                 }
             }
+            startupStage = "launch"
             try process.run()
             child = process; localPort = port
+            startupStage = "record"
             let record = HarborProxyProcessRecord(
                 pid: process.processIdentifier, configPath: file.path,
                 executablePath: process.executableURL?.path ?? "",
@@ -2173,25 +2239,20 @@ final class HarborProxyManager: ObservableObject {
                 warpEndpoint: activeWARPProfile?.endpoint
             )
             try HarborProbeFiles.replace(JSONEncoder().encode(record), at: runtimeRecordURL)
-            var ready = false
-            for _ in 0..<25 {
-                guard process.isRunning, cancellation?.isCancelled != true,
-                      !shuttingDownConnection else { break }
-                if portListening(port) && portListening(port + 1) { ready = true; break }
-                try? await Task.sleep(for: .milliseconds(150))
-            }
+            startupStage = "listener"
+            let ready = await HarborNodeLatencyTester.awaitListeningPair(
+                port: port, process: process, cancellation: cancellation) && !shuttingDownConnection
             // Opening the two local listeners is the startup condition.
             // External HTTPS probes can take 4s × 3 on a slow/blocked node;
             // they must not hold up the UI or serialize every node switch.
             guard HarborProxyStartupPolicy.canPublishListenerReady(
                 xrayRunning: process.isRunning, portsListening: ready
             ) else {
-                _ = await stopCore()
                 throw HarborProxyError.invalid("代理内核未能监听本地 HTTP/SOCKS5 端口，请检查端口或节点配置")
             }
+            startupStage = "identity"
             guard runningConfigMatches(node.id, path: file) else {
                 proxyAudit("runtime_config_mismatch", nodeID: node.id)
-                _ = await stopCore()
                 throw HarborProxyError.invalid("运行配置与目标节点不一致，未将切换标记为成功")
             }
             // Commit UI identity only after the listener belongs to the new
@@ -2212,9 +2273,16 @@ final class HarborProxyManager: ObservableObject {
             await finishHealthCheck(port: port, generation: generation, systemProxyInteractive: false,
                                     publishConnection: false, cancellation: cancellation)
         } catch {
-            _ = await stopCore()
+            // Record the failing stage before stopCore clears the process and
+            // port. Only fixed labels and numeric exit/error codes are logged.
+            let processState = child.map { process in
+                process.isRunning ? "running" : "exit_\(process.terminationStatus)"
+            } ?? "not_started"
+            proxyAudit("startup_failed", nodeID: node.id,
+                       note: "stage=\(startupStage) process=\(processState) code=\((error as NSError).code)")
+            let cleaned = await stopCore()
             status = "连接失败"
-            detail = error.localizedDescription
+            detail = error.localizedDescription + (cleaned ? "" : "；内核清理未完成")
         }
     }
 
@@ -3389,8 +3457,17 @@ final class HarborProxyManager: ObservableObject {
         try? FileManager.default.removeItem(at: runtimeRecordURL)
     }
 
-    private func choosePort(_ requestedPort: Int) throws -> Int {
+    private func choosePort(_ requestedPort: Int,
+                            cancellation: HarborLatencyCancellation?) async throws -> Int {
         let port = try HarborProxyPortPolicy.validate(httpPort: requestedPort)
+        // A just-stopped engine can take a short time to release its listeners.
+        // Wait only when occupied; never choose a different port implicitly.
+        let deadline = ContinuousClock.now + .seconds(2)
+        while ContinuousClock.now < deadline {
+            guard cancellation?.isCancelled != true, !shuttingDownConnection else { throw CancellationError() }
+            if !portListening(port), !portListening(port + 1) { return port }
+            try await Task.sleep(for: .milliseconds(100))
+        }
         if portListening(port) {
             throw HarborProxyError.invalid("HTTP 端口 \(port) 被其他进程占用。请关闭占用程序，或在代理页面手动更改端口；不会自动切换端口。")
         }

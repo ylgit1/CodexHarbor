@@ -1,10 +1,51 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Testing
 @testable import CodexHarborCore
 
 @Suite("Network proxy failure and recovery")
 struct HarborProxyReliabilityTests {
+    @Test("Loopback readiness waits for asynchronous connects and rejects closed listeners")
+    func loopbackReadiness() throws {
+        let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        try #require(fd >= 0)
+        defer { Darwin.close(fd) }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr = in_addr(s_addr: in_addr_t(INADDR_LOOPBACK).bigEndian)
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, length)
+            }
+        }
+        try #require(bound == 0)
+        let named = withUnsafeMutablePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.getsockname(fd, $0, &length)
+            }
+        }
+        try #require(named == 0)
+        let port = Int(UInt16(bigEndian: address.sin_port))
+        #expect(!HarborLoopbackTCP.isListening(port))
+        try #require(Darwin.listen(fd, 128) == 0)
+        let flags = Darwin.fcntl(fd, F_GETFL)
+        try #require(flags >= 0)
+        try #require(Darwin.fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0)
+        for _ in 0..<50 {
+            let connected = HarborLoopbackTCP.isListening(port)
+            #expect(connected)
+            let client = Darwin.accept(fd, nil, nil)
+            if client >= 0 { Darwin.close(client) }
+        }
+        #expect(!HarborLoopbackTCP.isListening(0))
+        #expect(!HarborLoopbackTCP.isListening(65_536))
+        #expect(HarborProxyLatencyPolicy.runtimeListenerStartupTimeoutMilliseconds >
+                HarborProxyLatencyPolicy.listenerStartupTimeoutMilliseconds)
+    }
+
     @Test("Child commands bound output, waiting time, and cancellation")
     func childProcessLimits() async throws {
         let yes = URL(fileURLWithPath: "/usr/bin/yes")

@@ -321,11 +321,23 @@ enum HarborNodeLatencyTester {
         return false
     }
 
-    static func canConnect(_ port: Int) -> Bool { socketCheck(port, binding: false) }
+    static func canConnect(_ port: Int) -> Bool { HarborLoopbackTCP.isListening(port) }
 
-    private static func isAvailable(_ port: Int) -> Bool { socketCheck(port, binding: true) }
+    /// Runtime startup and preflight check both listeners against one bounded
+    /// deadline rather than a fixed number of scheduling-dependent iterations.
+    static func awaitListeningPair(port: Int, process: Process,
+                                   cancellation: HarborLatencyCancellation?) async -> Bool {
+        let deadline = ContinuousClock.now + .milliseconds(
+            HarborProxyLatencyPolicy.runtimeListenerStartupTimeoutMilliseconds)
+        while process.isRunning, cancellation?.isCancelled != true,
+              !Task.isCancelled, ContinuousClock.now < deadline {
+            if canConnect(port), canConnect(port + 1), process.isRunning { return true }
+            do { try await Task.sleep(for: .milliseconds(75)) } catch { return false }
+        }
+        return false
+    }
 
-    private static func socketCheck(_ port: Int, binding: Bool) -> Bool {
+    private static func isAvailable(_ port: Int) -> Bool {
         guard (1...65_535).contains(port) else { return false }
         let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard descriptor >= 0 else { return false }
@@ -339,14 +351,7 @@ enum HarborNodeLatencyTester {
         let length = socklen_t(MemoryLayout<sockaddr_in>.size)
         return withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { pointer in
-                if binding { return Darwin.bind(descriptor, pointer, length) == 0 }
-                if Darwin.connect(descriptor, pointer, length) == 0 { return true }
-                guard errno == EINPROGRESS else { return false }
-                var pending = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
-                guard Darwin.poll(&pending, 1, 0) > 0, pending.revents & Int16(POLLOUT) != 0 else { return false }
-                var error: Int32 = 0
-                var size = socklen_t(MemoryLayout<Int32>.size)
-                return getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &error, &size) == 0 && error == 0
+                return Darwin.bind(descriptor, pointer, length) == 0
             }
         }
     }

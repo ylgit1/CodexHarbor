@@ -75,6 +75,9 @@ public enum HarborProxyLatencyPolicy {
     public static let realPingRequestCount = 2
     public static let realPingPauseMilliseconds = 100
     public static let listenerStartupTimeoutMilliseconds = 3_000
+    // Only connection activation uses the larger cold-start allowance.
+    // Successful starts return immediately; bulk probe budgets stay unchanged.
+    public static let runtimeListenerStartupTimeoutMilliseconds = 8_000
     public static let goodUpperBoundMilliseconds = 1_500
     public static let warningUpperBoundMilliseconds = 2_000
     public static let activeHealthCheckInterval: TimeInterval = 5 * 60

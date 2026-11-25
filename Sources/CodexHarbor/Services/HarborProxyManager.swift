@@ -2433,10 +2433,13 @@ final class HarborProxyManager: ObservableObject {
             detail = "旧入口仍被其他网络服务使用，已保留原连接；请先处理系统代理冲突"
             return
         }
-        guard let stage = (18100...18198).filter({ $0 % 2 == 0 }).first(where: {
-            abs($0 - oldPort) > 1 && abs($0 - targetPort) > 1 &&
-            !portListening($0) && !portListening($0 + 1) && !HarborSystemProxy.referencesListener($0)
-        }), let staging = try? HarborAgentGateway(httpPort: stage) else {
+        let stagingPorts = stride(from: 18100, through: 18198, by: 2)
+        let availablePort = stagingPorts.first { port in
+            guard abs(port - oldPort) > 1, abs(port - targetPort) > 1 else { return false }
+            return !portListening(port) && !portListening(port + 1)
+                && !HarborSystemProxy.referencesListener(port)
+        }
+        guard let stage = availablePort, let staging = try? HarborAgentGateway(httpPort: stage) else {
             detail = "没有可安全使用的迁移入口，旧连接未改变"
             return
         }

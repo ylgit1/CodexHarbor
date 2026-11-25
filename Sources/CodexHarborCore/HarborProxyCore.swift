@@ -368,25 +368,85 @@ public enum HarborProxyCommunitySource: String, CaseIterable, Sendable {
     }
 }
 
-/// Third-party network data about the relay's entry IP. It is a screening
-/// hint, never proof of the VPN exit's ownership or reputation.
+/// Network metadata belongs to one explicitly observed IP, never to a
+/// subscription label. Multiple independent observations are conservative:
+/// provider disagreement is unknown, and a single source is only a hint.
 public struct HarborProxyNetworkEvidence: Codable, Equatable, Sendable {
     public enum Kind: String, Codable, Sendable {
-        case residential, cellular, hosting, other
+        case residential, cellular, hosting, other, unknown
+    }
+    public enum Confidence: String, Codable, Sendable {
+        case unknown, singleSource, corroborated, conflicting
+    }
+    public struct Observation: Sendable {
+        public let source: String
+        public let kind: Kind?
+        public let isp: String?
+        public let countryCode: String?
+        public init(source: String, kind: Kind?, isp: String?, countryCode: String?) {
+            self.source = source
+            self.kind = kind
+            self.isp = isp
+            self.countryCode = countryCode
+        }
     }
 
     public let kind: Kind
     public let isp: String?
     public let checkedAt: Date
+    // Optional fields preserve existing encrypted v0.1.38 state.
+    public let sources: [String]?
+    public let confidence: Confidence?
+    public let countryCode: String?
+    public let observedIP: String?
+    public let networkEpoch: UInt64?
+    public let probeRouteID: String?
 
-    public init(kind: Kind, isp: String?, checkedAt: Date = .now) {
+    public init(kind: Kind, isp: String?, checkedAt: Date = .now,
+                sources: [String]? = nil, confidence: Confidence? = nil,
+                countryCode: String? = nil, observedIP: String? = nil,
+                networkEpoch: UInt64? = nil, probeRouteID: String? = nil) {
         self.kind = kind
         self.isp = isp
         self.checkedAt = checkedAt
+        self.sources = sources
+        self.confidence = confidence
+        self.countryCode = countryCode
+        self.observedIP = observedIP
+        self.networkEpoch = networkEpoch
+        self.probeRouteID = probeRouteID
     }
 
     public func isFresh(now: Date = .now) -> Bool {
-        now.timeIntervalSince(checkedAt) < 24 * 60 * 60
+        let lifetime: TimeInterval = kind == .unknown || confidence == .conflicting ? 10 * 60 : 24 * 60 * 60
+        return (0..<lifetime).contains(now.timeIntervalSince(checkedAt))
+    }
+
+    public static func combine(ip: String, observations: [Observation],
+                               networkEpoch: UInt64? = nil, probeRouteID: String? = nil) -> Self {
+        var seen = Set<String>()
+        let unique = observations.filter { seen.insert($0.source).inserted }
+        let known = unique.compactMap(\.kind).filter { $0 != .unknown && $0 != .other }
+        let kinds = Set(known)
+        let countries = Set(unique.compactMap { $0.countryCode?.uppercased() }.filter {
+            $0.count == 2 && $0.utf8.allSatisfy { (65...90).contains($0) } && $0 != "ZZ"
+        })
+        let confidence: Confidence
+        let kind: Kind
+        if kinds.count > 1 || countries.count > 1 {
+            kind = .unknown
+            confidence = .conflicting
+        } else if let detected = known.first {
+            kind = detected
+            confidence = known.count > 1 ? .corroborated : .singleSource
+        } else {
+            kind = .unknown
+            confidence = .unknown
+        }
+        return Self(kind: kind, isp: unique.compactMap(\.isp).first.map { String($0.prefix(80)) },
+                    sources: unique.map(\.source), confidence: confidence,
+                    countryCode: countries.count == 1 ? countries.first : nil,
+                    observedIP: ip, networkEpoch: networkEpoch, probeRouteID: probeRouteID)
     }
 
     public static func classify(userType: String?, connectionType: String?,
@@ -397,7 +457,6 @@ public struct HarborProxyNetworkEvidence: Codable, Equatable, Sendable {
         case "residential":
             return connectionType?.lowercased() == "cable/dsl" ? .residential : .other
         case "cellular": return .cellular
-        // A consumer-looking ISP name or Cable/DSL alone is insufficient.
         default: return .other
         }
     }

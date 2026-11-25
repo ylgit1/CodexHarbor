@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 @testable import ChatGPTBridgeCore
@@ -77,6 +78,44 @@ struct CommandSessionTests {
             attempts: 100
         )
         #expect(terminal.state == .timedOut)
+    }
+
+    @Test("Cancelling a command retires its child process group but not an unrelated command")
+    func childGroupCleanup() async throws {
+        let fixture = try await CommandSessionFixture()
+        defer { fixture.cleanup() }
+        let unrelated = try await fixture.manager.start(workspaceID: fixture.workspaceID,
+            executable: "sleep", arguments: ["20"], timeoutSeconds: 25, approvalGranted: true)
+        let started = try await fixture.manager.start(workspaceID: fixture.workspaceID,
+            executable: "zsh", arguments: ["-c", "/bin/sleep 20 & echo $!; wait"],
+            timeoutSeconds: 25, approvalGranted: true)
+        var child: Int32?
+        for _ in 0..<30 {
+            let output = try await fixture.manager.output(commandID: started.commandID)
+            if let pid = Int32(output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)),
+               pid > 1, getpgid(pid) == started.processIdentifier {
+                child = pid
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let cancelled = try await fixture.manager.cancel(commandID: started.commandID)
+        let stillRunning = try await fixture.manager.status(commandID: unrelated.commandID)
+        _ = try await fixture.manager.cancel(commandID: unrelated.commandID)
+        let pid = try #require(child)
+        #expect(cancelled.state == .cancelled)
+        #expect(stillRunning.state == .running)
+        // A zombie no longer executes code; allow the OS to reap it.
+        var live = true
+        for _ in 0..<40 {
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+            live = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size
+                && info.pbi_status != UInt32(SZOMB)
+            if !live { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(!live)
     }
 
     @Test("command sessions reject a fourth simultaneous process")

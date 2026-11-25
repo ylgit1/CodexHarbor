@@ -10,7 +10,9 @@ struct RepairAgentTests {
         defer { fixture.cleanup() }
         let result = try await fixture.agent.repair(
             workspaceID: fixture.workspaceID,
-            timeoutSeconds: 60,
+            // Cold SDK compilation is not the behavior under test here.
+            // Command timeout enforcement has its own short-deadline tests.
+            timeoutSeconds: 240,
             approvalGranted: true
         )
         #expect(result.state == .needsPatch)
@@ -33,7 +35,7 @@ private struct RepairFixture {
         try Data("""
         // swift-tools-version: 6.0
         import PackageDescription
-        let package = Package(name: "Broken", targets: [.executableTarget(name: "Broken")])
+        let package = Package(name: "Broken", platforms: [.macOS(.v14)], targets: [.executableTarget(name: "Broken")])
         """.utf8).write(to: root.appendingPathComponent("Package.swift"))
         try Data("let value: Int = missingSymbol\nprint(value)\n".utf8)
             .write(to: sources.appendingPathComponent("Broken.swift"))

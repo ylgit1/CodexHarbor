@@ -2,63 +2,136 @@ import CodexHarborCore
 import Darwin
 import Foundation
 
+enum HarborProbePriority: Int, Sendable, Comparable {
+    case geoIP = 0, screening, manual, health, switching, recovery, safety
+    static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+}
+
+/// Task-local priorities propagate through structured child tasks, without
+/// making the caller take a second resource permit for each helper.
+enum HarborProbeScope {
+    @TaskLocal static var priority: HarborProbePriority = .screening
+}
+
 actor HarborProbeBudget {
-    static let engines = HarborProbeBudget(limit: HarborProxyLatencyPolicy.temporaryEngineLimit)
-    static let requests = HarborProbeBudget(limit: HarborProxyLatencyPolicy.probeRequestLimit)
+    static let engines = HarborProbeBudget(limit: HarborProxyLatencyPolicy.temporaryEngineLimit, reserved: 1)
+    static let requests = HarborProbeBudget(limit: HarborProxyLatencyPolicy.probeRequestLimit, reserved: 2)
+
+    private struct Waiter {
+        let id: UUID
+        let count: Int
+        let priority: HarborProbePriority
+        let cancellation: HarborLatencyCancellation?
+        let continuation: CheckedContinuation<[UUID]?, Never>
+    }
 
     private let limit: Int
+    private let reserved: Int
+    private let queueLimit = 128
     private var held: Set<UUID> = []
-    private var waiting: [(UUID, CheckedContinuation<UUID?, Never>)] = []
+    private var waiting: [Waiter] = []
 
-    init(limit: Int) { self.limit = limit }
+    init(limit: Int, reserved: Int = 0) {
+        self.limit = max(1, limit)
+        self.reserved = max(0, min(reserved, limit - 1))
+    }
 
-    func acquire(_ cancellation: HarborLatencyCancellation? = nil) async -> UUID? {
-        guard !Task.isCancelled, cancellation?.isCancelled != true else { return nil }
+    func acquire(_ cancellation: HarborLatencyCancellation? = nil,
+                 priority: HarborProbePriority = HarborProbeScope.priority) async -> UUID? {
+        await acquireGroup(1, cancellation: cancellation, priority: priority)?.first
+    }
+
+    /// All permits for a dependent engine chain are granted together. Never
+    /// retain one engine permit while waiting for another from the same pool.
+    func acquireGroup(_ count: Int, cancellation: HarborLatencyCancellation? = nil,
+                      priority: HarborProbePriority = HarborProbeScope.priority) async -> [UUID]? {
+        let capacity = priority >= .health ? limit : limit - reserved
+        guard (1...capacity).contains(count), !Task.isCancelled,
+              cancellation?.isCancelled != true else { return nil }
         let id = UUID()
         let observer = cancellation?.observe { Task { await self.withdraw(id) } }
         defer { if let observer { cancellation?.removeObserver(observer) } }
-        let granted: UUID? = await withTaskCancellationHandler {
+        let deadline = Task {
+            do { try await Task.sleep(for: .seconds(30)) } catch { return }
+            self.withdraw(id)
+        }
+        defer { deadline.cancel() }
+        let granted: [UUID]? = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                if Task.isCancelled || cancellation?.isCancelled == true {
+                guard !Task.isCancelled, cancellation?.isCancelled != true else {
                     continuation.resume(returning: nil)
-                } else if held.count < limit {
-                    held.insert(id)
-                    continuation.resume(returning: id)
-                } else {
-                    waiting.append((id, continuation))
+                    return
                 }
+                if waiting.count >= queueLimit {
+                    if let index = waiting.lastIndex(where: { $0.priority < priority }) {
+                        waiting.remove(at: index).continuation.resume(returning: nil)
+                    } else {
+                        continuation.resume(returning: nil)
+                        return
+                    }
+                }
+                waiting.append(Waiter(id: id, count: count, priority: priority,
+                                      cancellation: cancellation, continuation: continuation))
+                dispatch()
             }
         } onCancel: {
             Task { await self.withdraw(id) }
         }
         if let granted, Task.isCancelled || cancellation?.isCancelled == true {
-            release(granted)
+            for lease in granted { held.remove(lease) }
+            dispatch()
             return nil
         }
         return granted
     }
 
     func release(_ id: UUID) {
-        guard held.remove(id) != nil, !waiting.isEmpty else { return }
-        let (next, continuation) = waiting.removeFirst()
-        held.insert(next)
-        continuation.resume(returning: next)
+        guard held.remove(id) != nil else { return }
+        dispatch()
     }
 
     private func withdraw(_ id: UUID) {
-        guard let index = waiting.firstIndex(where: { $0.0 == id }) else { return }
-        waiting.remove(at: index).1.resume(returning: nil)
+        guard let index = waiting.firstIndex(where: { $0.id == id }) else { return }
+        waiting.remove(at: index).continuation.resume(returning: nil)
+        dispatch()
+    }
+
+    private func dispatch() {
+        while !waiting.isEmpty {
+            // FIFO within priority. Do not let lower priority work consume
+            // the capacity a higher priority grouped request is waiting for.
+            guard let highest = waiting.map(\.priority).max(),
+                  let index = waiting.firstIndex(where: { $0.priority == highest }) else { return }
+            let next = waiting[index]
+            if next.cancellation?.isCancelled == true {
+                waiting.remove(at: index).continuation.resume(returning: nil)
+                continue
+            }
+            let capacity = next.priority >= .health ? limit : limit - reserved
+            guard held.count + next.count <= capacity else { return }
+            waiting.remove(at: index)
+            let permits = (0..<next.count).map { _ in UUID() }
+            held.formUnion(permits)
+            next.continuation.resume(returning: permits)
+        }
     }
 }
 
 enum HarborProbeFiles {
     static func write(_ data: Data, to file: URL) throws {
-        guard FileManager.default.createFile(atPath: file.path, contents: nil,
-                                             attributes: [.posixPermissions: 0o600]) else {
+        // Exclusive creation prevents overwriting an existing file or
+        // following a symlink at the destination. Permissions are private
+        // from the first write, not applied after the credentials reach disk.
+        let descriptor = Darwin.open(file.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else {
             throw HarborProxyError.invalid("无法创建私有代理配置")
         }
-        do { try data.write(to: file) }
-        catch {
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        do {
+            try handle.write(contentsOf: data)
+            try handle.close()
+        } catch {
+            try? handle.close()
             try? FileManager.default.removeItem(at: file)
             throw error
         }
@@ -74,17 +147,23 @@ enum HarborProbeFiles {
     }
 
     static func record(_ process: Process, config: URL) {
-        try? Data(String(process.processIdentifier).utf8).write(to: recordURL(for: config), options: .atomic)
+        let identity = HarborProcessIdentity.capture(pid: process.processIdentifier)
+        let data = identity.flatMap { try? JSONEncoder().encode($0) }
+            ?? Data(String(process.processIdentifier).utf8)
+        try? replace(data, at: recordURL(for: config))
     }
 
     static func remove(_ config: URL) {
         try? FileManager.default.removeItem(at: config)
         try? FileManager.default.removeItem(at: recordURL(for: config))
+        if config.lastPathComponent.hasPrefix("probe-runtime-") {
+            try? FileManager.default.removeItem(at: config.deletingPathExtension().appendingPathExtension("data"))
+        }
     }
 
     private static func recordURL(for config: URL) -> URL { config.appendingPathExtension("pid") }
 
-    static func cleanOrphans(root: URL) async {
+    static func cleanOrphans(root: URL, protectedPaths: Set<String> = []) async {
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: root, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey]
         ) else { return }
@@ -95,9 +174,12 @@ enum HarborProbeFiles {
         let processes = String(decoding: processList.data, as: UTF8.self)
             .split(whereSeparator: \.isNewline)
         for config in files where config.lastPathComponent.hasPrefix("probe-") && config.pathExtension == "json" {
+            guard !protectedPaths.contains(config.path) else { continue }
             guard let info = try? config.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
                   info.isRegularFile == true, let modified = info.contentModificationDate else { continue }
-            let recordedPID = (try? String(contentsOf: recordURL(for: config), encoding: .utf8)).flatMap(Int32.init)
+            let record = try? Data(contentsOf: recordURL(for: config))
+            let recordedIdentity = record.flatMap { try? JSONDecoder().decode(HarborProcessIdentity.self, from: $0) }
+            let recordedPID = recordedIdentity?.pid ?? record.flatMap { Int32(String(decoding: $0, as: UTF8.self)) }
             let owned = processes.compactMap { line -> (Int32, Int32)? in
                 let fields = line.split(maxSplits: 2, whereSeparator: \.isWhitespace)
                 guard fields.count == 3, let pid = Int32(fields[0]), let parent = Int32(fields[1]),
@@ -110,7 +192,7 @@ enum HarborProbeFiles {
             var alive = false
             for (pid, parent) in owned {
                 guard parent == 1, recordedPID == nil || pid == recordedPID else { alive = true; continue }
-                alive = !(await stopOrphan(pid, config: config, root: root)) || alive
+                alive = !(await stopOrphan(pid, config: config, root: root, recorded: recordedIdentity)) || alive
             }
             if !alive, !owned.isEmpty || Date.now.timeIntervalSince(modified) > 3_600 {
                 remove(config)
@@ -124,8 +206,12 @@ enum HarborProbeFiles {
         }
     }
 
-    private static func stopOrphan(_ pid: Int32, config: URL, root: URL) async -> Bool {
+    private static func stopOrphan(_ pid: Int32, config: URL, root: URL,
+                                   recorded: HarborProcessIdentity?) async -> Bool {
+        guard let identity = HarborProcessIdentity.capture(pid: pid),
+              recorded == nil || recorded == identity else { return Darwin.kill(pid, 0) != 0 }
         func stillOwned() async -> Bool {
+            guard identity.isCurrent else { return false }
             guard let info = try? await HarborProxyCommand.run(URL(fileURLWithPath: "/bin/ps"),
                 arguments: ["-ww", "-p", String(pid), "-o", "ppid=", "-o", "command="], timeout: 1),
                   info.status == 0 else { return false }
@@ -137,10 +223,10 @@ enum HarborProbeFiles {
                 fields[1].hasPrefix(root.appendingPathComponent($0).path + " ")
             } && (fields[1].hasSuffix(" -config " + config.path) || fields[1].hasSuffix(" -f " + config.path))
         }
-        guard pid > 1, await stillOwned() else { return Darwin.kill(pid, 0) != 0 }
+        guard pid > 1, await stillOwned(), identity.isCurrent else { return Darwin.kill(pid, 0) != 0 }
         _ = Darwin.kill(pid, SIGTERM)
         try? await Task.sleep(for: .milliseconds(250))
-        if Darwin.kill(pid, 0) == 0, await stillOwned() {
+        if Darwin.kill(pid, 0) == 0, await stillOwned(), identity.isCurrent {
             _ = Darwin.kill(pid, SIGKILL)
             try? await Task.sleep(for: .milliseconds(100))
         }

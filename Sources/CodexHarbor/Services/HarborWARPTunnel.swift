@@ -14,14 +14,14 @@ final class HarborWARPTunnel: @unchecked Sendable {
     private let cancellation: HarborLatencyCancellation
     private let parent: HarborLatencyCancellation
     private let parentObserver: UUID
-    private let engineObserver: UUID
     private let lease: UUID
     private let lock = NSLock()
     private var closed = false
+    var isUsable: Bool { lock.withLock { !closed && engine.isRunning && !cancellation.isCancelled } }
 
     private init(profile: HarborWARPProfile, httpPort: Int, engine: Process, directory: URL,
                  cancellation: HarborLatencyCancellation, parent: HarborLatencyCancellation,
-                 parentObserver: UUID, engineObserver: UUID, lease: UUID) {
+                 parentObserver: UUID, lease: UUID) {
         self.profile = profile
         self.httpPort = httpPort
         self.engine = engine
@@ -29,8 +29,28 @@ final class HarborWARPTunnel: @unchecked Sendable {
         self.cancellation = cancellation
         self.parent = parent
         self.parentObserver = parentObserver
-        self.engineObserver = engineObserver
         self.lease = lease
+    }
+
+    struct PromotedRuntime: Sendable {
+        let process: Process
+        let directory: URL
+        let port: Int
+        let profile: HarborWARPProfile
+    }
+
+    /// Transfer the exact verified engine out of the discovery budget.
+    /// Detach discovery cancellation before releasing its lease; the formal
+    /// supervisor assumes the port reservation and process cleanup.
+    func promote() async -> PromotedRuntime? {
+        guard lock.withLock({
+            if closed || !engine.isRunning || cancellation.isCancelled { return false }
+            closed = true
+            return true
+        }) else { return nil }
+        parent.removeObserver(parentObserver)
+        await HarborProbeBudget.engines.release(lease)
+        return PromotedRuntime(process: engine, directory: directory, port: httpPort, profile: profile)
     }
 
     func close() async {
@@ -40,13 +60,10 @@ final class HarborWARPTunnel: @unchecked Sendable {
             return true
         }) else { return }
         parent.removeObserver(parentObserver)
-        cancellation.removeObserver(engineObserver)
         cancellation.cancel()
-        if await HarborProxyCommand.stop(engine) {
-            try? FileManager.default.removeItem(at: directory)
-            HarborNodeLatencyTester.releasePortPair(httpPort)
-            await HarborProbeBudget.engines.release(lease)
-        }
+        await HarborProbeRetirementQueue.shared.retire(.init(
+            process: engine, config: directory.appendingPathComponent("config.json"),
+            directory: directory, port: httpPort, lease: lease))
     }
 
     static func prepare(account: HarborWARPAccount, preferred: HarborWARPEndpoint?,
@@ -108,70 +125,49 @@ final class HarborWARPTunnel: @unchecked Sendable {
             parent.removeObserver(parentObserver)
             return nil
         }
+        guard !cancellation.isCancelled, let port = HarborNodeLatencyTester.reservePortPair() else {
+            parent.removeObserver(parentObserver)
+            await HarborProbeBudget.engines.release(lease)
+            return nil
+        }
+        let directory = root.appendingPathComponent("warp-probe-\(UUID().uuidString)", isDirectory: true)
+        let file = directory.appendingPathComponent("config.json")
+        let engine = Process()
         return await withTaskCancellationHandler {
-            let released = HarborLatencyCancellation()
-            let tunnel = await Task.detached(priority: .utility) { () -> HarborWARPTunnel? in
-                guard !cancellation.isCancelled,
-                      let port = HarborNodeLatencyTester.reservePortPair() else {
-                    released.cancel()
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                        attributes: [.posixPermissions: 0o700])
+                try HarborProbeFiles.write(HarborWARPConfig.make(profile: profile, httpPort: port), to: file)
+                engine.executableURL = root.appendingPathComponent("mihomo")
+                engine.currentDirectoryURL = directory
+                engine.arguments = ["-d", directory.path, "-f", file.path]
+                engine.standardInput = FileHandle.nullDevice
+                engine.standardOutput = FileHandle.nullDevice
+                engine.standardError = FileHandle.nullDevice
+                guard !cancellation.isCancelled, !Task.isCancelled else { throw CancellationError() }
+                try engine.run()
+                let identity = HarborProcessIdentity.capture(pid: engine.processIdentifier)
+                let record = identity.flatMap { try? JSONEncoder().encode($0) }
+                    ?? Data(String(engine.processIdentifier).utf8)
+                try HarborProbeFiles.write(record, to: directory.appendingPathComponent("pid"))
+                guard await HarborNodeLatencyTester.awaitListeningPair(port: port, process: engine,
+                                                                       cancellation: cancellation),
+                      !cancellation.isCancelled, !Task.isCancelled else { throw CancellationError() }
+                let tunnel = HarborWARPTunnel(profile: profile, httpPort: port, engine: engine,
+                    directory: directory, cancellation: cancellation, parent: parent,
+                    parentObserver: parentObserver, lease: lease)
+                guard await tunnel.verify(), !Task.isCancelled, !cancellation.isCancelled else {
+                    await tunnel.close()
                     return nil
                 }
-                let directory = root.appendingPathComponent("warp-probe-\(UUID().uuidString)", isDirectory: true)
-                let file = directory.appendingPathComponent("config.json")
-                let engine = Process()
-                var keep = false
-                var observer: UUID?
-                defer {
-                    if !keep {
-                        if let observer { cancellation.removeObserver(observer) }
-                        if HarborProxyCommand.stopBlocking(engine) {
-                            try? FileManager.default.removeItem(at: directory)
-                            HarborNodeLatencyTester.releasePortPair(port)
-                            released.cancel()
-                        }
-                    }
-                }
-                do {
-                    try FileManager.default.createDirectory(
-                        at: directory, withIntermediateDirectories: true,
-                        attributes: [.posixPermissions: 0o700])
-                    try HarborWARPConfig.make(profile: profile, httpPort: port).write(to: file, options: .atomic)
-                    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
-                    engine.executableURL = root.appendingPathComponent("mihomo")
-                    engine.currentDirectoryURL = directory
-                    engine.arguments = ["-d", directory.path, "-f", file.path]
-                    engine.standardOutput = FileHandle.nullDevice
-                    engine.standardError = FileHandle.nullDevice
-                    observer = cancellation.observe { [weak engine] in
-                        if let engine { HarborProbeProcessReaper.requestStop(engine) }
-                    }
-                    guard let observer, !cancellation.isCancelled else { return nil }
-                    try engine.run()
-                    let pidFile = directory.appendingPathComponent("pid")
-                    try Data(String(engine.processIdentifier).utf8).write(to: pidFile, options: .atomic)
-                    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: pidFile.path)
-                    guard HarborNodeLatencyTester.waitUntilListening(
-                        port: port, process: engine, cancellation: cancellation),
-                          HarborNodeLatencyTester.waitUntilListening(
-                        port: port + 1, process: engine, cancellation: cancellation),
-                          !cancellation.isCancelled else { return nil }
-                    keep = true
-                    return HarborWARPTunnel(
-                        profile: profile, httpPort: port, engine: engine, directory: directory,
-                        cancellation: cancellation, parent: parent,
-                        parentObserver: parentObserver, engineObserver: observer, lease: lease)
-                } catch { return nil }
-            }.value
-            guard let tunnel else {
+                return tunnel
+            } catch {
                 parent.removeObserver(parentObserver)
-                if released.isCancelled { await HarborProbeBudget.engines.release(lease) }
+                cancellation.cancel()
+                await HarborProbeRetirementQueue.shared.retire(.init(
+                    process: engine, config: file, directory: directory, port: port, lease: lease))
                 return nil
             }
-            guard await tunnel.verify(), !Task.isCancelled, !cancellation.isCancelled else {
-                await tunnel.close()
-                return nil
-            }
-            return tunnel
         } onCancel: {
             cancellation.cancel()
         }
@@ -213,23 +209,27 @@ final class HarborWARPTunnel: @unchecked Sendable {
 
     /// Recover only our recorded, orphaned probe cores. Normal live probes
     /// belong to this process and are left alone.
-    static func cleanupOrphans(root: URL) async {
+    static func cleanupOrphans(root: URL, protectedPaths: Set<String> = []) async {
         let fm = FileManager.default
         guard let directories = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return }
         for directory in directories where directory.lastPathComponent.hasPrefix("warp-probe-") {
+            guard !protectedPaths.contains(directory.path) else { continue }
             let pidFile = directory.appendingPathComponent("pid")
-            guard let text = try? String(contentsOf: pidFile, encoding: .utf8),
-                  let pid = Int32(text), pid > 0 else { continue }
+            guard let data = try? Data(contentsOf: pidFile), data.count <= 16_384 else { continue }
+            let recorded = try? JSONDecoder().decode(HarborProcessIdentity.self, from: data)
+            guard let pid = recorded?.pid ?? Int32(String(decoding: data, as: UTF8.self)), pid > 1 else { continue }
             if Darwin.kill(pid, 0) == 0 {
+                guard let identity = HarborProcessIdentity.capture(pid: pid),
+                      recorded == nil || recorded == identity else { continue }
                 do {
                     let output = try await HarborProxyCommand.run(URL(fileURLWithPath: "/bin/ps"),
                         arguments: ["-ww", "-p", String(pid), "-o", "ppid=", "-o", "command="], timeout: 1)
                     let line = String(decoding: output.data, as: UTF8.self)
                     let fields = line.split(maxSplits: 1, whereSeparator: \.isWhitespace)
+                    let expected = "\(root.appendingPathComponent("mihomo").path) -d \(directory.path) -f \(directory.appendingPathComponent("config.json").path)"
                     guard fields.count == 2, fields[0] == "1",
-                          fields[1].contains(root.appendingPathComponent("mihomo").path),
-                          fields[1].contains("-d " + directory.path),
-                          fields[1].contains("-f " + directory.appendingPathComponent("config.json").path) else { continue }
+                          fields[1].trimmingCharacters(in: .whitespacesAndNewlines) == expected,
+                          identity.isCurrent else { continue }
                     _ = Darwin.kill(pid, SIGTERM)
                     try? await Task.sleep(for: .milliseconds(250))
                 } catch { continue }

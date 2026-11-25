@@ -28,5 +28,9 @@ if /bin/zsh "$verify_script"; then
   exit 0
 fi
 
-echo "rolled-back" > "$status_file"
+if [[ -e "$backup_app_path" ]]; then
+  echo "rollback-deferred" > "$status_file"
+else
+  echo "rolled-back" > "$status_file"
+fi
 exit 1

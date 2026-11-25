@@ -192,26 +192,29 @@ public enum HarborWARPConnectivity {
         guard (1024...65534).contains(httpPort) else {
             return .init(verified: false, exitIP: nil, reason: "本地 HTTP 代理端口无效")
         }
-        let session = URLSession(configuration: HarborProxyHTTP.configuration(httpPort: httpPort))
-        defer { session.invalidateAndCancel() }
+        let configuration = HarborProxyHTTP.configuration(httpPort: httpPort)
         do {
             var trace = URLRequest(url: URL(string: "https://www.cloudflare.com/cdn-cgi/trace")!)
             trace.timeoutInterval = 6
-            let (data, response) = try await session.data(for: trace)
-            guard (response as? HTTPURLResponse)?.statusCode == 200,
-                  HarborProxyHTTP.verifiesWARPTrace(data) else {
+            let (data, _) = try await HarborProxyHTTPBody.data(for: trace, configuration: configuration,
+                                                                limit: 4096, timeout: 6, status: 200..<201)
+            guard HarborProxyHTTP.verifiesWARPTrace(data) else {
                 return .init(verified: false, exitIP: nil, reason: "未收到 Cloudflare WARP 出口标记")
             }
-            let ip = exitIP(from: data)
+            guard let ip = exitIP(from: data).flatMap(HarborIPAddress.normalizedLiteral),
+                  !HarborIPAddress.isLocal(ip) else {
+                return .init(verified: false, exitIP: nil, reason: "WARP 出口 IP 无效")
+            }
             var check = URLRequest(url: URL(string: "https://www.gstatic.com/generate_204")!)
             check.timeoutInterval = 6
-            let (body, other) = try await session.data(for: check)
-            guard (other as? HTTPURLResponse)?.statusCode == 204, body.isEmpty else {
+            let (body, _) = try await HarborProxyHTTPBody.data(for: check, configuration: configuration,
+                                                                limit: 64, timeout: 6, status: 204..<205)
+            guard body.isEmpty else {
                 return .init(verified: false, exitIP: ip, reason: "WARP 通道已建立，但外部 HTTPS 检测未通过")
             }
             return .init(verified: true, exitIP: ip, reason: nil)
         } catch {
-            return .init(verified: false, exitIP: nil, reason: "WARP HTTPS 验证失败：" + error.localizedDescription)
+            return .init(verified: false, exitIP: nil, reason: "WARP HTTPS 验证失败")
         }
     }
 }

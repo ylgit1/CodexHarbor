@@ -96,7 +96,9 @@ final class HarborRealDelayBatch: @unchecked Sendable {
     private let portsByNodeID: [String: Int]
     private let cancellation: HarborLatencyCancellation
     private let lease: UUID
-    var hasRunningEngine: Bool { engine.isRunning }
+    private let closeLock = NSLock()
+    private var closed = false
+    var hasRunningEngine: Bool { closeLock.withLock { !closed && engine.isRunning } }
 
     init(engine: Process, config: URL, basePort: Int, nodes: [HarborProxyNode],
          cancellation: HarborLatencyCancellation, lease: UUID) {
@@ -111,11 +113,14 @@ final class HarborRealDelayBatch: @unchecked Sendable {
     }
 
     func close() async {
-        if await HarborProxyCommand.stop(engine) {
-            HarborProbeFiles.remove(configPath)
-            HarborNodeLatencyTester.releasePortRange(basePort, count: portsByNodeID.count)
-            await HarborProbeBudget.engines.release(lease)
-        }
+        guard closeLock.withLock({
+            if closed { return false }
+            closed = true
+            return true
+        }) else { return }
+        await HarborProbeRetirementQueue.shared.retire(.init(
+            process: engine, config: configPath, port: basePort,
+            portCount: portsByNodeID.count, lease: lease))
     }
 
     func measure(node: HarborProxyNode) async -> HarborNodeDelayReport {
@@ -244,11 +249,8 @@ enum HarborNodeLatencyTester {
             return HarborRealDelayBatch(engine: engine, config: config, basePort: basePort,
                                         nodes: nodes, cancellation: cancellation, lease: lease)
         } catch {
-            if await HarborProxyCommand.stop(engine) {
-                HarborProbeFiles.remove(config)
-                releasePortRange(basePort, count: nodes.count)
-                await HarborProbeBudget.engines.release(lease)
-            }
+            await HarborProbeRetirementQueue.shared.retire(.init(
+                process: engine, config: config, port: basePort, portCount: nodes.count, lease: lease))
             return nil
         }
     }
@@ -293,13 +295,22 @@ enum HarborNodeLatencyTester {
         return nil
     }
 
-    fileprivate static func releasePortRange(_ base: Int, count: Int) {
+    static func releasePortRange(_ base: Int, count: Int) {
         portLock.lock()
         reservedPorts.subtract(base..<(base + count))
         portLock.unlock()
     }
 
     static func reservePortPair() -> Int? { reservePortRange(2) }
+
+    /// A resident engine may be temporarily down during recovery, but its
+    /// assigned ports must not be reused by a background probe.
+    static func retainResidentPortPair(_ port: Int) {
+        guard (18200...19398).contains(port) else { return }
+        portLock.lock()
+        reservedPorts.formUnion(port..<(port + 2))
+        portLock.unlock()
+    }
 
     static func releasePortPair(_ port: Int) { releasePortRange(port, count: 2) }
 
@@ -443,11 +454,8 @@ enum HarborMihomoLatencyTester {
                 result = await action(port + 1, diagnostics)
             }
         } catch {}
-        if await HarborProxyCommand.stop(engine) {
-            HarborProbeFiles.remove(config)
-            HarborNodeLatencyTester.releasePortPair(port)
-            await HarborProbeBudget.engines.release(lease)
-        }
+        await HarborProbeRetirementQueue.shared.retire(.init(
+            process: engine, config: config, port: port, lease: lease))
         return result
     }
 

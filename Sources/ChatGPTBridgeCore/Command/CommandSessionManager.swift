@@ -54,6 +54,7 @@ public actor CommandSessionManager {
         let request: CommandRequest
         let auditTool: String
         let process: Process
+        let cleanup: CommandProcessCleanup
         let stdoutURL: URL
         let stderrURL: URL
         let stdoutHandle: FileHandle
@@ -84,6 +85,7 @@ public actor CommandSessionManager {
             self.request = request
             self.auditTool = auditTool
             self.process = process
+            self.cleanup = CommandProcessCleanup(process)
             self.stdoutURL = stdoutURL
             self.stderrURL = stderrURL
             self.stdoutHandle = stdoutHandle
@@ -290,13 +292,7 @@ public actor CommandSessionManager {
         }
 
         session.state = .cancelled
-        if session.process.isRunning {
-            session.process.terminate()
-            try? await Task.sleep(for: .milliseconds(250))
-            if session.process.isRunning {
-                session.process.interrupt()
-            }
-        }
+        await session.cleanup.stop(session.process)
         await waitForExit(session, maximumWaitMilliseconds: 1_000)
         await finalize(session, state: .cancelled)
         return statusValue(for: session)
@@ -310,20 +306,14 @@ public actor CommandSessionManager {
             let outputBytes = fileSize(at: session.stdoutURL) + fileSize(at: session.stderrURL)
             if outputBytes > Self.maximumStoredOutputBytes {
                 session.state = .failed
-                session.process.terminate()
-                try? await Task.sleep(for: .milliseconds(250))
-                if session.process.isRunning { session.process.interrupt() }
+                await session.cleanup.stop(session.process)
                 await waitForExit(session, maximumWaitMilliseconds: 1_000)
                 await finalize(session, state: .failed)
                 return
             }
             if Date() >= deadline {
                 session.state = .timedOut
-                session.process.terminate()
-                try? await Task.sleep(for: .milliseconds(250))
-                if session.process.isRunning {
-                    session.process.interrupt()
-                }
+                await session.cleanup.stop(session.process)
                 await waitForExit(session, maximumWaitMilliseconds: 1_000)
                 await finalize(session, state: .timedOut)
                 return

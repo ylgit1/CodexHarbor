@@ -96,12 +96,17 @@ public enum HarborProxyCommand {
     @discardableResult
     public static func stopBlocking(_ process: Process) -> Bool {
         guard process.processIdentifier > 0, process.isRunning else { return true }
+        guard let identity = HarborProcessIdentity.capture(pid: process.processIdentifier),
+              identity.isCurrent else { return !process.isRunning }
         process.terminate()
         let graceful = ContinuousClock.now + .milliseconds(750)
         while process.isRunning, ContinuousClock.now < graceful {
             Thread.sleep(forTimeInterval: 0.025)
         }
-        if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+        if process.isRunning {
+            guard identity.isCurrent else { return !process.isRunning }
+            _ = Darwin.kill(identity.pid, SIGKILL)
+        }
         let forced = ContinuousClock.now + .seconds(1)
         while process.isRunning, ContinuousClock.now < forced {
             Thread.sleep(forTimeInterval: 0.025)

@@ -219,7 +219,9 @@ struct HarborWARPTests {
         let value = account()
         for transport in [HarborWARPEndpoint.Transport.h2, .h3] {
             let profile = HarborWARPProfile(account: value, endpoint: .init(host: "162.159.198.2", transport: transport))
-            let data = try HarborWARPConfig.make(profile: profile, httpPort: 19080)
+            let raw = try HarborWARPConfig.make(profile: profile, httpPort: 19080)
+            let data = try HarborGatewayConfiguration.protectMihomo(raw,
+                ports: [18080, 18081, 19080, 19081], verificationOutbound: "warp")
             let config = directory.appendingPathComponent("config.json")
             try data.write(to: config)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: config.path)

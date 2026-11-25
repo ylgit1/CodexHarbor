@@ -30,6 +30,10 @@ Codex Harbor 是一个面向 macOS 开发者的原生桌面应用。它把原本
 
 可用 SHA-256 校验清单核验 v0.1.38 DMG 的完整性。[下载校验清单](https://github.com/ylgit1/CodexHarbor/releases/download/v0.1.38/SHA256SUMS)
 
+**v0.1.39 源码更新**
+
+网络代理由独立后台服务运行。启用恢复上次连接后，退出主窗口应用时可保留代理连接。HTTP 和 SOCKS5 使用固定入口，切换节点前分别验证两个入口。限制批量测速、出口检测及 VPN Gate 筛选的并发与等待时间，并改进取消后的资源回收和系统代理恢复。Apple Silicon 安装包通过签名和公证后发布，上方下载地址以已上线的版本为准。
+
 **v0.1.38 更新**
 
 修复 VPN Gate 切换时非阻塞本地端口检测误判；使用有界双端口启动等待，切换前验证独立底座，减少测速资源竞争，改进回退状态和脱敏启动诊断。保留原有端口、真实 HTTPS 验证和系统代理恢复保护。
@@ -466,10 +470,11 @@ Transport Installer 当前同时包含 Apple Silicon（arm64）与 Intel（x86_6
 
 ## GitHub / Gitee 双平台发布
 
-- GitHub 正式发布仍使用 `.github/workflows/publish-release.yml`，编译并验证 ARM64 DMG，生成版本号下载链接和 GitHub `latest` 镜像。
-- GitHub 正式发布成功后，`.github/workflows/publish-gitee-release.yml` 会读取**同一份** DMG 和 `SHA256SUMS`，先校验哈希，再向 Gitee 推送源码/标签、创建同版本 Release、上传 DMG 附件并验证其名称和文件大小；此流程与 GitHub 发布分开，可独立重试，失败时不能视作双平台发布完成。
+- GitHub 正式发布使用 `.github/workflows/publish-release.yml`。ARM64 包必须用 Developer ID Application 签名，通过代理后台服务的启动和认证自检，并通过 Apple 公证、装订和 Gatekeeper 检查。缺少证书或公证资料会停止发布，不会上传临时签名包。
+- 正式发布需在 GitHub Actions Secrets 中配置 `MACOS_CERTIFICATE_P12_BASE64`、`MACOS_CERTIFICATE_PASSWORD`、`MACOS_NOTARY_APPLE_ID`、`MACOS_NOTARY_TEAM_ID` 和 `MACOS_NOTARY_APP_PASSWORD`。最后一项是公证用的 Apple 专用密码。证书和公证凭据只导入 GitHub 临时运行环境；本机的开发签名不变。
+- GitHub 正式发布成功后，`.github/workflows/publish-gitee-release.yml` 会读取**同一份** DMG 和 `SHA256SUMS`，复核哈希、签名、公证和对应版本，再向 Gitee 同步源码、标签和安装包。该流程可独立重试，失败时不能视作双平台发布完成。
 - **首次配置（必须）**：在 Gitee [个人设置 → 私人令牌](https://gitee.com/profile/personal_access_tokens) 创建具有 `projects` 权限的私人令牌；到 GitHub 仓库的 `Settings → Secrets and variables → Actions → New repository secret` 中创建名称**严格为 `GITEE_TOKEN`** 的 Secret。不要把令牌写入配置文件、终端命令、代码或提交记录。
-- 补发已存在的版本：进入 GitHub Actions → **Mirror verified GitHub Release to Gitee** → **Run workflow**，输入 `v0.1.33`（或目标已有版本标签）。此操作不会重复编译或覆盖 GitHub Release；远端同名附件会先检查，避免重复上传。**未设置 `GITEE_TOKEN` 时工作流会明确失败**。
+- 补发已存在且通过公证的版本：进入 GitHub Actions → **Mirror verified GitHub Release to Gitee** → **Run workflow**，输入目标版本标签。此操作不会重复编译或覆盖 GitHub Release。历史临时签名包不能用此流程同步。
 - Gitee `release-assets` 原始文件镜像与 Gitee Release 附件是不同的分发路径；旧原始文件镜像未自动更新时，请用 Gitee 的正式发行版附件下载，避免误下历史 DMG。
 
 ## 下载与安装
@@ -611,7 +616,7 @@ GitHub Actions 的 macOS 工作流会运行测试、Release 打包，并创建�
 
 正式发布前还需在独立测试用户中：从 DMG 拖入安装、首次启动、连接已知可用节点、切换节点、退出应用，并确认 macOS 系统代理恢复到原值。当前 CI 对节点切换与恢复只覆盖策略测试，不声称完成了真实系统代理端到端测试。
 
-以后取得 Developer ID Application 证书及公证凭据后，在干净且精确打上 `vX.Y.Z` 标签的提交上显式指定同一签名身份构建；`notarytool` 凭据先存入本机钥匙串，再执行可选公证步骤：
+手动制作正式安装包时，使用 Developer ID Application，在干净且精确打上 `vX.Y.Z` 标签的提交上显式指定同一签名身份构建。公证凭据提前配置到 `notarytool`；对外发布前必须通过公证：
 
 ```bash
 CODEX_HARBOR_SIGN_IDENTITY="Developer ID Application: <名称>" ./Scripts/build-app.sh full --no-install

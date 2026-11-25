@@ -10,6 +10,12 @@ enum HarborSystemProxy {
         var original: Data
         var managed: Data
         var pending: Data?
+        var transactionID: UUID?
+        var managedAt: Date?
+    }
+    private struct Journal: Codable {
+        var version: Int = 2
+        var services: [String: Snapshot]
     }
     enum Failure: LocalizedError {
         case unavailable, inUse, notOwned, changeFailed
@@ -41,11 +47,7 @@ enum HarborSystemProxy {
     /// Recover the actual managed listener port if the app exited before
     /// restoring the previous macOS network settings.
     static var ownedHTTPPort: Int? {
-        guard isOwned(), let snapshot = load(),
-              let managed = decoded(snapshot.managed) else { return nil }
-        guard let port = (managed["HTTPPort"] as? NSNumber)?.intValue,
-              usesEffectiveListener(port, all: true) else { return nil }
-        return port
+        ownedListenerPort()
     }
 
     private static func decoded(_ data: Data) -> [String: Any]? {
@@ -54,11 +56,21 @@ enum HarborSystemProxy {
     private static func encoded(_ value: [String: Any]) throws -> Data {
         try PropertyListSerialization.data(fromPropertyList: value, format: .binary, options: 0)
     }
-    private static func load() -> Snapshot? {
+    private static func loadSnapshots() -> [String: Snapshot]? {
+        guard hasBackup else { return [:] }
         guard let file = try? FileHandle(forReadingFrom: backupURL) else { return nil }
         defer { try? file.close() }
-        guard let bytes = try? file.read(upToCount: 256 * 1024 + 1), bytes.count <= 256 * 1024 else { return nil }
-        return try? JSONDecoder().decode(Snapshot.self, from: bytes)
+        let limit = 2 * 1024 * 1024
+        guard let bytes = try? file.read(upToCount: limit + 1), bytes.count <= limit else { return nil }
+        let decoder = JSONDecoder()
+        if let journal = try? decoder.decode(Journal.self, from: bytes) {
+            guard journal.version == 2, journal.services.count <= 64,
+                  journal.services.allSatisfy({ $0.key == $0.value.serviceID }) else { return nil }
+            return journal.services
+        }
+        // Existing v0.1.38 recovery files remain readable without migration.
+        guard let legacy = try? decoder.decode(Snapshot.self, from: bytes) else { return nil }
+        return [legacy.serviceID: legacy]
     }
     private static func currentService(_ prefs: SCPreferences) -> (String, SCNetworkProtocol)? {
         let serviceIDs = ["IPv4", "IPv6"].compactMap { family -> String? in
@@ -96,16 +108,23 @@ enum HarborSystemProxy {
         HarborSystemProxyNetworkSetup.matches(a, b)
     }
 
-    static func isOwned() -> Bool {
-        guard let snapshot = load(), let managed = decoded(snapshot.managed),
-              let port = (managed["HTTPPort"] as? NSNumber)?.intValue,
+    static func isOwned() -> Bool { ownedListenerPort() != nil }
+
+    private static func ownedListenerPort() -> Int? {
+        guard let snapshots = loadSnapshots(),
               let prefs = SCPreferencesCreate(nil, "com.codexharbor.proxy.read" as CFString, nil),
-              let (serviceID, target) = currentService(prefs), serviceID == snapshot.serviceID,
-              usesEffectiveListener(port, all: true) else { return false }
-        return HarborSystemProxyNetworkSetup.matches(
-            SCNetworkProtocolGetConfiguration(target) as? [String: Any] ?? [:],
-            managed, includeBypass: false
-        )
+              let (serviceID, target) = currentService(prefs),
+              let snapshot = snapshots[serviceID] else { return nil }
+        let current = SCNetworkProtocolGetConfiguration(target) as? [String: Any] ?? [:]
+        // The app may have exited just after applying a pending transaction.
+        // Accept it only if the complete actual listener matches the journal.
+        for data in [snapshot.pending, snapshot.managed].compactMap({ $0 }) {
+            guard let values = decoded(data), let port = (values["HTTPPort"] as? NSNumber)?.intValue,
+                  usesEffectiveListener(port, all: true),
+                  HarborSystemProxyNetworkSetup.matches(current, values, includeBypass: false) else { continue }
+            return port
+        }
+        return nil
     }
 
     private static func usesEffectiveListener(_ port: Int, all: Bool = false) -> Bool {
@@ -117,13 +136,51 @@ enum HarborSystemProxy {
     /// listener recorded by Harbor. A complete takeover by another client is
     /// safe to relinquish and must not strand node switching in recovery mode.
     static var currentUsesManagedListener: Bool {
-        guard let snapshot = load() else { return false }
-        let current = SCPreferencesCreate(nil, "com.codexharbor.proxy.read" as CFString, nil)
-            .flatMap { proxy($0, serviceID: snapshot.serviceID) }
-            .flatMap { SCNetworkProtocolGetConfiguration($0) as? [String: Any] } ?? [:]
-        return managedPorts(snapshot).contains { port in
-            HarborSystemProxyNetworkSetup.usesLoopback(current, httpPort: port) || usesEffectiveListener(port)
+        guard let snapshots = loadSnapshots() else { return hasBackup }
+        guard let prefs = SCPreferencesCreate(nil, "com.codexharbor.proxy.read" as CFString, nil) else {
+            return !snapshots.isEmpty
         }
+        return snapshots.values.contains { snapshot in
+            let current = proxy(prefs, serviceID: snapshot.serviceID)
+                .flatMap { SCNetworkProtocolGetConfiguration($0) as? [String: Any] } ?? [:]
+            return managedPorts(snapshot).contains { port in
+                HarborSystemProxyNetworkSetup.usesLoopback(current, httpPort: port) || usesEffectiveListener(port)
+            }
+        }
+    }
+
+    /// A configured inactive service can become active at any moment.
+    /// Its reference must be treated like a live listener dependency.
+    static func referencesListener(_ port: Int) -> Bool {
+        // Check every configured service, not only services in our journal.
+        // A manual edit or another app may still reference the old listener.
+        if usesEffectiveListener(port) { return true }
+        guard let prefs = SCPreferencesCreate(nil, "com.codexharbor.proxy.references" as CFString, nil),
+              let services = SCNetworkServiceCopyAll(prefs) as? [SCNetworkService]
+        else { return true }
+        return services.contains { service in
+            guard let target = SCNetworkServiceCopyProtocol(service, kSCNetworkProtocolTypeProxies),
+                  let values = SCNetworkProtocolGetConfiguration(target) as? [String: Any] else { return false }
+            return HarborSystemProxyNetworkSetup.usesLoopback(values, httpPort: port)
+        }
+    }
+
+    static func otherServiceReferencesListener(_ port: Int) -> Bool {
+        guard let prefs = SCPreferencesCreate(nil, "com.codexharbor.proxy.references" as CFString, nil),
+              let services = SCNetworkServiceCopyAll(prefs) as? [SCNetworkService]
+        else { return true }
+        let activeID = currentService(prefs)?.0
+        return services.contains { service in
+            guard (SCNetworkServiceGetServiceID(service) as String?) != activeID,
+                  let target = SCNetworkServiceCopyProtocol(service, kSCNetworkProtocolTypeProxies),
+                  let values = SCNetworkProtocolGetConfiguration(target) as? [String: Any] else { return false }
+            return HarborSystemProxyNetworkSetup.usesLoopback(values, httpPort: port)
+        }
+    }
+
+    static var activeUsesManagedListener: Bool {
+        guard let snapshots = loadSnapshots() else { return hasBackup }
+        return snapshots.values.flatMap(managedPorts).contains { usesEffectiveListener($0) }
     }
 
     private static func managedPorts(_ snapshot: Snapshot) -> [Int] {
@@ -161,32 +218,69 @@ enum HarborSystemProxy {
     private static func apply(
         serviceID: String, values: [String: Any], expected: [String: Any], requireActive: Bool = false
     ) throws {
-        guard let prefs = SCPreferencesCreate(nil, "com.codexharbor.proxy.read" as CFString, nil),
-              let service = SCNetworkServiceCopy(prefs, serviceID as CFString),
-              let name = SCNetworkServiceGetName(service) as String?,
-              let allServices = SCNetworkServiceCopyAll(prefs) as? [SCNetworkService],
-              allServices.filter({ (SCNetworkServiceGetName($0) as String?) == name }).count == 1,
-              let proto = SCNetworkServiceCopyProtocol(service, kSCNetworkProtocolTypeProxies)
-        else { throw Failure.unavailable }
-        let current = SCNetworkProtocolGetConfiguration(proto) as? [String: Any] ?? [:]
-        guard equal(current, expected),
-              let commands = HarborSystemProxyNetworkSetup.commands(
-                current: current, desired: values
-              ) else { throw Failure.notOwned }
+        if try applyWithPreferencesLock(serviceID: serviceID, values: values, expected: expected,
+                                        requireActive: requireActive) { return }
 
+        // Some accounts can use macOS's networksetup helper but cannot write
+        // the preferences directly. Re-read and verify the exact transition
+        // around every helper call, keeping the recovery snapshot on conflict.
+        guard let inspector = SCPreferencesCreate(nil, "com.codexharbor.proxy.read" as CFString, nil),
+              let service = SCNetworkServiceCopy(inspector, serviceID as CFString),
+              let name = SCNetworkServiceGetName(service) as String? else { throw Failure.unavailable }
         let deadline = ContinuousClock.now + .seconds(10)
-        for command in commands {
-            guard ContinuousClock.now < deadline else { throw Failure.changeFailed }
-            guard let fresh = SCPreferencesCreate(nil, "com.codexharbor.proxy.read" as CFString, nil),
-                  let destination = SCNetworkServiceCopy(fresh, serviceID as CFString),
-                  SCNetworkServiceGetName(destination) as String? == name,
-                  !requireActive || currentService(fresh)?.0 == serviceID else { throw Failure.notOwned }
-            let result = try HarborProxyCommand.runBlocking(
-                URL(fileURLWithPath: "/usr/sbin/networksetup"),
-                arguments: [command[0], name] + Array(command.dropFirst()), timeout: 3, outputLimit: 0
-            )
-            guard result.status == 0 else { throw Failure.changeFailed }
+        func read() throws -> [String: Any] {
+            guard let prefs = SCPreferencesCreate(nil, "com.codexharbor.proxy.read" as CFString, nil),
+                  let service = SCNetworkServiceCopy(prefs, serviceID as CFString),
+                  SCNetworkServiceGetName(service) as String? == name,
+                  let allServices = SCNetworkServiceCopyAll(prefs) as? [SCNetworkService],
+                  allServices.filter({ (SCNetworkServiceGetName($0) as String?) == name }).count == 1,
+                  let target = SCNetworkServiceCopyProtocol(service, kSCNetworkProtocolTypeProxies),
+                  !requireActive || currentService(prefs)?.0 == serviceID else { throw Failure.notOwned }
+            return SCNetworkProtocolGetConfiguration(target) as? [String: Any] ?? [:]
         }
+        do {
+            try HarborSystemProxyNetworkSetup.applyGuarded(expected: expected, desired: values, read: read) { command in
+                let remaining = ContinuousClock.now.duration(to: deadline).components
+                let seconds = Double(remaining.seconds) + Double(remaining.attoseconds) / 1e18
+                guard seconds > 0 else { throw Failure.changeFailed }
+                let result = try HarborProxyCommand.runBlocking(
+                    URL(fileURLWithPath: "/usr/sbin/networksetup"),
+                    arguments: [command[0], name] + Array(command.dropFirst()), timeout: min(3, seconds), outputLimit: 0
+                )
+                guard result.status == 0 else { throw Failure.changeFailed }
+            }
+        } catch is HarborSystemProxyNetworkSetup.GuardedWriteFailure {
+            throw Failure.notOwned
+        }
+    }
+
+    /// Compare and commit with the OS lock held when the current account has
+    /// direct write access. Do not wait on another writer or request more rights.
+    private static func applyWithPreferencesLock(
+        serviceID: String, values: [String: Any], expected: [String: Any], requireActive: Bool
+    ) throws -> Bool {
+        guard let prefs = SCPreferencesCreate(nil, "com.codexharbor.proxy.write" as CFString, nil) else {
+            throw Failure.unavailable
+        }
+        guard SCPreferencesLock(prefs, false) else {
+            let status = SCError()
+            if status == kSCStatusAccessError { return false }
+            if status == kSCStatusPrefsBusy || status == kSCStatusStale { throw Failure.notOwned }
+            throw Failure.changeFailed
+        }
+        defer { SCPreferencesUnlock(prefs) }
+        guard let target = proxy(prefs, serviceID: serviceID),
+              !requireActive || currentService(prefs)?.0 == serviceID else { throw Failure.notOwned }
+        let current = SCNetworkProtocolGetConfiguration(target) as? [String: Any] ?? [:]
+        guard HarborSystemProxyNetworkSetup.unchangedForWrite(current, expected) else { throw Failure.notOwned }
+        let updated = HarborSystemProxyNetworkSetup.mergingManagedValues(values, into: current)
+        if HarborSystemProxyNetworkSetup.unchangedForWrite(current, updated) { return true }
+        if !SCNetworkProtocolSetConfiguration(target, updated as CFDictionary) || !SCPreferencesCommitChanges(prefs) {
+            if SCError() == kSCStatusAccessError { return false }
+            throw Failure.changeFailed
+        }
+        guard SCPreferencesApplyChanges(prefs) else { throw Failure.changeFailed }
+        return true
     }
 
     static func enable(port: Int, forcedProxyDomains: [String], automaticBypass: [String]) async throws {
@@ -195,16 +289,23 @@ enum HarborSystemProxy {
         }
     }
 
-    private static func save(_ snapshot: Snapshot) throws {
+    private static func save(_ snapshots: [String: Snapshot]) throws {
+        if snapshots.isEmpty {
+            if hasBackup { try FileManager.default.removeItem(at: backupURL) }
+            return
+        }
+        guard snapshots.count <= 64 else { throw Failure.changeFailed }
         let parent = backupURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-        let staged = parent.appendingPathComponent(".proxy-recovery-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: staged) }
-        guard FileManager.default.createFile(
-            atPath: staged.path, contents: nil, attributes: [.posixPermissions: 0o600]
-        ) else { throw Failure.changeFailed }
-        try JSONEncoder().encode(snapshot).write(to: staged)
-        guard Darwin.rename(staged.path, backupURL.path) == 0 else { throw Failure.changeFailed }
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true,
+                                               attributes: [.posixPermissions: 0o700])
+        let encoder = JSONEncoder()
+        // Preserve the old single-service file shape for straightforward
+        // downgrade after a normal stop; multiple services need the v2 journal.
+        let data = try snapshots.count == 1
+            ? encoder.encode(snapshots.values.first!)
+            : encoder.encode(Journal(services: snapshots))
+        guard data.count <= 2 * 1024 * 1024 else { throw Failure.changeFailed }
+        try HarborProbeFiles.replace(data, at: backupURL)
     }
 
     private static func enableBlocking(port: Int, forcedProxyDomains: [String],
@@ -213,11 +314,24 @@ enum HarborSystemProxy {
         guard let inspector = SCPreferencesCreate(nil, "com.codexharbor.proxy.read" as CFString, nil),
               let (id, active) = currentService(inspector) else { throw Failure.unavailable }
         let inspected = SCNetworkProtocolGetConfiguration(active) as? [String: Any] ?? [:]
-        let previous = load()
+        guard var snapshots = loadSnapshots() else { throw Failure.notOwned }
+        var previous = snapshots[id]
         var original = inspected
-        if hasBackup {
-            guard let previous, previous.pending == nil, previous.serviceID == id,
-                  let baseline = decoded(previous.original), let managed = decoded(previous.managed),
+        if var record = previous {
+            if let pending = record.pending {
+                // Finish an interrupted commit only when the entire pending
+                // configuration actually took effect; otherwise require recovery.
+                if let values = decoded(pending), equal(inspected, values), usesEffectiveListener(portOf(values) ?? 0, all: true) {
+                    record.managed = pending
+                    record.pending = nil
+                    snapshots[id] = record
+                    try save(snapshots)
+                    previous = record
+                } else {
+                    throw Failure.notOwned
+                }
+            }
+            guard let baseline = decoded(record.original), let managed = decoded(record.managed),
                   HarborSystemProxyNetworkSetup.matches(inspected, managed, includeBypass: false) else {
                 throw Failure.notOwned
             }
@@ -243,10 +357,12 @@ enum HarborSystemProxy {
             forced: try HarborProxyDomainRules.normalized(forcedProxyDomains)
         )
         let desired = try encoded(updated)
-        var transition = Snapshot(serviceID: id, original: try encoded(original),
-                                  managed: previous?.managed ?? desired)
-        if previous != nil { transition.pending = desired }
-        try save(transition)
+        let transition = Snapshot(serviceID: id, original: try encoded(original),
+                                  managed: previous?.managed ?? desired, pending: desired,
+                                  transactionID: UUID(), managedAt: .now)
+        let priorSnapshots = snapshots
+        snapshots[id] = transition
+        try save(snapshots)
         do {
             try apply(serviceID: id, values: updated, expected: inspected, requireActive: true)
             guard let verifier = SCPreferencesCreate(nil, "com.codexharbor.proxy.verify" as CFString, nil),
@@ -254,18 +370,28 @@ enum HarborSystemProxy {
                   equal(SCNetworkProtocolGetConfiguration(target) as? [String: Any] ?? [:], updated) else {
                 throw Failure.changeFailed
             }
-            try save(Snapshot(serviceID: id, original: transition.original, managed: desired))
+            for _ in 0..<10 where !usesEffectiveListener(port, all: true) {
+                Thread.sleep(forTimeInterval: 0.06)
+            }
+            guard usesEffectiveListener(port, all: true) else { throw Failure.changeFailed }
+            snapshots[id] = Snapshot(serviceID: id, original: transition.original, managed: desired,
+                                     transactionID: transition.transactionID, managedAt: transition.managedAt)
+            try save(snapshots)
         } catch {
-            if let previous,
-               let verifier = SCPreferencesCreate(nil, "com.codexharbor.proxy.rollback" as CFString, nil),
+            if let verifier = SCPreferencesCreate(nil, "com.codexharbor.proxy.rollback" as CFString, nil),
                let target = proxy(verifier, serviceID: id) {
                 let current = SCNetworkProtocolGetConfiguration(target) as? [String: Any] ?? [:]
                 if HarborSystemProxyNetworkSetup.recoverable(current, original: inspected, managed: updated),
-                   (try? apply(serviceID: id, values: inspected, expected: current)) != nil {
-                    try? save(previous)
+                   (try? apply(serviceID: id, values: inspected, expected: current)) != nil,
+                   let checked = SCPreferencesCreate(nil, "com.codexharbor.proxy.rollback.verify" as CFString, nil),
+                   let restored = proxy(checked, serviceID: id),
+                   equal(SCNetworkProtocolGetConfiguration(restored) as? [String: Any] ?? [:], inspected) {
+                    // Keep the prepared journal if the dynamic store has not
+                    // caught up; the caller must preserve the affected listener.
+                    if previous != nil || !usesEffectiveListener(port) {
+                        try? save(priorSnapshots)
+                    }
                 }
-            } else if previous == nil {
-                _ = try? restoreBlocking()
             }
             throw error
         }
@@ -276,30 +402,61 @@ enum HarborSystemProxy {
         try await transaction { try restoreBlocking() }
     }
 
+    private static func portOf(_ values: [String: Any]) -> Int? {
+        guard let port = (values["HTTPPort"] as? NSNumber)?.intValue,
+              (1024...65534).contains(port) else { return nil }
+        return port
+    }
+
     private static func restoreBlocking() throws -> Bool {
-        guard let snapshot = load(), let original = decoded(snapshot.original),
-              let managed = decoded(snapshot.managed) else {
-            if hasBackup { throw Failure.notOwned }
-            return false
+        guard var snapshots = loadSnapshots() else { throw Failure.notOwned }
+        guard !snapshots.isEmpty else { return false }
+        // Restore active service last, so inactive services cannot strand a
+        // still-owned listener during a switch between Wi-Fi and a hotspot.
+        let activeID = SCPreferencesCreate(nil, "com.codexharbor.proxy.restore.order" as CFString, nil)
+            .flatMap { currentService($0)?.0 }
+        let ids = snapshots.keys.sorted { a, b in
+            if a == activeID { return false }
+            if b == activeID { return true }
+            return a < b
         }
+        for id in ids {
+            guard let snapshot = snapshots[id] else { continue }
+            try restoreService(snapshot, remaining: snapshots.values.filter { $0.serviceID != id })
+            snapshots.removeValue(forKey: id)
+            try save(snapshots)
+        }
+        return true
+    }
+
+    private static func restoreService(_ snapshot: Snapshot, remaining: [Snapshot]) throws {
+        guard let original = decoded(snapshot.original),
+              let managed = decoded(snapshot.managed) else { throw Failure.notOwned }
         guard let inspector = SCPreferencesCreate(nil, "com.codexharbor.proxy.read" as CFString, nil) else {
             throw Failure.unavailable
         }
         let ports = managedPorts(snapshot)
         func finishRestore() throws {
-            if currentService(inspector)?.0 != snapshot.serviceID,
-               ports.contains(where: { usesEffectiveListener($0) }) { throw Failure.notOwned }
-            try FileManager.default.removeItem(at: backupURL)
+            let activeID = SCPreferencesCreate(nil, "com.codexharbor.proxy.restore.verify" as CFString, nil)
+                .flatMap { currentService($0)?.0 }
+            let remainingPorts = remaining.filter { $0.serviceID == activeID }.flatMap(managedPorts)
+            let portsToRelease = ports.filter { !remainingPorts.contains($0) }
+            for _ in 0..<10 where portsToRelease.contains(where: { usesEffectiveListener($0) }) {
+                Thread.sleep(forTimeInterval: 0.06)
+            }
+            guard !portsToRelease.contains(where: { usesEffectiveListener($0) }) else {
+                throw Failure.notOwned
+            }
         }
         guard let target = proxy(inspector, serviceID: snapshot.serviceID) else {
             guard SCNetworkServiceCopy(inspector, snapshot.serviceID as CFString) == nil else { throw Failure.unavailable }
             try finishRestore()
-            return true
+            return
         }
         let current = SCNetworkProtocolGetConfiguration(target) as? [String: Any] ?? [:]
         if equal(current, original) {
             try finishRestore()
-            return true
+            return
         }
         var desired = HarborSystemProxyNetworkSetup.restoreValues(
             current: current, original: original, managed: managed)
@@ -309,7 +466,7 @@ enum HarborSystemProxy {
         }
         if equal(current, desired) {
             try finishRestore()
-            return true
+            return
         }
         try apply(serviceID: snapshot.serviceID, values: desired, expected: current)
         guard let verifier = SCPreferencesCreate(nil, "com.codexharbor.proxy.verify" as CFString, nil),
@@ -317,6 +474,5 @@ enum HarborSystemProxy {
               equal(SCNetworkProtocolGetConfiguration(verified) as? [String: Any] ?? [:], desired)
         else { throw Failure.changeFailed }
         try finishRestore()
-        return true
     }
 }

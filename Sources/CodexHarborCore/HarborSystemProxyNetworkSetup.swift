@@ -8,6 +8,14 @@ public enum HarborSystemProxyNetworkSetup {
         ("HTTPS", "-setsecurewebproxy", "-setsecurewebproxystate"),
         ("SOCKS", "-setsocksfirewallproxy", "-setsocksfirewallproxystate")
     ]
+    private static let flagKeys = ["HTTPEnable", "HTTPSEnable", "SOCKSEnable",
+                                   "ProxyAutoConfigEnable", "ProxyAutoDiscoveryEnable"]
+    private static let managedKeys = Set(flagKeys + protocols.flatMap { [$0.name + "Proxy", $0.name + "Port"] }
+                                         + ["ExceptionsList"])
+
+    public enum GuardedWriteFailure: Error {
+        case changed, unsupported
+    }
 
     private static func enabled(_ values: [String: Any], _ key: String) -> Bool {
         (values[key] as? NSNumber)?.boolValue == true
@@ -19,6 +27,73 @@ public enum HarborSystemProxyNetworkSetup {
 
     private static func same(_ lhs: Any?, _ rhs: Any?) -> Bool {
         (lhs as? NSObject) == (rhs as? NSObject)
+    }
+
+    /// Stronger than the effective settings comparison. A dormant endpoint
+    /// or PAC URL can have an owner even when its enable flag is off.
+    public static func unchangedForWrite(_ current: [String: Any], _ expected: [String: Any]) -> Bool {
+        Set(current.keys).union(expected.keys).allSatisfy { key in
+            if flagKeys.contains(key) { return enabled(current, key) == enabled(expected, key) }
+            if key == "ExceptionsList" {
+                return (current[key] as? [String] ?? []) == (expected[key] as? [String] ?? [])
+            }
+            return same(current[key], expected[key])
+        }
+    }
+
+    public static func mergingManagedValues(_ desired: [String: Any], into current: [String: Any]) -> [String: Any] {
+        var result = current
+        for key in managedKeys { result[key] = desired[key] }
+        return result
+    }
+
+    /// Nonprivileged fallback. A third party's change ends the transaction
+    /// before the next command, including changes to fields we never write.
+    public static func applyGuarded(
+        expected initial: [String: Any], desired: [String: Any],
+        read: () throws -> [String: Any], run: ([String]) throws -> Void
+    ) throws {
+        guard let planned = commands(current: initial, desired: desired) else {
+            throw GuardedWriteFailure.unsupported
+        }
+        var expected = initial
+        for command in planned {
+            guard unchangedForWrite(try read(), expected) else { throw GuardedWriteFailure.changed }
+            try run(command)
+            let observed = try read()
+            guard statesAfter(command, before: expected).contains(where: { unchangedForWrite(observed, $0) }) else {
+                throw GuardedWriteFailure.changed
+            }
+            expected = observed
+        }
+        guard unchangedForWrite(try read(), expected), matches(expected, desired) else {
+            throw GuardedWriteFailure.changed
+        }
+    }
+
+    private static func statesAfter(_ command: [String], before: [String: Any]) -> [[String: Any]] {
+        guard let option = command.first else { return [] }
+        var next = before
+        if let item = protocols.first(where: { $0.set == option }), command.count == 3,
+           let port = Int(command[2]) {
+            next[item.name + "Proxy"] = command[1]
+            next[item.name + "Port"] = port
+            // Setters can enable an endpoint. The explicit following
+            // state command resolves the difference when it matters.
+            var enabled = next
+            enabled[item.name + "Enable"] = 1
+            return [next, enabled]
+        }
+        if let item = protocols.first(where: { $0.state == option }), command.count == 2 {
+            next[item.name + "Enable"] = command[1] == "on" ? 1 : 0
+        } else if option == "-setproxybypassdomains" {
+            next["ExceptionsList"] = Array(command.dropFirst()) == ["Empty"] ? [] : Array(command.dropFirst())
+        } else if option == "-setautoproxystate" {
+            next["ProxyAutoConfigEnable"] = 0
+        } else if option == "-setproxyautodiscovery" {
+            next["ProxyAutoDiscoveryEnable"] = 0
+        } else { return [] }
+        return [next]
     }
 
     public static func matches(_ current: [String: Any], _ expected: [String: Any],

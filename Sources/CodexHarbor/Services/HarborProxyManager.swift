@@ -2,6 +2,7 @@ import AppKit
 import CodexHarborCore
 import CryptoKit
 import Foundation
+import Network
 import Darwin
 import Security
 import SystemConfiguration
@@ -23,6 +24,7 @@ private struct HarborProxyState: Codable, Equatable, Sendable {
     var httpListenPort: Int?
     var autoManageSystemProxy: Bool?
     var resumeConnectionOnLaunch: Bool?
+    var fallbackPolicy: HarborProxyFallbackPolicy?
     var subscriptionUpdatedAt: [String: Date]?
     var probeNetworkFingerprint: String?
     var probeNetworkChangedAt: Date?
@@ -33,6 +35,7 @@ private struct HarborProxyState: Codable, Equatable, Sendable {
     var nodeNetworkEvidence: [String: HarborProxyNetworkEvidence]?
     // Per-node observed exit, never indexed by shared server IP.
     var nodeExitLocations: [String: HarborProxyExitLocation]?
+    var nodeExitNetworkEvidence: [String: HarborProxyNetworkEvidence]?
     // Optional so older encrypted state remains decodable after latency
     // results become durable.
     var probeResults: [String: HarborProxyProbeResult]?
@@ -178,6 +181,7 @@ final class HarborProxyManager: ObservableObject {
     /// Runtime identity is separate from the desired/saved profile; the UI
     /// must never call a merely selected node "connected".
     @Published private(set) var activeNodeID: String?
+    @Published private(set) var connectionPhase: HarborConnectionPhase = .stopped
     @Published private(set) var running = false
     @Published private(set) var healthy = false
     @Published private(set) var checkingConnectivity = false
@@ -192,7 +196,7 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var localPort: Int?
     @Published private(set) var configuredHTTPPort = HarborProxyPortPolicy.defaultHTTPPort
     @Published private(set) var switchingNodeID: String?
-    private var pendingActivation = HarborProxyActivationQueue()
+    private let connectionCoordinator = HarborConnectionCoordinator()
     private var activationInProgress = false
     private var connectionTransition = false
     private var shuttingDownConnection = false
@@ -204,6 +208,13 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var nodeServerLocations: [String: HarborProxyIPLocation] = [:]
     @Published private(set) var nodeNetworkEvidence: [String: HarborProxyNetworkEvidence] = [:]
     @Published private(set) var nodeExitLocations: [String: HarborProxyExitLocation] = [:]
+    @Published private(set) var nodeExitNetworkEvidence: [String: HarborProxyNetworkEvidence] = [:]
+    @Published private(set) var lastSuccessfulHealthCheckAt: Date?
+    private var exitClassificationTask: Task<Void, Never>?
+    private var exitObservationTask: Task<Void, Never>?
+    private var exitObservationCancellation: HarborLatencyCancellation?
+    private var exitClassificationCancellation: HarborLatencyCancellation?
+    private var exitClassificationKey: String?
     @Published private(set) var exitGeoUpdating = false
     @Published private(set) var exitGeoCleaningUp = false
     @Published private(set) var exitGeoSummary = ""
@@ -236,6 +247,9 @@ final class HarborProxyManager: ObservableObject {
     @Published private(set) var configurationLoadError: String?
     @Published private(set) var configurationSaveError: String?
     @Published private(set) var resumeConnectionOnLaunch = false
+    @Published private(set) var fallbackPolicy = HarborProxyFallbackPolicy()
+    private var attemptedFallbackIDs: Set<String> = []
+    private var lastFallbackAttempt: ContinuousClock.Instant?
     @Published private(set) var probeNetworkChangedAt = Date.distantPast
     private var store = HarborProxyState()
     private let persistence: HarborProxyStateFile<HarborProxyState>
@@ -269,7 +283,20 @@ final class HarborProxyManager: ObservableObject {
     private var vpnGateUnderlayNodeID: String?
     private var activeWARPProfile: HarborWARPProfile?
     private var activePolicy: RoutingPolicy?
+    private let runtimeSupervisor = HarborRuntimeEngineSupervisor()
+    private var localGateway: HarborAgentGateway?
+    private var gatewayBackend: GatewayBackend?
+    private var drainingBackend: GatewayBackend?
+    private var migrationGateway: HarborAgentGateway?
+    private var gatewayHealthPolicy = HarborProxyHealthPolicy()
+    private var gatewayRecoveryTask: Task<Void, Never>?
+    private var gatewayRecoveryToken = UUID()
+    private var networkPathMonitor: NWPathMonitor?
+    private var networkOnline = true
     private var warpRegistrationTask: Task<HarborWARPAccount, Error>?
+    private var warpRegistrationID: UUID?
+    private let warpDiscoveryPool = HarborWARPDiscoveryPool()
+    private var formalWARPDiscovery = HarborWARPFormalDiscoveryPolicy()
     private var vpnGateDownloadCancellation: HarborLatencyCancellation?
     private var bootstrapped = false
     private var bootstrapping = false
@@ -294,11 +321,20 @@ final class HarborProxyManager: ObservableObject {
     /// Used to prevent a delayed health probe from updating a newer node.
     private var connectionGeneration: UInt64 = 0
     private var healthTask: Task<Void, Never>?
+    private var activeHealthCancellation: HarborLatencyCancellation?
     /// Cheap process-only check, started only while Xray runs. Handles adoption
     /// of a previous process, where Process.terminationHandler is unavailable.
     private var livenessTask: Task<Void, Never>?
     private var intentionallyStoppingCore = false
     private var runtimeRecordURL: URL { root.appendingPathComponent("active-process.json") }
+    private var legacyMigrationURL: URL { root.appendingPathComponent("legacy-migration.json") }
+
+    private struct LegacyMigration: Codable {
+        let oldPort: Int
+        let stagingPort: Int
+        let targetPort: Int
+        let wasManaged: Bool
+    }
     /// Private, local-only Xray warnings. Refreshed for each new Xray process;
     /// never included in the public app logs or remote MCP payloads.
     private var runtimeErrorLogURL: URL { root.appendingPathComponent("xray-runtime-warnings.log") }
@@ -350,13 +386,55 @@ final class HarborProxyManager: ObservableObject {
         case underlay(String)
         case warp(HarborWARPProfile)
     }
+    private struct GatewayBackend {
+        let nodeID: String
+        let endpointSignature: String
+        var observedExitIP: String?
+        let primary: HarborRuntimeEngineSupervisor.Engine
+        let underlay: HarborRuntimeEngineSupervisor.Engine?
+        let underlayID: String?
+        let warp: HarborWARPProfile?
+        let warpExitIP: String?
+        let policy: RoutingPolicy
+
+        func agentRoute() throws -> HarborProxyAgentRoute {
+            let engines = [primary] + (underlay.map { [$0] } ?? [])
+            let records = engines.compactMap(\.agentRecord)
+            guard records.count == engines.count else { throw HarborProxyError.invalid("代理内核身份未确认") }
+            for engine in engines { engine.managedByAgent = true }
+            return .init(nodeID: nodeID, endpointSignature: endpointSignature, primaryID: primary.id,
+                underlayID: underlay?.id, underlayNodeID: underlayID, warpEndpoint: warp?.endpoint,
+                ruleMode: policy.ruleMode, forcedDomains: policy.forcedDomains,
+                localHostAddresses: policy.localHostAddresses, observedExitIP: observedExitIP, engines: records)
+        }
+
+        var engineIDs: Set<UUID> {
+            Set([primary.id] + (underlay.map { [$0.id] } ?? []))
+        }
+
+        var alive: Bool {
+            primary.isAlive && primary.configurationUnchanged
+                && (underlay.map { $0.isAlive && $0.configurationUnchanged } ?? true)
+        }
+    }
+
     var selectedNode: HarborProxyNode? { nodes.first { $0.id == selectedID } }
+    var canMaintainResidentProxy: Bool {
+        configurationLoaded && (running || bootstrapping || activationInProgress || connectionTransition
+                                || shuttingDownConnection)
+    }
     var activeNode: HarborProxyNode? { nodes.first { $0.id == activeNodeID } }
+    var currentVerifiedExitIP: String? {
+        guard running, healthy, let activeNode else { return nil }
+        if HarborIndependentWARP.isBuiltIn(activeNode) { return warpExitIP }
+        if let gatewayBackend { return gatewayBackend.observedExitIP }
+        return observedExit(for: activeNode)?.ip
+    }
     private var workingVPNGateUnderlay: (nodeID: String, socksPort: Int, routeID: String)? {
         guard running, healthy, let activeNode,
               !HarborIndependentWARP.isBuiltIn(activeNode) else { return nil }
         let isOpenVPN = activeNode.protocolName == "openvpn"
-        guard let port = isOpenVPN ? underlayPort : localPort,
+        guard let port = isOpenVPN ? underlayPort : (gatewayBackend?.primary.port ?? localPort),
               let nodeID = isOpenVPN ? vpnGateUnderlayNodeID : activeNodeID else { return nil }
         return (nodeID, port + 1, "underlay:" + nodeID)
     }
@@ -422,44 +500,74 @@ final class HarborProxyManager: ObservableObject {
         return HarborWARPProfile(account: account, endpoint: endpoint)
     }
 
-    /// Enrollment and discovery are independent of the selected subscription,
-    /// the active proxy, and every VPN Gate candidate.
-    private func prepareIndependentVPNGateTunnel(
-        cancellation: HarborLatencyCancellation,
-        preferred: HarborWARPEndpoint? = nil
-    ) async throws -> HarborWARPTunnel {
+    /// Enrollment is shared by screening and formal connection discovery.
+    private func ensureWARPAccount(
+        cancellation: HarborLatencyCancellation
+    ) async throws -> HarborWARPAccount {
+        let epoch = connectionCoordinator.networkEpoch
         guard mihomoInstalled else { throw HarborProxyError.invalid("请从安装包恢复内置 Mihomo 内核") }
         if store.warpAccount == nil {
             detail = "首次准备独立筛选通道，正在生成本机凭据"
             if warpRegistrationTask == nil {
+                warpRegistrationID = UUID()
                 warpRegistrationTask = Task { try await HarborWARPRegistration.register() }
             }
-            let task = warpRegistrationTask!
-            let observer = cancellation.observe { task.cancel() }
+            guard let task = warpRegistrationTask, let id = warpRegistrationID else { throw CancellationError() }
             defer {
-                if let observer { cancellation.removeObserver(observer) }
-                warpRegistrationTask = nil
+                if warpRegistrationID == id {
+                    warpRegistrationTask = nil
+                    warpRegistrationID = nil
+                }
             }
-            store.warpAccount = try await task.value
-            persist()
+            let account = try await task.value
+            guard !shuttingDownConnection, networkOnline, epoch == connectionCoordinator.networkEpoch else {
+                throw CancellationError()
+            }
+            if store.warpAccount == nil {
+                store.warpAccount = account
+                persist()
+            }
         }
-        guard !cancellation.isCancelled, let account = store.warpAccount else { throw CancellationError() }
+        guard !cancellation.isCancelled, !Task.isCancelled, !shuttingDownConnection,
+              networkOnline, epoch == connectionCoordinator.networkEpoch,
+              let account = store.warpAccount else { throw CancellationError() }
+        try account.validate()
+        return account
+    }
+
+    /// Screening uses a shared temporary tunnel; the formal connection
+    /// path instead verifies resident candidates directly.
+    private func prepareIndependentVPNGateTunnel(
+        cancellation: HarborLatencyCancellation,
+        preferred: HarborWARPEndpoint? = nil
+    ) async throws -> HarborWARPDiscoveryPool.Lease {
+        let epoch = connectionCoordinator.networkEpoch
+        let account = try await ensureWARPAccount(cancellation: cancellation)
         detail = "正在验证独立筛选通道，无需启用订阅节点"
-        let tunnel = try await HarborWARPTunnel.prepare(
+        let tunnel = try await warpDiscoveryPool.acquire(
             account: account, preferred: preferred ?? store.warpEndpoint,
-            root: root, cancellation: cancellation)
+            root: root, networkEpoch: epoch, cancellation: cancellation)
+        guard epoch == connectionCoordinator.networkEpoch, !shuttingDownConnection,
+              !cancellation.isCancelled, !Task.isCancelled else {
+            await tunnel.close()
+            throw CancellationError()
+        }
         store.warpEndpoint = tunnel.profile.endpoint
         persist()
         return tunnel
     }
 
     private func runningConfigMatches(_ id: String, path: URL?) -> Bool {
+        if let gatewayBackend {
+            return gatewayBackend.nodeID == id && gatewayBackend.primary.configuration == path
+                && gatewayBackend.alive && nodes.first(where: { $0.id == id })?.endpointSignature == gatewayBackend.endpointSignature
+        }
         guard let node = nodes.first(where: { $0.id == id }),
               let path, let data = try? Data(contentsOf: path) else { return false }
         return HarborIndependentWARP.isBuiltIn(node)
             ? activeWARPProfile.map {
                 HarborWARPConfig.matches(configuration: data, profile: $0,
-                                        httpPort: localPort ?? configuredHTTPPort)
+                                        httpPort: gatewayBackend?.primary.port ?? localPort ?? configuredHTTPPort)
               } ?? false
             : node.protocolName == "openvpn"
             ? HarborMihomoConfig.matches(configuration: data, node: node,
@@ -468,81 +576,51 @@ final class HarborProxyManager: ObservableObject {
             : HarborProxyRuntimeIdentity.matches(configuration: data, node: node)
     }
 
-    private func underlayRecord(nodeID: String?) -> HarborProxyUnderlayRecord? {
-        guard let nodeID, let underlayPort, let underlayConfigPath,
-              let pid = underlayChild?.processIdentifier ?? adoptedUnderlayPID else { return nil }
-        return HarborProxyUnderlayRecord(
-            pid: pid, configPath: underlayConfigPath.path,
-            executablePath: root.appendingPathComponent("xray").path,
-            httpPort: underlayPort, nodeID: nodeID)
-    }
+    private lazy var proxyDiagnostics = HarborProxyDiagnostics(
+        destination: root.appendingPathComponent("proxy-switch-diagnostics.log"))
 
-    /// A second isolated Xray carries the VPN relay after the former active
-    /// listener is stopped. It does not change macOS proxy settings.
-    private func startUnderlay(_ node: HarborProxyNode,
-                               cancellation: HarborLatencyCancellation?) async throws {
-        guard let port = HarborNodeLatencyTester.reservePortPair() else {
-            throw HarborProxyError.invalid("底座代理本地端口不可用")
-        }
-        let file = root.appendingPathComponent("underlay-\(UUID().uuidString).json")
-        var process: Process?
-        do {
-            let config = try HarborXrayConfig.make(
-                node: node, httpPort: port, ruleMode: false, routeAllViaProxy: true)
-            try HarborProbeFiles.write(config, to: file)
-            let engine = Process()
-            engine.executableURL = root.appendingPathComponent("xray")
-            engine.currentDirectoryURL = root
-            engine.arguments = ["run", "-config", file.path]
-            engine.standardInput = FileHandle.nullDevice
-            engine.standardOutput = FileHandle.nullDevice
-            engine.standardError = FileHandle.nullDevice
-            try engine.run()
-            process = engine
-            underlayChild = engine
-            underlayConfigPath = file
-            underlayPort = port
-            guard await HarborNodeLatencyTester.awaitListeningPair(
-                port: port, process: engine, cancellation: cancellation) else {
-                proxyAudit("underlay_listener_failed", nodeID: node.id,
-                           note: "alive=\(engine.isRunning)")
-                throw HarborProxyError.invalid("底座代理未能建立 HTTP/SOCKS5 监听")
-            }
-        } catch {
-            if let process, !(await HarborProxyCommand.stop(process)) { throw error }
-            underlayChild = nil
-            underlayConfigPath = nil
-            underlayPort = nil
-            try? FileManager.default.removeItem(at: file)
-            HarborNodeLatencyTester.releasePortPair(port)
-            throw error
-        }
-    }
-
-    /// Minimal, bounded, append-only, permission-restricted switch journal.
-    /// Node IDs are hashed, never record IP, hostname, SNI, credentials or URLs.
-    private func proxyAudit(_ event: String, nodeID: String? = nil, note: String = "") {
+    /// Structured, bounded audit. Node IDs are hashed; error text, endpoints,
+    /// subscription URLs and credentials never enter the journal.
+    private func proxyAudit(_ event: String, nodeID: String? = nil, note: String = "",
+                            category explicitCategory: HarborProxyErrorCategory? = nil) {
         let marker = nodeID.map { id in
-            SHA256.hash(data: Data(id.utf8)).prefix(6).map { String(format: "%02x", $0) }.joined()
-        } ?? "none"
-        let destination = root.appendingPathComponent("proxy-switch-diagnostics.log")
-        let fd = destination.path.withCString {
-            Darwin.open($0, O_WRONLY | O_CREAT | O_APPEND, mode_t(0o600))
+            SHA256.hash(data: Data(id.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
         }
-        guard fd >= 0 else { return }
-        defer { _ = Darwin.close(fd) }
-        _ = Darwin.fchmod(fd, mode_t(0o600))
-        let time = ISO8601DateFormatter().string(from: .now)
-        let line = "\(time) event=\(event) node=\(marker) pid=\(child?.processIdentifier ?? adoptedPID ?? 0) port=\(localPort ?? 0) \(note)\n"
-        let bytes = Array(line.utf8)
-        bytes.withUnsafeBytes { ptr in
-            if let base = ptr.baseAddress { _ = Darwin.write(fd, base, ptr.count) }
+        var fields = HarborProxyDiagnosticEvent.fields(from: note)
+        fields["pid"] = String(child?.processIdentifier ?? adoptedPID ?? 0)
+        fields["port"] = String(localPort ?? 0)
+        let category: HarborProxyErrorCategory?
+        if let explicitCategory { category = explicitCategory }
+        else {
+            switch event {
+            case "underlay_listener_failed": category = .underlayUnavailable
+            case "health_identity_mismatch", "runtime_config_mismatch", "periodic_identity_mismatch":
+                category = .configurationIdentityMismatch
+            case "health_failed", "gateway_candidate_failed", "switch_preflight_failed":
+                category = .httpsUnreachable
+            case "gateway_backend_unavailable", "unexpected_xray_exit", "startup_failed":
+                category = .engineStartFailed
+            case "gateway_port_migration_failed", "rollback_system_proxy_failed": category = .systemProxyConflict
+            case "vpngate_warp_unavailable": category = .warpUnavailable
+            case "gateway_recovery_failed", "rollback_failed", "switch_failed": category = .recoveryFailed
+            case "old_stop_failed": category = .cleanupFailed
+            default: category = nil
+            }
         }
-        if (try? FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.intValue ?? 0 > 128 * 1024 {
-            // No unbounded growth; resume with a fresh audit on the next event.
-            _ = Darwin.ftruncate(fd, 0)
+        let transaction = connectionCoordinator.current
+        let elapsed = transaction.map { value -> Int in
+            let parts = value.startedAt.duration(to: .now).components
+            return max(0, Int(parts.seconds * 1000 + parts.attoseconds / 1_000_000_000_000_000))
         }
+        proxyDiagnostics.append(HarborProxyDiagnosticEvent(
+            event: event, transactionID: transaction?.id, generation: transaction?.generation ?? connectionGeneration,
+            engineID: gatewayBackend?.primary.id, nodeHash: marker,
+            engineType: gatewayBackend.map { $0.primary.kind == .xray ? "xray" : "mihomo" },
+            connectionState: connectionPhase, networkEpoch: connectionCoordinator.networkEpoch,
+            errorCategory: category, failureStage: fields["stage"], durationMilliseconds: elapsed,
+            retryCount: gatewayHealthPolicy.recoveryAttempts, fields: fields))
     }
+
     var coreInstalled: Bool {
         let files = ["xray", "geoip.dat", "geosite.dat"]
         return files.allSatisfy {
@@ -646,6 +724,13 @@ final class HarborProxyManager: ObservableObject {
             refreshSystemProxyState()
             return true
         }
+        if localGateway != nil, !HarborSystemProxy.activeUsesManagedListener {
+            // Leave inactive-service records intact. The active service may
+            // belong to another application; enable() checks it independently.
+            systemManaged = false
+            refreshSystemProxyState()
+            return false
+        }
         do {
             try await HarborSystemProxy.restore()
             systemManaged = false
@@ -669,6 +754,13 @@ final class HarborProxyManager: ObservableObject {
         }
         monitor.start()
         systemProxyMonitor = monitor
+        let pathMonitor = NWPathMonitor()
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let online = path.status == .satisfied
+            Task { @MainActor [weak self] in self?.updateNetworkAvailability(online) }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "com.codexharbor.proxy.network-path", qos: .utility))
+        networkPathMonitor = pathMonitor
         appActivationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification,
             object: nil,
@@ -700,11 +792,158 @@ final class HarborProxyManager: ObservableObject {
         }
     }
 
+    private func updateNetworkAvailability(_ online: Bool) {
+        guard online != networkOnline else { return }
+        networkOnline = online
+        gatewayHealthPolicy.networkChanged(online: online)
+        cancelGatewayRecovery(reset: false)
+        activeHealthCancellation?.cancel()
+        connectionCoordinator.networkChanged()
+        formalWARPDiscovery.invalidate()
+        warpDiscoveryPool.invalidate()
+        cancelActiveExitClassification()
+        gatewayBackend?.observedExitIP = nil
+        activationPreflightCancellation?.cancel()
+        if !online {
+            if localGateway != nil {
+                healthy = false
+                checkingConnectivity = false
+                connectionPhase = .offline
+                status = "网络离线 · 已暂停恢复"
+            }
+        } else if gatewayBackend != nil {
+            lastActiveHealthCheckAt = nil
+            connectionPhase = .degraded
+            scheduleGatewayRecovery(.recheck(afterSeconds: 0))
+        }
+        refreshProbeNetwork()
+    }
+
+    private func cancelGatewayRecovery(reset: Bool) {
+        gatewayRecoveryToken = UUID()
+        gatewayRecoveryTask?.cancel()
+        gatewayRecoveryTask = nil
+        if reset { gatewayHealthPolicy.recordHealthy() }
+    }
+
+    private func scheduleGatewayRecovery(_ action: HarborProxyHealthPolicy.Action) {
+        guard gatewayRecoveryTask == nil, networkOnline, !shuttingDownConnection,
+              let nodeID = activeNodeID, localGateway != nil else { return }
+        let delay: Int
+        switch action {
+        case .none: return
+        case .recheck(let seconds), .recover(let seconds), .cooldown(let seconds):
+            delay = seconds
+        }
+        let token = UUID()
+        gatewayRecoveryToken = token
+        let generation = connectionGeneration
+        if case .cooldown = action {
+            connectionPhase = .failed
+            status = "代理恢复失败 · 退避中"
+            detail = "将在 \(delay) 秒后重新尝试当前节点，未绕过代理"
+        }
+        gatewayRecoveryTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            guard let self, self.gatewayRecoveryToken == token else { return }
+            self.gatewayRecoveryTask = nil
+            guard self.networkOnline, !self.shuttingDownConnection, !Task.isCancelled,
+                  self.connectionGeneration == generation, self.activeNodeID == nodeID else { return }
+            if self.connectionTransition || self.activationInProgress || self.busy || self.checkingConnectivity {
+                // Retry only after other operations finish; never enqueue a
+                // recovery ahead of a newer explicit user request.
+                if !self.connectionCoordinator.hasPending {
+                    let deferred: HarborProxyHealthPolicy.Action
+                    switch action {
+                    case .recheck: deferred = .recheck(afterSeconds: 5)
+                    case .recover: deferred = .recover(afterSeconds: 5)
+                    case .cooldown: deferred = .cooldown(afterSeconds: 5)
+                    case .none: deferred = .none
+                    }
+                    self.scheduleGatewayRecovery(deferred)
+                }
+                return
+            }
+            if case .recheck = action, self.coreProcessAlive {
+                await self.verify()
+                return
+            }
+            if case .cooldown = action { self.gatewayHealthPolicy.cooldownElapsed() }
+            guard self.gatewayHealthPolicy.beginRecovery() else {
+                self.scheduleGatewayRecovery(self.gatewayHealthPolicy.recoveryFailed())
+                return
+            }
+            self.connectionPhase = .recovering
+            self.status = "正在恢复当前节点"
+            self.proxyAudit("gateway_recovery_started", nodeID: nodeID,
+                            note: "attempt=\(self.gatewayHealthPolicy.recoveryAttempts)")
+            await self.queueActivation(nodeID, restart: true, userInitiated: false)
+            guard !self.shuttingDownConnection, !Task.isCancelled,
+                  self.gatewayRecoveryToken == token,
+                  self.connectionGeneration == generation,
+                  self.activeNodeID == nodeID, !self.healthy else { return }
+            self.proxyAudit("gateway_recovery_failed", nodeID: nodeID)
+            if self.gatewayHealthPolicy.recoveryAttempts >= HarborProxyHealthPolicy.recoveryLimit {
+                await self.tryAuthorizedFallback(from: nodeID)
+                guard !self.shuttingDownConnection, !Task.isCancelled,
+                      self.gatewayRecoveryToken == token, self.connectionGeneration == generation,
+                      self.activeNodeID == nodeID, !self.healthy else { return }
+            }
+            self.scheduleGatewayRecovery(self.gatewayHealthPolicy.recoveryFailed())
+        }
+    }
+
+    /// At most three distinct explicitly authorized backups per manual
+    /// connection, at least 60 seconds apart. Never infer authorization
+    /// from favorites or subscription membership.
+    private func tryAuthorizedFallback(from nodeID: String) async {
+        guard fallbackPolicy.enabled, networkOnline, !shuttingDownConnection,
+              !connectionTransition, !activationInProgress, !connectionCoordinator.hasPending,
+              let original = activeNode, original.id == nodeID,
+              let backend = gatewayBackend, backend.nodeID == nodeID,
+              let ip = backend.observedExitIP,
+              let evidence = nodeExitNetworkEvidence[nodeID],
+              evidence.networkEpoch == connectionCoordinator.networkEpoch,
+              let constraint = HarborProxyFallbackPolicy.ExitConstraint(evidence: evidence, observedIP: ip)
+        else { return }
+        if let lastFallbackAttempt, lastFallbackAttempt.duration(to: .now) < .seconds(60) { return }
+        attemptedFallbackIDs.insert(nodeID)
+        guard attemptedFallbackIDs.count < 4 else { return }
+        let candidates = nodes.filter {
+            $0.id != nodeID && !attemptedFallbackIDs.contains($0.id)
+                && fallbackPolicy.permits(nodeID: $0.id, signature: $0.endpointSignature)
+                && $0.protocolName == original.protocolName
+                && supportsCore(for: $0)
+        }.sorted { $0.id < $1.id }
+        guard let candidate = candidates.first else { return }
+        attemptedFallbackIDs.insert(candidate.id)
+        lastFallbackAttempt = .now
+        switchingNodeID = candidate.id
+        status = "正在验证已授权备用节点"
+        proxyAudit("authorized_fallback_started", nodeID: candidate.id)
+        await HarborProbeScope.$priority.withValue(.recovery) {
+            await activateOne(candidate.id, restart: true, userInitiated: false, fallback: constraint)
+        }
+        if !activationInProgress { switchingNodeID = nil }
+        if activeNodeID == candidate.id && healthy {
+            proxyAudit("authorized_fallback_succeeded", nodeID: candidate.id)
+        } else {
+            proxyAudit("authorized_fallback_rejected", nodeID: candidate.id)
+        }
+    }
+
     private func refreshProbeNetwork() {
         guard configurationLoaded, let route = HarborSystemProxy.currentNetworkFingerprintInput() else { return }
         let key = Data(SHA256.hash(data: Data(route.utf8))).base64EncodedString()
         guard store.probeNetworkFingerprint != key else { return }
         if store.probeNetworkFingerprint != nil {
+            connectionCoordinator.networkChanged()
+            formalWARPDiscovery.invalidate()
+            warpDiscoveryPool.invalidate()
+            cancelActiveExitClassification()
+            gatewayBackend?.observedExitIP = nil
+            activeHealthCancellation?.cancel()
+            activationPreflightCancellation?.cancel()
             probeNetworkChangedAt = .now
             cancelLatencyTests()
             cancelAllExitGeoWork()
@@ -760,8 +999,22 @@ final class HarborProxyManager: ObservableObject {
         startSystemProxyMonitoring()
         refreshSystemProxyState(synchronizeOwnership: true)
         let probeRoot = root
-        await HarborWARPTunnel.cleanupOrphans(root: probeRoot)
-        await HarborProbeFiles.cleanOrphans(root: probeRoot)
+        var resident: HarborProxyAgentSnapshot?
+        if FileManager.default.fileExists(atPath: HarborProxyAgentConstants.journalURL.path) {
+            do { resident = try await HarborProxyAgentClient.shared.inspect() }
+            catch {
+                detail = "独立代理服务记录尚未确认，已暂停启动清理：" + error.localizedDescription
+                return
+            }
+        }
+        var protectedPaths = Set((resident?.engines ?? []).flatMap { [$0.configurationPath, $0.directoryPath] })
+        for id in (resident?.pendingLaunchPorts ?? [:]).keys {
+            let file = probeRoot.appendingPathComponent("probe-runtime-\(id.uuidString).json")
+            protectedPaths.insert(file.path)
+            protectedPaths.insert(file.deletingPathExtension().appendingPathExtension("data").path)
+        }
+        await HarborWARPTunnel.cleanupOrphans(root: probeRoot, protectedPaths: protectedPaths)
+        await HarborProbeFiles.cleanOrphans(root: probeRoot, protectedPaths: protectedPaths)
         if !configurationLoaded {
             configurationLoadError = nil
             do {
@@ -772,6 +1025,7 @@ final class HarborProxyManager: ObservableObject {
                 nodeNetworkEvidence = state.nodeNetworkEvidence ?? [:]
                 nodeServerResolvedAt = state.nodeServerResolvedAt ?? [:]
                 nodeExitLocations = state.nodeExitLocations ?? [:]
+                nodeExitNetworkEvidence = state.nodeExitNetworkEvidence ?? [:]
                 probeResults = state.probeResults ?? [:]
                 subscriptions = state.subscriptions
                 subscriptionUpdatedAt = state.subscriptionUpdatedAt ?? [:]
@@ -781,6 +1035,7 @@ final class HarborProxyManager: ObservableObject {
                 routingRules = state.routingRules
                 autoManageSystemProxy = state.autoManageSystemProxy ?? true
                 resumeConnectionOnLaunch = state.resumeConnectionOnLaunch ?? HarborSystemProxy.hasBackup
+                fallbackPolicy = state.fallbackPolicy ?? HarborProxyFallbackPolicy()
                 configuredHTTPPort = (try? HarborProxyPortPolicy.validate(
                     httpPort: state.httpListenPort ?? HarborProxyPortPolicy.defaultHTTPPort
                 )) ?? HarborProxyPortPolicy.defaultHTTPPort
@@ -827,6 +1082,88 @@ final class HarborProxyManager: ObservableObject {
         startSystemProxyMonitoring()
         refreshSystemProxyState(synchronizeOwnership: true)
         startupTrace("bootstrap-entered")
+        var migration: LegacyMigration?
+        if FileManager.default.fileExists(atPath: legacyMigrationURL.path) {
+            guard let data = try? Data(contentsOf: legacyMigrationURL), data.count <= 4096,
+                  let saved = try? JSONDecoder().decode(LegacyMigration.self, from: data),
+                  [saved.oldPort, saved.stagingPort, saved.targetPort].allSatisfy({ (1024...65534).contains($0) }),
+                  abs(saved.stagingPort - saved.oldPort) > 1,
+                  abs(saved.stagingPort - saved.targetPort) > 1 else {
+                detail = "旧代理迁移记录无法核对，已停止自动清理"
+                return
+            }
+            migration = saved
+            if FileManager.default.fileExists(atPath: runtimeRecordURL.path) {
+                let stagedRoute = resident?.gateways.first(where: { $0.port == saved.stagingPort })
+                let stagedCommitted = stagedRoute?.route != nil &&
+                    stagedRoute?.routingBackendID == stagedRoute?.route?.primaryID && stagedRoute?.ready == true
+                if HarborSystemProxy.referencesListener(saved.oldPort) || !stagedCommitted {
+                    // The system still points at the legacy listener, or the
+                    // staged route never became live. Never
+                    // adopt a staging route as though it had replaced it.
+                    if HarborSystemProxy.referencesListener(saved.stagingPort) {
+                        detail = "旧入口和迁移入口均被引用，保留两个入口，请先恢复系统代理"
+                        return
+                    }
+                    if let current = resident {
+                        runtimeSupervisor.adoptSnapshot(current)
+                        for entry in current.gateways {
+                            guard entry.port == saved.stagingPort,
+                                  let gateway = try? HarborAgentGateway(httpPort: entry.port),
+                                  await gateway.stop() else {
+                                detail = "迁移入口回收未确认，保留旧连接"
+                                return
+                            }
+                        }
+                        guard await runtimeSupervisor.reap(excluding: []) else {
+                            detail = "迁移候选尚未清理，保留旧连接"; return
+                        }
+                        resident = nil
+                        HarborProxyAgentClient.shared.disconnect()
+                    }
+                    try? FileManager.default.removeItem(at: legacyMigrationURL)
+                    migration = nil
+                } else {
+                    await cleanupOrphan()
+                    guard !FileManager.default.fileExists(atPath: runtimeRecordURL.path) else {
+                        detail = "旧内核清理未确认，保留迁移入口与记录"
+                        return
+                    }
+                }
+            }
+        }
+        if let resident {
+            runtimeSupervisor.adoptSnapshot(resident)
+            if !resident.gateways.isEmpty {
+                guard adoptResidentProxy(resident) else {
+                    detail = "独立代理服务状态尚未确认，保留入口与内核记录"
+                    return
+                }
+                if let migration, let backend = gatewayBackend {
+                    if localPort == migration.stagingPort {
+                        await finishLegacyMigration(migration, policy: backend.policy)
+                    } else if localPort == migration.targetPort {
+                        if let extra = migrationGateway, extra.port == migration.stagingPort,
+                           await extra.stop() { migrationGateway = nil }
+                        if migrationGateway == nil {
+                            try? FileManager.default.removeItem(at: legacyMigrationURL)
+                        }
+                    }
+                }
+                bootstrapped = true
+                startLivenessMonitoring()
+                scheduleGeoIPRefresh()
+                if running, let activeNode { enqueueExitGeoRefresh(for: [activeNode]) }
+                if !running, resumeConnectionOnLaunch, let selectedNode {
+                    await queueActivation(selectedNode.id, restart: false, userInitiated: false)
+                }
+                return
+            }
+            guard await runtimeSupervisor.reap(excluding: []) else {
+                detail = "独立代理服务遗留内核尚未清理"; return
+            }
+            HarborProxyAgentClient.shared.disconnect()
+        }
         // Prefer adopting an unchanged Harbor-owned proxy from the previous
         // session. Recovery does not need macOS authorization and leaves the
         // fixed listener ports intact while Xray is safely re-started.
@@ -892,13 +1229,71 @@ final class HarborProxyManager: ObservableObject {
         // Restore the user's last active node *and* prior system-proxy intent.
         // Automatic system changes are always noninteractive and never take
         // over a proxy managed by another app.
-        if !pendingActivation.hasPending, resumeConnectionOnLaunch,
+        if !connectionCoordinator.hasPending, resumeConnectionOnLaunch,
            let selectedNode, supportsCore(for: selectedNode) {
             await queueActivation(selectedNode.id, restart: false, userInitiated: false)
         }
         scheduleGeoIPRefresh()
         scheduleLegacyRealPingRetest()
         Task { [weak self] in await self?.retryDueFailedNodes() }
+    }
+
+    private func residentBackend(_ route: HarborProxyAgentRoute) -> GatewayBackend? {
+        guard let primary = runtimeSupervisor.engine(route.primaryID) else { return nil }
+        let base = route.underlayID.flatMap { runtimeSupervisor.engine($0) }
+        guard route.underlayID == nil || base != nil else { return nil }
+        let warp = route.warpEndpoint.flatMap { endpoint in
+            store.warpAccount.map { HarborWARPProfile(account: $0, endpoint: endpoint) }
+        }
+        return GatewayBackend(nodeID: route.nodeID, endpointSignature: route.endpointSignature,
+            observedExitIP: route.observedExitIP, primary: primary, underlay: base,
+            underlayID: route.underlayNodeID, warp: warp,
+            warpExitIP: route.nodeID == HarborIndependentWARP.nodeID ? route.observedExitIP : nil,
+            policy: RoutingPolicy(ruleMode: route.ruleMode, forcedDomains: route.forcedDomains,
+                                  localHostAddresses: route.localHostAddresses))
+    }
+
+    private func adoptResidentProxy(_ snapshot: HarborProxyAgentSnapshot) -> Bool {
+        guard let entry = snapshot.gateways.first(where: { $0.port == HarborSystemProxy.ownedHTTPPort })
+                ?? snapshot.gateways.first(where: { $0.port == configuredHTTPPort })
+                ?? snapshot.gateways.first,
+              let gateway = try? HarborAgentGateway(httpPort: entry.port) else { return false }
+        gateway.refresh(snapshot)
+        localGateway = gateway
+        localPort = entry.port
+        configuredHTTPPort = entry.port
+        if let other = snapshot.gateways.first(where: { $0.port != entry.port }),
+           let extra = try? HarborAgentGateway(httpPort: other.port) {
+            extra.refresh(snapshot)
+            migrationGateway = extra
+            if let route = other.route, route.primaryID != entry.route?.primaryID {
+                drainingBackend = residentBackend(route)
+            }
+        }
+        gatewayBackend = entry.route.flatMap { residentBackend($0) }
+        if entry.route != nil && gatewayBackend == nil { return false }
+        running = gatewayBackend != nil
+        if let backend = gatewayBackend {
+            let matches = nodes.contains { $0.id == backend.nodeID && $0.endpointSignature == backend.endpointSignature }
+            activeNodeID = matches ? backend.nodeID : nil
+            configPath = backend.primary.configuration
+            underlayConfigPath = backend.underlay?.configuration
+            underlayPort = backend.underlay?.port
+            activeWARPProfile = backend.warp
+            activePolicy = backend.policy
+            vpnGateUnderlayNodeID = backend.underlayID
+            healthy = matches && backend.alive && entry.healthy && entry.ready
+                && entry.routingBackendID == backend.primary.id
+            lastSuccessfulHealthCheckAt = healthy ? entry.lastHealth : nil
+            lastActiveHealthCheckAt = entry.lastHealth
+            warpExitIP = healthy ? backend.warpExitIP : nil
+        } else { healthy = false }
+        connectionGeneration &+= 1
+        connectionPhase = running ? (healthy ? .connected : .degraded) : .stopped
+        status = healthy ? "已连接" : "独立代理入口已保留"
+        detail = "已核对独立代理服务 HTTP 127.0.0.1:\(entry.port)"
+        refreshSystemProxyState(synchronizeOwnership: true)
+        return true
     }
 
     /// Legacy OpenVPN failures lacked a record of whether the relay was
@@ -947,6 +1342,128 @@ final class HarborProxyManager: ObservableObject {
         guard node.protocolName == "openvpn", let evidence = nodeNetworkEvidence[node.host],
               evidence.isFresh() else { return nil }
         return evidence
+    }
+
+    /// Exit network classification is intentionally separate from entry
+    /// screening. An observed IP is required; subscription remarks or the
+    /// VPN Gate publisher country cannot populate this field.
+    func exitNetworkEvidence(for node: HarborProxyNode) -> HarborProxyNetworkEvidence? {
+        let ip = HarborIndependentWARP.isBuiltIn(node) && node.id == activeNodeID
+            ? warpExitIP : observedExit(for: node)?.ip
+        guard let ip, let evidence = nodeExitNetworkEvidence[node.id], evidence.isFresh(),
+              let evidenceIP = evidence.observedIP, HarborIPAddress.equivalent(ip, evidenceIP) else { return nil }
+        if node.id == activeNodeID {
+            guard healthy, evidence.networkEpoch == connectionCoordinator.networkEpoch,
+                  evidence.probeRouteID == activeExitEvidenceRouteID else { return nil }
+        }
+        return evidence
+    }
+
+    private var activeExitEvidenceRouteID: String? {
+        activeWARPProfile?.routeID ?? currentVPNGateRouteID
+    }
+
+    private func cancelActiveExitClassification() {
+        exitObservationCancellation?.cancel()
+        exitObservationTask?.cancel()
+        exitObservationCancellation = nil
+        exitObservationTask = nil
+        exitClassificationCancellation?.cancel()
+        exitClassificationTask?.cancel()
+        exitClassificationCancellation = nil
+        exitClassificationTask = nil
+        exitClassificationKey = nil
+    }
+
+    private func scheduleActiveExitClassification() {
+        guard networkOnline, running, healthy, !shuttingDownConnection,
+              let node = activeNode, let port = localPort else { return }
+        let isWarp = HarborIndependentWARP.isBuiltIn(node)
+        if !isWarp, let backend = gatewayBackend, backend.observedExitIP == nil {
+            observeActiveGatewayExit(node: node, port: port, backendID: backend.primary.id)
+            return
+        }
+        let ip = isWarp ? warpExitIP : (gatewayBackend?.observedExitIP ?? observedExit(for: node)?.ip)
+        guard let ip, HarborNodeGeoIPResolver.isPublic(ip) else { return }
+        let epoch = connectionCoordinator.networkEpoch
+        let generation = connectionGeneration
+        let route = activeExitEvidenceRouteID
+        let key = "\(generation):\(epoch):\(node.id):\(ip)"
+        if exitNetworkEvidence(for: node) != nil || exitClassificationKey == key { return }
+        cancelActiveExitClassification()
+        // Classification can reuse evidence for the same explicit IP, but
+        // the per-node association remains scoped to this observed route.
+        if let existing = nodeExitNetworkEvidence.values.first(where: {
+            $0.isFresh() && $0.observedIP.map { HarborIPAddress.equivalent($0, ip) } == true
+        }) {
+            nodeExitNetworkEvidence[node.id] = HarborProxyNetworkEvidence(
+                kind: existing.kind, isp: existing.isp, checkedAt: existing.checkedAt,
+                sources: existing.sources, confidence: existing.confidence, countryCode: existing.countryCode,
+                observedIP: ip, networkEpoch: epoch, probeRouteID: route)
+            persist()
+            return
+        }
+        let cancellation = HarborLatencyCancellation()
+        exitClassificationCancellation = cancellation
+        exitClassificationKey = key
+        exitClassificationTask = Task(priority: .utility) { [weak self] in
+            let evidence = await HarborVPNGateNetworkClassifier.lookup(ip: ip, proxyPort: port,
+                    cancellation: cancellation, networkEpoch: epoch, probeRouteID: route)
+            guard let self, self.exitClassificationCancellation === cancellation else { return }
+            defer {
+                self.exitClassificationCancellation = nil
+                self.exitClassificationTask = nil
+                self.exitClassificationKey = nil
+            }
+            guard !cancellation.isCancelled, !Task.isCancelled, self.running, self.healthy,
+                  self.connectionGeneration == generation, self.connectionCoordinator.networkEpoch == epoch,
+                  self.activeNodeID == node.id, let evidence else { return }
+            let actual = self.currentVerifiedExitIP
+            guard let actual, HarborIPAddress.equivalent(actual, ip) else { return }
+            self.nodeExitNetworkEvidence[node.id] = evidence
+            self.persist()
+        }
+    }
+
+    /// Ordinary connections become usable before optional IP services answer.
+    /// Record their result only for the exact live route tested.
+    private func observeActiveGatewayExit(node: HarborProxyNode, port: Int, backendID: UUID) {
+        guard exitObservationTask == nil else { return }
+        let cancellation = HarborLatencyCancellation()
+        exitObservationCancellation = cancellation
+        let generation = connectionGeneration
+        let epoch = connectionCoordinator.networkEpoch
+        exitObservationTask = Task(priority: .utility) { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.exitObservationCancellation === cancellation {
+                    self.exitObservationCancellation = nil
+                    self.exitObservationTask = nil
+                }
+            }
+            @MainActor func isCurrent() -> Bool {
+                !Task.isCancelled && !cancellation.isCancelled && !self.shuttingDownConnection
+                    && self.healthy && self.connectionGeneration == generation
+                    && self.connectionCoordinator.networkEpoch == epoch && self.localPort == port
+                    && self.activeNodeID == node.id && self.gatewayBackend?.primary.id == backendID
+            }
+            guard let ip = await self.gatewayObservedExit(socksPort: port + 1, cancellation: cancellation,
+                                                          priority: .geoIP),
+                  isCurrent(),
+                  (try? await HarborProxyAgentClient.shared.call(.recordExit(port: port, backendID: backendID, ip: ip))) != nil,
+                  isCurrent() else { return }
+            self.gatewayBackend?.observedExitIP = ip
+            let existing = self.nodeExitLocations[node.id]?.location
+            let measured = existing.flatMap { $0.ip == ip ? $0 : nil }
+                ?? HarborProxyIPLocation(ip: ip, countryCode: "ZZ")
+            self.nodeExitLocations[node.id] = HarborProxyExitLocation(
+                location: measured, endpointSignature: node.endpointSignature,
+                resolvedServerIP: self.entranceLocation(for: node)?.ip, probeRouteID: self.currentVPNGateRouteID)
+            self.persist()
+            self.exitObservationTask = nil
+            self.exitObservationCancellation = nil
+            self.scheduleActiveExitClassification()
+        }
     }
 
     /// Resolve a bounded set of server addresses without keeping the workspace busy.
@@ -1033,6 +1550,9 @@ final class HarborProxyManager: ObservableObject {
         store.nodeNetworkEvidence = nodeNetworkEvidence
         store.nodeServerResolvedAt = nodeServerResolvedAt
         store.nodeExitLocations = nodeExitLocations
+        let validNodeIDs = Set(nodes.map(\.id))
+        nodeExitNetworkEvidence = nodeExitNetworkEvidence.filter { validNodeIDs.contains($0.key) }
+        store.nodeExitNetworkEvidence = nodeExitNetworkEvidence
         store.probeResults = probeResults
         store.subscriptions = subscriptions
         store.selectedID = selectedID
@@ -1042,6 +1562,10 @@ final class HarborProxyManager: ObservableObject {
         store.httpListenPort = configuredHTTPPort
         store.autoManageSystemProxy = autoManageSystemProxy
         store.resumeConnectionOnLaunch = resumeConnectionOnLaunch
+        fallbackPolicy.authorizedEndpoints = fallbackPolicy.authorizedEndpoints.filter { id, signature in
+            nodes.contains { $0.id == id && $0.endpointSignature == signature }
+        }
+        store.fallbackPolicy = fallbackPolicy
         store.subscriptionUpdatedAt = subscriptionUpdatedAt
         store.probeNetworkChangedAt = probeNetworkChangedAt
         persistenceGeneration += 1
@@ -1063,6 +1587,26 @@ final class HarborProxyManager: ObservableObject {
     }
 
     func retryConfigurationSave() {
+        persist()
+    }
+
+    func setAutomaticFallback(_ enabled: Bool) {
+        guard configurationLoaded else { return }
+        fallbackPolicy.enabled = enabled
+        persist()
+    }
+
+    func isAuthorizedFallback(_ node: HarborProxyNode) -> Bool {
+        fallbackPolicy.authorizedEndpoints[node.id] == node.endpointSignature
+    }
+
+    func toggleFallbackAuthorization(_ node: HarborProxyNode) {
+        guard configurationLoaded, nodes.contains(where: { $0.id == node.id && $0.endpointSignature == node.endpointSignature }) else { return }
+        if isAuthorizedFallback(node) {
+            fallbackPolicy.authorizedEndpoints.removeValue(forKey: node.id)
+        } else {
+            fallbackPolicy.authorizedEndpoints[node.id] = node.endpointSignature
+        }
         persist()
     }
 
@@ -1551,7 +2095,7 @@ final class HarborProxyManager: ObservableObject {
         var candidates: [HarborProxyNode] = []
         var usedProxyPort: Int?
         var source = "direct"
-        var tunnel: HarborWARPTunnel?
+        var tunnel: HarborWARPDiscoveryPool.Lease?
         var lastFailure = "独立通道或节点来源暂时不可用"
         detail = "正在准备独立通道获取 VPN Gate 名单"
         do {
@@ -1591,7 +2135,8 @@ final class HarborProxyManager: ObservableObject {
             classification.cancel()
         }
         let evidence = await HarborVPNGateNetworkClassifier.classify(
-            ranked, cached: nodeNetworkEvidence, proxyPort: usedProxyPort, cancellation: classification)
+            ranked, cached: nodeNetworkEvidence, proxyPort: usedProxyPort, cancellation: classification,
+            networkEpoch: connectionCoordinator.networkEpoch, probeRouteID: source)
         deadline.cancel()
         if let observer { cancellation.removeObserver(observer) }
         await tunnel?.close()
@@ -1736,7 +2281,13 @@ final class HarborProxyManager: ObservableObject {
             detail = "所选节点已不存在，请刷新订阅"
             return
         }
-        pendingActivation.enqueue(id, restart: restart, userInitiated: userInitiated)
+        if userInitiated {
+            cancelGatewayRecovery(reset: true)
+            attemptedFallbackIDs = [id]
+            lastFallbackAttempt = nil
+        }
+        activeHealthCancellation?.cancel()
+        guard connectionCoordinator.enqueue(id, restart: restart, userInitiated: userInitiated) else { return }
         switchingNodeID = id
         // The previous candidate may still be completing a 30-second OpenVPN
         // handshake. The latest user click should supersede that test now,
@@ -1749,7 +2300,8 @@ final class HarborProxyManager: ObservableObject {
             switchingNodeID = nil
         }
 
-        while let request = pendingActivation.takeNext() {
+        while let request = connectionCoordinator.takeNext() {
+            defer { connectionCoordinator.finishRequest(request) }
             // Startup, subscription refresh, and another switch can be in progress.
             // Keep the request queued instead of disabling every node button.
             while busy || installingCore || connectionTransition || (bootstrapping && !bootstrapped) {
@@ -1759,17 +2311,22 @@ final class HarborProxyManager: ObservableObject {
             // A newer click arrived while waiting for another operation.
             // Do not start an obsolete preflight or stop the active core.
             if shuttingDownConnection || Task.isCancelled { return }
-            if pendingActivation.hasPending { continue }
-            await activateOne(
-                request.nodeID,
-                restart: request.restart,
-                userInitiated: request.userInitiated
-            )
+            if !connectionCoordinator.accepts(request) { continue }
+            let priority: HarborProbePriority = request.userInitiated ? .switching : .recovery
+            await HarborProbeScope.$priority.withValue(priority) {
+                await activateOne(request.nodeID, restart: request.restart, userInitiated: request.userInitiated)
+            }
         }
     }
 
     private func activateOne(_ id: String, restart: Bool, userInitiated: Bool,
-                             replacementPort: Int? = nil) async {
+                             replacementPort: Int? = nil,
+                             fallback: HarborProxyFallbackPolicy.ExitConstraint? = nil) async {
+        guard !shuttingDownConnection, !connectionTransition else { return }
+        guard networkOnline else {
+            detail = "当前网络离线，已暂停代理连接"
+            return
+        }
         guard let requestedNode = nodes.first(where: { $0.id == id }) else {
             detail = "所选节点已不存在"
             return
@@ -1777,17 +2334,28 @@ final class HarborProxyManager: ObservableObject {
         connectionTransition = true
         defer { connectionTransition = false }
         let cancellation = HarborLatencyCancellation()
+        guard let transaction = connectionCoordinator.begin(nodeID: id, endpointSignature: requestedNode.endpointSignature,
+                                                timeout: .seconds(300), source: replacementPort != nil ? .reconfiguration : (userInitiated ? .user : (running ? .recovery : .startup))) else { return }
         activationPreflightCancellation = cancellation
-        defer { activationPreflightCancellation = nil }
-        let previousUnderlayID = activeNode?.protocolName == "openvpn" && underlayPort != nil
-            ? vpnGateUnderlayNodeID : nil
-        let previousRoute = previousUnderlayID.map(VPNGateRoute.underlay)
-            ?? activeWARPProfile.map(VPNGateRoute.warp) ?? .direct
-        let previousPolicy = activePolicy
+        let deadlineTask = Task {
+            do { try await Task.sleep(until: transaction.deadline, clock: .continuous) }
+            catch { return }
+            cancellation.cancel()
+        }
+        defer {
+            deadlineTask.cancel()
+            connectionCoordinator.finish(transaction)
+            activationPreflightCancellation = nil
+        }
+        func transactionValid() -> Bool {
+            (fallback == nil || fallbackPolicy.permits(nodeID: id, signature: requestedNode.endpointSignature))
+                && !connectionCoordinator.hasPending && !shuttingDownConnection && !cancellation.isCancelled
+                && !Task.isCancelled && connectionCoordinator.accepts(transaction, endpointSignature:
+                    nodes.first(where: { $0.id == id })?.endpointSignature)
+        }
         let previousID = activeNodeID
         let previousPort = localPort ?? configuredHTTPPort
         let wasRunning = running
-        let previousIntent = autoManageSystemProxy
         let wantsSystemProxy = HarborProxyConnectionIntent.shouldManageSystemProxy(
             persistedPreference: autoManageSystemProxy,
             userInitiated: userInitiated
@@ -1797,7 +2365,7 @@ final class HarborProxyManager: ObservableObject {
         // and actual outbound identity have been verified.
         proxyAudit("switch_requested", nodeID: id, note: "running=\(wasRunning)")
 
-        if wasRunning && previousID == id && !restart {
+        if wasRunning && previousID == id && !restart && localGateway != nil {
             if checkingConnectivity {
                 detail = "当前节点已启动，正在完成网络检测"
                 return
@@ -1824,268 +2392,760 @@ final class HarborProxyManager: ObservableObject {
             return
         }
         let policy = await RoutingPolicy.read(ruleMode: routingRules, forcedDomains: forcedProxyDomains)
+        guard transactionValid() else { return }
         // Pause bulk probing before preflight so activation does not compete
         // with multiple temporary engines for CPU and connection slots.
         if latencyTesting { cancelLatencyTests() }
-        let route: VPNGateRoute
-        do {
-            route = try await validateConnection(requestedNode, policy: policy, cancellation: cancellation)
-            let routeKind: String
-            switch route {
-            case .direct: routeKind = "direct"
-            case .underlay: routeKind = "underlay"
-            case .warp: routeKind = "warp"
-            }
-            proxyAudit("switch_preflight_passed", nodeID: id, note: "route=\(routeKind)")
-        } catch {
-            guard !cancellation.isCancelled, !shuttingDownConnection, !Task.isCancelled else { return }
-            proxyAudit("switch_preflight_failed", nodeID: id, note: "code=\((error as NSError).code)")
-            detail = (wasRunning ? "新节点验证失败，原连接保持不变：" : "节点验证失败：") + error.localizedDescription
+        // Legacy adopted listeners stay intact until explicitly stopped. New
+        // connections and every subsequent switch use a fixed TCP gateway.
+        if localGateway != nil || (!wasRunning && child == nil && underlayChild == nil
+            && adoptedPID == nil && !FileManager.default.fileExists(atPath: runtimeRecordURL.path)) {
+            await activateGateway(requestedNode, policy: policy, replacementPort: replacementPort,
+                                  wantsSystemProxy: wantsSystemProxy, userInitiated: userInitiated,
+                                  cancellation: cancellation, transactionValid: transactionValid, fallback: fallback)
             return
         }
-        guard !pendingActivation.hasPending, !shuttingDownConnection, !cancellation.isCancelled,
-              !Task.isCancelled, nodes.contains(where: {
-                  $0.id == id && $0.endpointSignature == requestedNode.endpointSignature
-              }) else { return }
-        guard let wasManaged = await prepareSystemProxyForActivation(),
-              !shuttingDownConnection, !cancellation.isCancelled else { return }
-        autoManageSystemProxy = wantsSystemProxy
-        if latencyTesting { cancelLatencyTests() }
-        if wasRunning {
-            // Keep the macOS proxy settings and ownership snapshot untouched:
-            // Xray's fixed ports do not change when only the remote node changes.
-            guard await stopCore() else {
-                proxyAudit("old_stop_failed", nodeID: id)
-                detail = "旧代理内核仍未退出，请稍候重试：" + detail
-                return
-            }
-            proxyAudit("old_stopped", nodeID: previousID)
-        }
+        guard fallback == nil else { return }
+        await migrateLegacyConnection(requestedNode, policy: policy,
+            targetPort: replacementPort ?? previousPort, wantsSystemProxy: wantsSystemProxy,
+            userInitiated: userInitiated, cancellation: cancellation, transactionValid: transactionValid)
+    }
 
-        await start(
-            nodeID: id,
-            route: route,
-            policy: policy,
-            requestedPort: replacementPort,
-            preservingSystemProxy: wasManaged,
-            cancellation: cancellation
-        )
-        if running && healthy && (wasManaged || wantsSystemProxy)
-            && !shuttingDownConnection && !cancellation.isCancelled {
-            await applySystemProxy(interactive: userInitiated, policy: policy, reconfigure: true)
+    /// Stage a verified resident route on a separate loopback pair before
+    /// touching the old process or its system proxy. The same tested engine
+    /// is then attached to the requested fixed port after the legacy pair
+    /// becomes free. Persist the migration intent for crash reconciliation.
+    private func migrateLegacyConnection(
+        _ node: HarborProxyNode, policy: RoutingPolicy, targetPort: Int,
+        wantsSystemProxy: Bool, userInitiated: Bool,
+        cancellation: HarborLatencyCancellation, transactionValid: () -> Bool
+    ) async {
+        guard !FileManager.default.fileExists(atPath: legacyMigrationURL.path) else {
+            detail = "上次迁移尚未结束，请先断开代理并完成清理"
+            return
         }
-        if !running || !healthy || (wasManaged && !systemManaged) || cancellation.isCancelled {
-            let failure = detail
-            proxyAudit("switch_failed", nodeID: id)
-            autoManageSystemProxy = previousIntent
-            if running {
-                guard await stopCore() else { return }
+        guard running, let oldPort = localPort, localGateway == nil else {
+            detail = "旧代理状态未确认，请先恢复原系统代理并清理旧内核"
+            return
+        }
+        guard !HarborSystemProxy.otherServiceReferencesListener(oldPort),
+              !HarborSystemProxy.referencesListener(oldPort) || HarborSystemProxy.ownedHTTPPort == oldPort else {
+            detail = "旧入口仍被其他网络服务使用，已保留原连接；请先处理系统代理冲突"
+            return
+        }
+        guard let stage = (18100...18198).filter({ $0 % 2 == 0 }).first(where: {
+            abs($0 - oldPort) > 1 && abs($0 - targetPort) > 1 &&
+            !portListening($0) && !portListening($0 + 1) && !HarborSystemProxy.referencesListener($0)
+        }), let staging = try? HarborAgentGateway(httpPort: stage) else {
+            detail = "没有可安全使用的迁移入口，旧连接未改变"
+            return
+        }
+        let record = LegacyMigration(oldPort: oldPort, stagingPort: stage, targetPort: targetPort,
+                                     wasManaged: HarborSystemProxy.ownedHTTPPort == oldPort)
+        do { try HarborProbeFiles.replace(JSONEncoder().encode(record), at: legacyMigrationURL) }
+        catch { detail = "迁移记录无法写入，旧连接未改变"; return }
+
+        var candidate: GatewayBackend?
+        do {
+            guard await runtimeSupervisor.reap(excluding: []), transactionValid() else {
+                throw HarborProxyError.invalid("残留候选尚未回收")
             }
-            if !shuttingDownConnection, wasRunning, let previousID,
-               nodes.contains(where: { $0.id == previousID }) {
-                let rollbackPolicy: RoutingPolicy
-                if let previousPolicy { rollbackPolicy = previousPolicy }
-                else { rollbackPolicy = policy }
-                await start(
-                    nodeID: previousID,
-                    route: previousRoute,
-                    policy: rollbackPolicy,
-                    requestedPort: previousPort,
-                    preservingSystemProxy: wasManaged,
-                    cancellation: nil
-                )
-                if running && healthy {
-                    if wasManaged {
-                        await applySystemProxy(interactive: false, policy: rollbackPolicy, reconfigure: true)
-                    }
-                    if !wasManaged || (systemManaged && HarborSystemProxy.isOwned()) {
-                        proxyAudit("rollback_restored", nodeID: previousID)
-                        detail = "新节点连接失败：\(failure)；已恢复原连接"
-                    } else {
-                        proxyAudit("rollback_system_proxy_failed", nodeID: previousID)
-                        detail = "新节点连接失败：\(failure)；原本地代理已恢复，但系统代理未恢复：" + detail
-                    }
-                } else {
-                    proxyAudit("rollback_failed", nodeID: previousID)
-                    detail = "新节点连接失败：\(failure)；原连接恢复失败：" + detail
+            try await staging.start()
+            var protected = Set([oldPort, oldPort + 1, stage, stage + 1, targetPort, targetPort + 1])
+            if let underlayPort { protected.formUnion([underlayPort, underlayPort + 1]) }
+            let verified = try await prepareGatewayCandidate(node, policy: policy,
+                protectedPorts: protected, cancellation: cancellation)
+            candidate = verified
+            guard transactionValid(), verified.alive else { throw CancellationError() }
+            try await staging.route(to: verified.agentRoute(), cancellation: cancellation)
+            guard transactionValid(), verified.alive else { throw CancellationError() }
+            if record.wasManaged {
+                guard HarborSystemProxy.ownedHTTPPort == oldPort else {
+                    throw HarborProxyError.invalid("系统代理所有权已变化")
+                }
+                try await HarborSystemProxy.enable(port: stage, forcedProxyDomains: policy.forcedDomains,
+                                                   automaticBypass: policy.localHosts)
+                guard HarborSystemProxy.ownedHTTPPort == stage else {
+                    throw HarborProxyError.invalid("迁移入口未确认生效")
                 }
             }
-            if (!running || !healthy) && HarborSystemProxy.hasBackup {
-                _ = try? await HarborSystemProxy.restore()
-                refreshSystemProxyState(synchronizeOwnership: true)
+            guard !HarborSystemProxy.referencesListener(oldPort), transactionValid() else {
+                throw HarborProxyError.invalid("旧入口仍被引用或迁移已取消")
+            }
+            // Legacy stop is allowed only after the system has ceased using
+            // it. Keep the new route even if cleanup cannot be confirmed.
+            guard await stopCore() else { throw HarborProxyError.invalid("旧内核尚未完全退出") }
+            guard let snapshot = try? await HarborProxyAgentClient.shared.inspect(),
+                  adoptResidentProxy(snapshot) else {
+                detail = "迁移入口已保留，等待重新核对独立服务"
+                return
+            }
+            autoManageSystemProxy = wantsSystemProxy
+            selectedID = node.id
+            if userInitiated { resumeConnectionOnLaunch = true }
+            await finishLegacyMigration(record, policy: policy)
+            if !record.wasManaged, wantsSystemProxy, transactionValid(), healthy {
+                await applySystemProxy(interactive: userInitiated, policy: policy)
+            }
+            startLivenessMonitoring()
+            persist()
+        } catch {
+            if record.wasManaged && HarborSystemProxy.ownedHTTPPort == stage &&
+                portListening(oldPort) && portListening(oldPort + 1) {
+                // Rollback only while our staging settings remain owned.
+                _ = try? await HarborSystemProxy.enable(port: oldPort, forcedProxyDomains: activePolicy?.forcedDomains ?? policy.forcedDomains,
+                    automaticBypass: activePolicy?.localHosts ?? policy.localHosts)
+            }
+            if !HarborSystemProxy.referencesListener(stage), await staging.stop() {
+                if let candidate { await disposeGatewayBackend(candidate) }
+                try? FileManager.default.removeItem(at: legacyMigrationURL)
+                detail = "旧代理迁移未完成，保留原连接：" + error.localizedDescription
+            } else {
+                detail = "迁移入口可能仍被系统使用，已保留进程和恢复记录：" + error.localizedDescription
+            }
+        }
+    }
+
+    /// Reuse the staged engine. Do not stop it merely to return to the
+    /// configured port. A failed final bind leaves the staging route usable.
+    private func finishLegacyMigration(_ record: LegacyMigration, policy: RoutingPolicy) async {
+        guard let staging = localGateway, staging.port == record.stagingPort,
+              let backend = gatewayBackend, backend.alive,
+              !FileManager.default.fileExists(atPath: runtimeRecordURL.path),
+              let target = try? HarborAgentGateway(httpPort: record.targetPort) else { return }
+        do {
+            try await target.start()
+            try await target.route(to: backend.agentRoute())
+            if record.wasManaged {
+                guard HarborSystemProxy.ownedHTTPPort == record.stagingPort else {
+                    throw HarborProxyError.invalid("迁移入口所有权已变化")
+                }
+                try await HarborSystemProxy.enable(port: record.targetPort,
+                    forcedProxyDomains: policy.forcedDomains, automaticBypass: policy.localHosts)
+                guard HarborSystemProxy.ownedHTTPPort == record.targetPort else {
+                    throw HarborProxyError.invalid("固定入口未确认生效")
+                }
+            }
+            localGateway = target
+            localPort = record.targetPort
+            configuredHTTPPort = record.targetPort
+            if await staging.stop() {
+                migrationGateway = nil
+                try? FileManager.default.removeItem(at: legacyMigrationURL)
+                detail = "旧代理已迁移至固定入口"
+            } else {
+                migrationGateway = staging
+                detail = "固定入口已迁移，旧迁移入口仍被引用"
+            }
+        } catch {
+            if !HarborSystemProxy.referencesListener(record.targetPort) {
+                _ = await target.stop()
+            } else {
+                migrationGateway = target
+            }
+            detail = "暂时使用已验证迁移入口，原固定端口尚未恢复：" + error.localizedDescription
+        }
+        refreshSystemProxyState(synchronizeOwnership: true)
+    }
+
+    /// Fixed-listener path. Candidate engines are never discarded and
+    /// recreated after validation; the exact tested instance becomes active.
+    private func activateGateway(
+        _ node: HarborProxyNode, policy: RoutingPolicy, replacementPort: Int?,
+        wantsSystemProxy: Bool, userInitiated: Bool,
+        cancellation: HarborLatencyCancellation, transactionValid: () -> Bool,
+        fallback: HarborProxyFallbackPolicy.ExitConstraint? = nil
+    ) async {
+        connectionPhase = gatewayBackend == nil ? .preparing : .switching
+        defer {
+            if [.preparing, .validating, .switching].contains(connectionPhase) {
+                connectionPhase = !networkOnline ? .offline : (healthy ? .connected : .failed)
+            }
+        }
+        if FileManager.default.fileExists(atPath: legacyMigrationURL.path) {
+            guard let data = try? Data(contentsOf: legacyMigrationURL), data.count <= 4096,
+                  let record = try? JSONDecoder().decode(LegacyMigration.self, from: data),
+                  let backend = gatewayBackend else {
+                detail = "旧代理迁移记录尚未确认，请先恢复系统代理"; return
+            }
+            if localPort == record.stagingPort && migrationGateway == nil {
+                await finishLegacyMigration(record, policy: backend.policy)
+            }
+            guard !FileManager.default.fileExists(atPath: legacyMigrationURL.path) else {
+                detail = "旧代理迁移尚未完成，当前已验证入口保持运行"; return
+            }
+        }
+        guard migrationGateway == nil else {
+            detail = "上次端口迁移需要恢复系统代理，恢复完成后才能切换"
+            return
+        }
+        let entryPort = replacementPort ?? localPort ?? configuredHTTPPort
+        let previousGateway = localGateway
+        let previousBackend = gatewayBackend
+        let previousPort = localPort
+        if let previousPort, entryPort != previousPort,
+           HarborSystemProxy.otherServiceReferencesListener(previousPort) {
+            detail = "其他网络服务仍使用当前端口，请先恢复系统代理后再更改端口"
+            return
+        }
+        let retained = (previousBackend?.engineIDs ?? []).union(drainingBackend?.engineIDs ?? [])
+        guard await runtimeSupervisor.reap(excluding: retained), transactionValid() else {
+            detail = "上次候选内核清理尚未完成，原连接保持不变"
+            return
+        }
+
+        let gateway: HarborAgentGateway
+        do {
+            if let previousGateway, entryPort == previousPort {
+                gateway = previousGateway
+            } else {
+                gateway = try HarborAgentGateway(httpPort: entryPort)
+            }
+            if !gateway.isReady { try await gateway.start() }
+        } catch {
+            detail = "固定代理入口启动失败，未更改系统代理"
+            return
+        }
+
+        let isNewGateway = previousGateway !== gateway
+        func retainOrStopUncommittedGateway() async {
+            guard isNewGateway else { return }
+            if previousGateway == nil, HarborSystemProxy.referencesListener(entryPort) {
+                // An interrupted previous session still points here. Keep the
+                // entry bound, with no route, rather than silently bypassing.
+                localGateway = gateway
+                localPort = entryPort
+            } else if !(await gateway.stop()) {
+                if previousGateway == nil { localGateway = gateway; localPort = entryPort }
+                else { migrationGateway = gateway }
+            }
+        }
+
+        guard transactionValid() else {
+            await retainOrStopUncommittedGateway()
+            return
+        }
+
+        connectionPhase = .validating
+        let candidate: GatewayBackend
+        do {
+            var protectedPorts = Set([entryPort, entryPort + 1])
+            if let previousPort { protectedPorts.formUnion([previousPort, previousPort + 1]) }
+            if let previousBackend {
+                protectedPorts.formUnion([previousBackend.primary.port, previousBackend.primary.port + 1])
+                if let base = previousBackend.underlay { protectedPorts.formUnion([base.port, base.port + 1]) }
+            }
+            candidate = try await prepareGatewayCandidate(node, policy: policy, protectedPorts: protectedPorts,
+                                                          cancellation: cancellation, requiresObservedExit: fallback != nil)
+        } catch {
+            await retainOrStopUncommittedGateway()
+            guard transactionValid() else { return }
+            status = previousBackend?.alive == true && previousGateway?.isReady == true ? "已连接" : "连接失败"
+            detail = "候选后端验证失败，未切换路由：" + error.localizedDescription
+            proxyAudit("gateway_candidate_failed", nodeID: node.id, note: "code=\((error as NSError).code)")
+            return
+        }
+
+        guard transactionValid(), candidate.alive, gateway.isReady else {
+            await disposeGatewayBackend(candidate)
+            await retainOrStopUncommittedGateway()
+            return
+        }
+
+        if let fallback {
+            guard let ip = candidate.observedExitIP,
+                  let evidence = await HarborVPNGateNetworkClassifier.lookup(ip: ip,
+                      proxyPort: candidate.primary.port, cancellation: cancellation,
+                      networkEpoch: connectionCoordinator.networkEpoch),
+                  transactionValid(), fallback.matches(evidence: evidence, observedIP: ip) else {
+                await disposeGatewayBackend(candidate)
+                await retainOrStopUncommittedGateway()
+                detail = "备用节点实际出口与原连接不一致或证据不足，未切换"
+                return
+            }
+            nodeExitNetworkEvidence[node.id] = evidence
+        }
+
+        guard let wasManaged = await prepareSystemProxyForActivation(),
+              transactionValid(), candidate.alive else {
+            await disposeGatewayBackend(candidate)
+            await retainOrStopUncommittedGateway()
+            return
+        }
+
+        // Bound the number of draining generations. Normal switches keep
+        // existing connections on their original engine; a third generation
+        // may close the oldest flows to avoid unbounded resource growth.
+        if let oldest = drainingBackend {
+            _ = await previousGateway?.closeConnections(backendID: oldest.primary.id)
+            let disposed = await disposeGatewayBackend(oldest)
+            if disposed { drainingBackend = nil }
+            let keep = retained.subtracting(oldest.engineIDs).union(candidate.engineIDs)
+            guard disposed, await runtimeSupervisor.reap(excluding: keep), transactionValid() else {
+                await disposeGatewayBackend(candidate)
+                await retainOrStopUncommittedGateway()
+                detail = "旧后端尚未回收，未切换路由"
+                return
+            }
+        }
+
+        guard transactionValid(), candidate.alive else {
+            await disposeGatewayBackend(candidate)
+            await retainOrStopUncommittedGateway()
+            return
+        }
+
+        // During the fixed-entry trial, a request sent to the old public
+        // port can reach the candidate even if the switch later rolls back.
+        // Retire all in-flight observations of that port first.
+        if !isNewGateway {
+            connectionGeneration &+= 1
+            activeHealthCancellation?.cancel()
+            checkingConnectivity = false
+            websiteCancellation?.cancel()
+            cancelActiveExitClassification()
+        }
+        do {
+            try await gateway.route(to: candidate.agentRoute(), cancellation: cancellation)
+        } catch {
+            await disposeGatewayBackend(candidate)
+            await retainOrStopUncommittedGateway()
+            if gateway === previousGateway, gateway.routingBackendID != previousBackend?.primary.id {
+                healthy = false
+                connectionPhase = .degraded
+            }
+            if !cancellation.isCancelled && !shuttingDownConnection {
+                detail = "固定入口未提交新线路：" + error.localizedDescription
+                if healthy { scheduleActiveExitClassification() }
             }
             return
         }
 
-        configuredHTTPPort = localPort ?? configuredHTTPPort
-        selectedID = id
-        if userInitiated { resumeConnectionOnLaunch = true }
-        pruneRetiredProfiles(keeping: [id, underlayPort == nil ? nil : vpnGateUnderlayNodeID])
+        // The RPC may have completed after a stop, network change, or
+        // newer click. The previous listener is still intact: do not let
+        // an obsolete port-change transaction take over system proxy.
+        if isNewGateway, previousGateway != nil, !transactionValid() {
+            if !HarborSystemProxy.referencesListener(entryPort), await gateway.stop() {
+                await disposeGatewayBackend(candidate)
+            } else {
+                migrationGateway = gateway
+                drainingBackend = candidate
+                detail = "过期切换的入口尚未安全释放，已保留恢复记录"
+            }
+            return
+        }
+
+        // A port change is the only case that requires changing the owned
+        // system listener while a healthy old gateway is still running.
+        if isNewGateway, previousGateway != nil, wasManaged {
+            do {
+                try await HarborSystemProxy.enable(port: entryPort, forcedProxyDomains: policy.forcedDomains,
+                                                   automaticBypass: policy.localHosts)
+                for _ in 0..<10 where HarborSystemProxy.ownedHTTPPort != entryPort {
+                    try? await Task.sleep(for: .milliseconds(60))
+                }
+            } catch {
+                proxyAudit("gateway_port_migration_failed", nodeID: node.id, note: "code=\((error as NSError).code)")
+            }
+            if HarborSystemProxy.ownedHTTPPort != entryPort {
+                // Preserve both listeners if a partial system transaction
+                // might still refer to the new port. Explicit restoration
+                // will retire the extra listener.
+                if let previousBackend, previousBackend.alive {
+                    _ = try? await gateway.route(to: previousBackend.agentRoute(), closeOldConnections: true)
+                } else {
+                    await gateway.suspendRouting(closeExisting: true)
+                }
+                if HarborSystemProxy.referencesListener(entryPort) {
+                    migrationGateway = gateway
+                } else {
+                    if !(await gateway.stop()) { migrationGateway = gateway }
+                }
+                await disposeGatewayBackend(candidate)
+                refreshSystemProxyState(synchronizeOwnership: true)
+                detail = "系统代理端口迁移未确认，已保留原连接；请检查恢复状态"
+                return
+            }
+        }
+
+        // No suspension between route commit and publishing the actual
+        // runtime identity. Once a system transaction has taken effect it
+        // must be reflected even if a newer user request arrived meanwhile.
+        connectionGeneration &+= 1
+        localGateway = gateway
+        gatewayBackend = candidate
+        child = candidate.primary.process
+        configPath = candidate.primary.configuration
+        underlayChild = candidate.underlay?.process
+        underlayConfigPath = candidate.underlay?.configuration
+        underlayPort = candidate.underlay?.port
+        if node.protocolName == "openvpn" { vpnGateUnderlayNodeID = candidate.underlayID }
+        activeWARPProfile = candidate.warp
+        if let endpoint = candidate.warp?.endpoint {
+            if HarborIndependentWARP.isBuiltIn(node) {
+                store.warpEndpoint = endpoint
+            } else if node.protocolName == "openvpn" {
+                if store.warpProbeEndpoints == nil { store.warpProbeEndpoints = [:] }
+                store.warpProbeEndpoints?[node.id] = endpoint
+            }
+        }
+        activePolicy = policy
+        localPort = entryPort
+        configuredHTTPPort = entryPort
+        activeNodeID = node.id
+        selectedID = node.id
+        running = true
+        healthy = candidate.alive && gateway.isReady && gateway.routingBackendID == candidate.primary.id
+        if healthy {
+            cancelGatewayRecovery(reset: true)
+            connectionPhase = .connected
+        } else {
+            connectionPhase = .degraded
+        }
+        checkingConnectivity = false
+        lastActiveHealthCheckAt = .now
+        lastSuccessfulHealthCheckAt = healthy ? .now : nil
+        warpExitIP = candidate.warpExitIP
+        if let ip = candidate.observedExitIP, !HarborIndependentWARP.isBuiltIn(node) {
+            let existing = nodeExitLocations[node.id]?.location
+            let location = existing.flatMap { $0.ip == ip ? $0 : nil }
+                ?? HarborProxyIPLocation(ip: ip, countryCode: "ZZ")
+            nodeExitLocations[node.id] = HarborProxyExitLocation(location: location,
+                endpointSignature: node.endpointSignature, resolvedServerIP: entranceLocation(for: node)?.ip,
+                probeRouteID: currentVPNGateRouteID)
+        }
+        autoManageSystemProxy = wantsSystemProxy
+        status = healthy ? "已连接" : "代理连接异常"
+        detail = "HTTP 127.0.0.1:\(entryPort) · SOCKS5 \(entryPort + 1)"
+        if userInitiated, transactionValid() { resumeConnectionOnLaunch = true }
+        if let previousBackend {
+            if isNewGateway {
+                if let previousPort, HarborSystemProxy.referencesListener(previousPort), let previousGateway {
+                    // An inactive service changed during the migration. Keep
+                    // that listener alive and route it to the committed backend.
+                    do {
+                        try await previousGateway.route(to: candidate.agentRoute(), closeOldConnections: true)
+                        migrationGateway = previousGateway
+                        detail = "新端口已连接，旧端口仍被系统网络服务引用；恢复系统代理后释放"
+                        await disposeGatewayBackend(previousBackend)
+                    } catch {
+                        migrationGateway = previousGateway
+                        drainingBackend = previousBackend
+                        detail = "旧端口仍被系统引用，已保留其后端，请恢复系统代理"
+                    }
+                } else {
+                    if let previousGateway, !(await previousGateway.stop()) {
+                        migrationGateway = previousGateway
+                        drainingBackend = previousBackend
+                    } else { await disposeGatewayBackend(previousBackend) }
+                }
+            } else {
+                drainingBackend = previousBackend
+            }
+        }
+
+        startLivenessMonitoring()
+        cancelActiveExitClassification()
+        scheduleActiveExitClassification()
         persist()
+        proxyAudit("gateway_route_committed", nodeID: node.id, note: "backend=\(candidate.primary.id.uuidString)")
+        if transactionValid(), wantsSystemProxy {
+            if !wasManaged || (!isNewGateway && previousBackend.map {
+                $0.policy.forcedDomains != policy.forcedDomains || $0.policy.localHosts != policy.localHosts
+            } == true) {
+                await applySystemProxy(interactive: userInitiated, policy: policy, reconfigure: wasManaged)
+            }
+        }
+        refreshSystemProxyState(synchronizeOwnership: true)
         if let activeNode, !HarborIndependentWARP.isBuiltIn(activeNode) {
             enqueueExitGeoRefresh(for: [activeNode])
         }
-
-        proxyAudit("switch_listener_committed", nodeID: id)
-        if wasManaged {
-            // The unchanged system proxy already targets our fixed listener.
-            if !HarborSystemProxy.isOwned() {
-                systemManaged = false
-                detail = "Xray 已切换，但系统代理被其他程序更改；未覆盖其配置"
-            } else {
-                detail = "已切换节点 · 系统代理端口保持不变"
-            }
-            refreshSystemProxyState()
-        }
+        await reapDrainedGatewayBackend()
     }
 
-    private func validateConnection(_ node: HarborProxyNode, policy: RoutingPolicy,
-                                    cancellation: HarborLatencyCancellation) async throws -> VPNGateRoute {
-        // Independent WARP is itself the outbound; never treat its placeholder
-        // identity as a remote Xray server or a subscription node.
+    private func prepareGatewayCandidate(
+        _ node: HarborProxyNode, policy: RoutingPolicy, protectedPorts: Set<Int>,
+        cancellation: HarborLatencyCancellation, requiresObservedExit: Bool = false
+    ) async throws -> GatewayBackend {
         if HarborIndependentWARP.isBuiltIn(node) {
-            let tunnel = try await prepareIndependentVPNGateTunnel(cancellation: cancellation)
-            let profile = tunnel.profile
-            await tunnel.close()
-            return .warp(profile)
+            return try await prepareFormalWARPCandidate(node, policy: policy,
+                protectedPorts: protectedPorts, cancellation: cancellation, requiresObservedExit: requiresObservedExit)
         }
         guard node.protocolName == "openvpn" else {
-            try await validateCandidate(node, policy: policy, cancellation: cancellation)
-            return .direct
+            return try await makeGatewayBackend(node, policy: policy, route: .direct,
+                protectedPorts: protectedPorts, cancellation: cancellation, requiresObservedExit: requiresObservedExit)
         }
         let previous = probeResults[node.id].flatMap { $0.succeeded && !$0.isStale() ? $0.probeRouteID : nil }
-        let availableUnderlay = workingVPNGateUnderlay
-        let underlay = availableUnderlay.flatMap { item in
-            nodes.contains(where: { $0.id == item.nodeID }) ? item : nil
-        }
-        if let underlay, previous == underlay.routeID {
-            if (try? await validateCandidateThroughUnderlay(
-                node, baseID: underlay.nodeID, policy: policy, cancellation: cancellation)) != nil {
-                return .underlay(underlay.nodeID)
+        let base = workingVPNGateUnderlay
+        let cached = warpProfile(for: node)
+        var routes: [VPNGateRoute] = []
+        if let base, previous == base.routeID { routes.append(.underlay(base.nodeID)) }
+        if let cached, previous == cached.routeID { routes.append(.warp(cached)) }
+        routes.append(.direct)
+        if let base, previous != base.routeID { routes.append(.underlay(base.nodeID)) }
+        for route in routes {
+            guard !cancellation.isCancelled, !Task.isCancelled else { throw CancellationError() }
+            if let candidate = try? await makeGatewayBackend(node, policy: policy, route: route,
+                protectedPorts: protectedPorts, cancellation: cancellation, requiresObservedExit: requiresObservedExit) {
+                return candidate
             }
-        }
-        if let cached = warpProfile(for: node), previous == cached.routeID,
-           (try? await validateCandidate(node, policy: policy, warp: cached, cancellation: cancellation)) != nil {
-            return .warp(cached)
-        }
-        if (try? await validateCandidate(node, policy: policy, cancellation: cancellation)) != nil {
-            return .direct
         }
         guard !cancellation.isCancelled, !Task.isCancelled else { throw CancellationError() }
-        if let underlay, previous != underlay.routeID,
-           (try? await validateCandidateThroughUnderlay(
-               node, baseID: underlay.nodeID, policy: policy, cancellation: cancellation)) != nil {
-            return .underlay(underlay.nodeID)
-        }
-        let tunnel = try await prepareIndependentVPNGateTunnel(
-            cancellation: cancellation, preferred: store.warpProbeEndpoints?[node.id])
-        let profile = tunnel.profile
-        await tunnel.close()
-        try await validateCandidate(node, policy: policy, warp: profile, cancellation: cancellation)
-        return .warp(profile)
+        return try await prepareFormalWARPCandidate(node, policy: policy,
+            protectedPorts: protectedPorts, cancellation: cancellation, requiresObservedExit: requiresObservedExit)
     }
 
-    /// Match the actual runtime topology: an independent Xray base with all
-    /// traffic routed through its outbound, followed by the candidate relay.
-    /// Do not stop the working system listener to discover a base startup error.
-    private func validateCandidateThroughUnderlay(
-        _ node: HarborProxyNode, baseID: String, policy: RoutingPolicy,
-        cancellation: HarborLatencyCancellation
-    ) async throws {
-        guard let base = nodes.first(where: {
-            $0.id == baseID && $0.protocolName != "openvpn" && !HarborIndependentWARP.isBuiltIn($0)
-        }) else { throw HarborProxyError.invalid("底座订阅节点不可用") }
-        guard let lease = await HarborProbeBudget.engines.acquire(cancellation) else { throw CancellationError() }
-        guard let port = HarborNodeLatencyTester.reservePortPair() else {
-            await HarborProbeBudget.engines.release(lease)
-            throw HarborProxyError.invalid("底座验证端口不可用")
+    /// Each discovery attempt is a formal agent-owned candidate. On success
+    /// retain that same engine and port pair; never restart a verified engine
+    /// merely to promote it. The existing screen-only pool stays independent.
+    private func prepareFormalWARPCandidate(
+        _ node: HarborProxyNode, policy: RoutingPolicy, protectedPorts: Set<Int>,
+        cancellation: HarborLatencyCancellation, requiresObservedExit: Bool
+    ) async throws -> GatewayBackend {
+        let epoch = connectionCoordinator.networkEpoch
+        let account = try await ensureWARPAccount(cancellation: cancellation)
+        let key = HarborWARPFormalDiscoveryPolicy.Key(accountID: account.id, nodeID: node.id,
+            endpointSignature: node.endpointSignature, networkEpoch: epoch)
+        guard formalWARPDiscovery.canAttempt(key) else {
+            throw HarborProxyError.invalid("独立通道处于失败冷却期，请稍后重试")
         }
-        let file = root.appendingPathComponent("probe-underlay-\(UUID().uuidString).json")
-        let engine = Process()
-        var failure: (any Error)?
+        let attempts = HarborLatencyCancellation()
+        let observer = cancellation.observe { attempts.cancel() }
+        let deadline = ContinuousClock.now + .seconds(HarborWARPEndpoint.discoveryDeadlineSeconds)
+        let timer = Task {
+            do { try await Task.sleep(until: deadline, clock: .continuous) } catch { return }
+            attempts.cancel()
+        }
+        defer {
+            timer.cancel()
+            if let observer { cancellation.removeObserver(observer) }
+        }
+
+        let preferred = store.warpProbeEndpoints?[node.id] ?? store.warpEndpoint
+        let endpoints = HarborWARPEndpoint.discoveryAttempts(preferred: preferred)
+        for endpoint in endpoints {
+            guard !attempts.isCancelled, !Task.isCancelled, !shuttingDownConnection,
+                  networkOnline, epoch == connectionCoordinator.networkEpoch,
+                  ContinuousClock.now < deadline else { break }
+            do {
+                let profile = HarborWARPProfile(account: account, endpoint: endpoint)
+                let candidate = try await makeGatewayBackend(node, policy: policy, route: .warp(profile),
+                    protectedPorts: protectedPorts, cancellation: attempts, requiresObservedExit: requiresObservedExit)
+                guard !attempts.isCancelled, !Task.isCancelled, !shuttingDownConnection,
+                      networkOnline, epoch == connectionCoordinator.networkEpoch else {
+                    await disposeGatewayBackend(candidate)
+                    throw CancellationError()
+                }
+                formalWARPDiscovery.recordSuccess(key)
+                return candidate
+            } catch {
+                if cancellation.isCancelled || Task.isCancelled || shuttingDownConnection
+                    || epoch != connectionCoordinator.networkEpoch { throw CancellationError() }
+                proxyAudit("warp_candidate_failed", nodeID: node.id,
+                           note: "transport=\(endpoint.transport.rawValue)")
+            }
+        }
+        guard !cancellation.isCancelled, !Task.isCancelled, !shuttingDownConnection,
+              networkOnline, epoch == connectionCoordinator.networkEpoch else { throw CancellationError() }
+        formalWARPDiscovery.recordFailure(key)
+        throw HarborProxyError.invalid("正式 WARP 候选验证未通过，已保留原连接")
+    }
+
+    private func makeGatewayBackend(
+        _ node: HarborProxyNode, policy: RoutingPolicy, route: VPNGateRoute,
+        protectedPorts: Set<Int>, cancellation: HarborLatencyCancellation, requiresObservedExit: Bool
+    ) async throws -> GatewayBackend {
+        var base: HarborRuntimeEngineSupervisor.Engine?
+        var baseID: String?
+        var warp: HarborWARPProfile?
+        var main: HarborRuntimeEngineSupervisor.Engine?
+        let isWarp = HarborIndependentWARP.isBuiltIn(node)
+        let isOpenVPN = node.protocolName == "openvpn"
+        let aliases = policy.localHostAddresses.filter { $0.value.contains(where: HarborGatewayConfiguration.isLoopback) }.keys.sorted()
+        guard !(await gatewayEndpointLoops(node, protectedPorts: protectedPorts)) else {
+            throw HarborProxyError.invalid("节点入口指向本地代理端口，已拒绝递归连接")
+        }
         do {
-            let config = try HarborXrayConfig.make(
-                node: base, httpPort: port, ruleMode: false, routeAllViaProxy: true)
-            try HarborProbeFiles.write(config, to: file)
-            engine.executableURL = root.appendingPathComponent("xray")
-            engine.currentDirectoryURL = root
-            engine.arguments = ["run", "-config", file.path]
-            engine.standardInput = FileHandle.nullDevice
-            engine.standardOutput = FileHandle.nullDevice
-            engine.standardError = FileHandle.nullDevice
-            guard !cancellation.isCancelled, !Task.isCancelled else { throw CancellationError() }
-            try engine.run()
-            HarborProbeFiles.record(engine, config: file)
-            guard await HarborNodeLatencyTester.awaitListeningPair(
-                port: port, process: engine, cancellation: cancellation) else {
-                throw HarborProxyError.invalid("独立底座验证内核未能监听")
+            switch route {
+            case .direct: break
+            case .warp(let profile): warp = profile
+            case .underlay(let id):
+                guard isOpenVPN, let profile = nodes.first(where: {
+                    $0.id == id && $0.protocolName != "openvpn" && !HarborIndependentWARP.isBuiltIn($0)
+                }) else { throw HarborProxyError.invalid("底座节点不可用") }
+                guard !(await gatewayEndpointLoops(profile, protectedPorts: protectedPorts)) else {
+                    throw HarborProxyError.invalid("底座入口指向本地代理端口")
+                }
+                baseID = id
+                base = try await runtimeSupervisor.start(kind: .xray, root: root, cancellation: cancellation) { port in
+                    let ports = protectedPorts.union([port, port + 1])
+                    guard !(ports.contains(profile.port) && HarborGatewayConfiguration.isLoopback(profile.host)) else {
+                        throw HarborProxyError.invalid("底座入口与内部监听端口冲突")
+                    }
+                    let config = try HarborXrayConfig.make(node: profile, httpPort: port, ruleMode: false, routeAllViaProxy: true)
+                    return try HarborGatewayConfiguration.protectXray(config, ports: ports, aliases: aliases)
+                }
             }
-            try await validateCandidate(node, policy: policy, underlayPort: port, cancellation: cancellation)
-        } catch { failure = error }
-        guard await HarborProxyCommand.stop(engine) else {
-            throw HarborProxyError.invalid("底座验证内核未退出，已保留清理记录")
+            let engine = try await runtimeSupervisor.start(
+                kind: isWarp || isOpenVPN ? .mihomo : .xray, root: root,
+                cancellation: cancellation, dependencies: base.map { [$0] } ?? []
+            ) { port in
+                if isWarp {
+                    guard let warp else { throw HarborProxyError.invalid("WARP 通道配置尚未就绪") }
+                    let config = try HarborWARPConfig.make(profile: warp, httpPort: port)
+                    return try HarborGatewayConfiguration.protectMihomo(config,
+                        ports: protectedPorts.union([port, port + 1]), aliases: aliases, verificationOutbound: "warp")
+                }
+                var ports = protectedPorts.union([port, port + 1])
+                if let base { ports.formUnion([base.port, base.port + 1]) }
+                guard !(ports.contains(node.port) && HarborGatewayConfiguration.isLoopback(node.host)) else {
+                    throw HarborProxyError.invalid("节点入口与内部监听端口冲突")
+                }
+                let config = try policy.configuration(for: node, port: port, underlayPort: base?.port, warp: warp)
+                return try isOpenVPN
+                    ? HarborGatewayConfiguration.protectMihomo(config, ports: ports, aliases: aliases)
+                    : HarborGatewayConfiguration.protectXray(config, ports: ports, aliases: aliases)
+            }
+            main = engine
+            var warpExit: String?
+            if isWarp {
+                let report = await HarborWARPConnectivity.check(httpPort: engine.port)
+                guard report.verified else { throw HarborProxyError.invalid("WARP 出口验证失败") }
+                warpExit = report.exitIP
+            }
+
+            // Verify both protocols against the actual candidate, with
+            // multiple HTTPS targets and no environment proxy fallback.
+            var protocolsReady = await gatewayProtocolsReachable(port: engine.port, openVPN: isOpenVPN,
+                                                                 cancellation: cancellation)
+            if !protocolsReady, isOpenVPN, !cancellation.isCancelled, !Task.isCancelled {
+                // Allow a cold OpenVPN handshake another bounded verification wave.
+                protocolsReady = await gatewayProtocolsReachable(port: engine.port, openVPN: true,
+                                                                 cancellation: cancellation)
+            }
+            guard protocolsReady, !cancellation.isCancelled, !Task.isCancelled else {
+                throw HarborProxyError.invalid("候选 HTTP/SOCKS5 双协议验证未通过")
+            }
+            let exitIP: String?
+            if let warpExit { exitIP = warpExit }
+            else if requiresObservedExit {
+                exitIP = await gatewayObservedExit(socksPort: engine.port + 1, cancellation: cancellation)
+                guard exitIP != nil else { throw HarborProxyError.invalid("备用节点实际出口 IP 未验证") }
+            } else { exitIP = nil }
+            let candidate = GatewayBackend(nodeID: node.id, endpointSignature: node.endpointSignature,
+                                           observedExitIP: exitIP, primary: engine, underlay: base,
+                                           underlayID: baseID, warp: warp, warpExitIP: warpExit, policy: policy)
+            guard candidate.alive else { throw HarborProxyError.invalid("候选运行配置或进程身份已变化") }
+            return candidate
+        } catch {
+            if let main { _ = await runtimeSupervisor.stop(main) }
+            if let base { _ = await runtimeSupervisor.stop(base) }
+            throw error
         }
-        HarborProbeFiles.remove(file)
-        HarborNodeLatencyTester.releasePortPair(port)
-        await HarborProbeBudget.engines.release(lease)
-        if let failure { throw failure }
     }
 
-    private func validateCandidate(_ node: HarborProxyNode, policy: RoutingPolicy,
-                                   underlayPort: Int? = nil, warp: HarborWARPProfile? = nil,
-                                   cancellation: HarborLatencyCancellation) async throws {
-        guard !cancellation.isCancelled, !Task.isCancelled else { throw CancellationError() }
-        let root = root
-        try await Self.runCandidate(node, root: root, policy: policy, underlayPort: underlayPort,
-                                    warp: warp, cancellation: cancellation)
+    private func gatewayEndpointLoops(_ node: HarborProxyNode, protectedPorts: Set<Int>) async -> Bool {
+        guard protectedPorts.contains(node.port) else { return false }
+        if HarborGatewayConfiguration.isLoopback(node.host) { return true }
+        if let resolved = await HarborNodeGeoIPResolver.resolvedIP(for: node.host) {
+            return HarborGatewayConfiguration.isLoopback(resolved)
+        }
+        return false
     }
 
-    private nonisolated static func runCandidate(
-        _ node: HarborProxyNode, root: URL, policy: RoutingPolicy, underlayPort: Int?,
-        warp: HarborWARPProfile?, cancellation: HarborLatencyCancellation
-    ) async throws {
-        guard let lease = await HarborProbeBudget.engines.acquire(cancellation) else { throw CancellationError() }
-        guard let port = HarborNodeLatencyTester.reservePortPair() else {
-            await HarborProbeBudget.engines.release(lease)
-            throw HarborProxyError.invalid("没有空闲的验证端口")
+    private func gatewayObservedExit(socksPort: Int, cancellation: HarborLatencyCancellation,
+                                     priority: HarborProbePriority? = nil) async -> String? {
+        for target in ["https://checkip.amazonaws.com/", "https://api.ipify.org/"] {
+            guard !cancellation.isCancelled, !Task.isCancelled else { return nil }
+            guard let lease = await HarborProbeBudget.requests.acquire(cancellation,
+                priority: priority ?? max(.health, HarborProbeScope.priority)) else { return nil }
+            let result = try? await HarborProxyCommand.run(URL(fileURLWithPath: "/usr/bin/curl"),
+                arguments: ["--disable", "--silent", "--fail", "--max-time", "7", "--max-filesize", "256",
+                            "--proto", "=https", "--proxy", "socks5h://127.0.0.1:\(socksPort)", "--noproxy", "", "--url", target],
+                timeout: 8, outputLimit: 256, cancelled: { cancellation.isCancelled })
+            await HarborProbeBudget.requests.release(lease)
+            if let result, result.status == 0, !cancellation.isCancelled,
+               let ip = HarborIPAddress.normalizedLiteral(String(decoding: result.data, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)), HarborNodeGeoIPResolver.isPublic(ip) {
+                return ip
+            }
         }
-        let file = root.appendingPathComponent("probe-\(UUID().uuidString).json")
-        let engine = Process()
-        let openVPN = node.protocolName == "openvpn"
-        var failed: (any Error)?
-        do {
-            let config = try policy.configuration(for: node, port: port, underlayPort: underlayPort, warp: warp)
-            try HarborProbeFiles.write(config, to: file)
-            engine.executableURL = root.appendingPathComponent(openVPN ? "mihomo" : "xray")
-            engine.currentDirectoryURL = root
-            engine.arguments = openVPN
-                ? ["-d", HarborMihomoInstaller.dataDirectory(root: root).path, "-f", file.path]
-                : ["run", "-config", file.path]
-            engine.standardInput = FileHandle.nullDevice
-            engine.standardOutput = FileHandle.nullDevice
-            engine.standardError = FileHandle.nullDevice
-            guard !cancellation.isCancelled, !Task.isCancelled else { throw CancellationError() }
-            try engine.run()
-            HarborProbeFiles.record(engine, config: file)
-            guard await HarborNodeLatencyTester.awaitListeningPair(
-                port: port, process: engine, cancellation: cancellation) else {
-                throw HarborProxyError.invalid("验证内核未能监听本地端口")
+        return nil
+    }
+
+    private func gatewayProtocolsReachable(
+        port: Int, openVPN: Bool, cancellation: HarborLatencyCancellation
+    ) async -> Bool {
+        let primary = HarborNodeLatencyTester.verificationURL(openVPN: openVPN)
+        var targets = [primary, HarborNodeLatencyTester.openVPNVerificationURL,
+                       URL(string: "https://example.com/")!]
+        targets = targets.filter { $0.scheme?.lowercased() == "https" }
+        var unique: [URL] = []
+        for target in targets where !unique.contains(target) { unique.append(target) }
+        // Test the two entry protocols independently. A failed website does
+        // not by itself invalidate an otherwise working connection.
+        async let http = gatewayAnyHTTPSProbe(port: port, socks: false, targets: unique,
+                                              cancellation: cancellation)
+        async let socks = gatewayAnyHTTPSProbe(port: port + 1, socks: true, targets: unique,
+                                               cancellation: cancellation)
+        let (httpOK, socksOK) = await (http, socks)
+        return httpOK && socksOK
+    }
+
+    private func gatewayAnyHTTPSProbe(
+        port: Int, socks: Bool, targets: [URL], cancellation: HarborLatencyCancellation
+    ) async -> Bool {
+        for target in targets {
+            guard !cancellation.isCancelled, !Task.isCancelled else { return false }
+            if await gatewayHTTPSProbe(port: port, socks: socks, target: target, cancellation: cancellation) {
+                return true
             }
-            let reachable = openVPN
-                ? await HarborMihomoLatencyTester.checkActiveSOCKS(port: port + 1, cancellation: cancellation)
-                : await HarborNodeLatencyTester.checkActiveHTTP(port: port, cancellation: cancellation)
-            guard reachable, engine.isRunning, !cancellation.isCancelled else {
-                throw HarborProxyError.invalid("该线路未完成真实 HTTPS 验证")
-            }
-        } catch { failed = error }
-        if await HarborProxyCommand.stop(engine) {
-            HarborProbeFiles.remove(file)
-            HarborNodeLatencyTester.releasePortPair(port)
-            await HarborProbeBudget.engines.release(lease)
+        }
+        return false
+    }
+
+    private func gatewayHTTPSProbe(
+        port: Int, socks: Bool, target: URL, cancellation: HarborLatencyCancellation
+    ) async -> Bool {
+        guard target.scheme?.lowercased() == "https", !cancellation.isCancelled, !Task.isCancelled else { return false }
+        guard let lease = await HarborProbeBudget.requests.acquire(cancellation, priority: max(.health, HarborProbeScope.priority)) else { return false }
+        let scheme = socks ? "socks5h" : "http"
+        let result = try? await HarborProxyCommand.run(
+            URL(fileURLWithPath: "/usr/bin/curl"),
+            arguments: ["--disable", "--silent", "--fail", "--max-time", "6", "--max-filesize", "16384",
+                        "--proto", "=https", "--proxy", "\(scheme)://127.0.0.1:\(port)", "--noproxy", "",
+                        "--output", "/dev/null", "--write-out", "%{http_code}", "--url", target.absoluteString],
+            timeout: 7, outputLimit: 32, cancelled: { cancellation.isCancelled }
+        )
+        await HarborProbeBudget.requests.release(lease)
+        guard let result, result.status == 0, !cancellation.isCancelled, !Task.isCancelled,
+              let code = Int(String(decoding: result.data, as: UTF8.self)),
+              (200..<400).contains(code) else { return false }
+        return target.path != "/generate_204" || code == 204
+    }
+
+    @discardableResult
+    private func disposeGatewayBackend(_ backend: GatewayBackend) async -> Bool {
+        guard await runtimeSupervisor.stop(backend.primary) else { return false }
+        if let base = backend.underlay, !(await runtimeSupervisor.stop(base)) { return false }
+        return true
+    }
+
+    private func reapDrainedGatewayBackend() async {
+        guard let backend = drainingBackend, let localGateway, migrationGateway == nil,
+              !shuttingDownConnection else { return }
+        // Serialize cleanup against switching and explicit stop, including the
+        // suspension points in the agent's connection-count and stop calls.
+        let previousTransition = connectionTransition
+        connectionTransition = true
+        defer { connectionTransition = previousTransition }
+        guard await localGateway.connectionCount(backendID: backend.primary.id) == 0,
+              drainingBackend?.primary.id == backend.primary.id else { return }
+        if await disposeGatewayBackend(backend) {
+            drainingBackend = nil
         } else {
-            throw HarborProxyError.invalid("验证内核未退出，已保留其清理记录")
+            proxyAudit("old_stop_failed", nodeID: backend.nodeID)
         }
-        if let failed { throw failed }
     }
 
     /// The visible 'clear proxy' action never silently deletes another
@@ -2094,7 +3154,9 @@ final class HarborProxyManager: ObservableObject {
         setResumeConnectionOnLaunch(false)
         if running || child != nil || underlayChild != nil || adoptedPID != nil
             || HarborSystemProxy.hasBackup || connectionTransition || activationInProgress
-            || FileManager.default.fileExists(atPath: runtimeRecordURL.path) {
+            || localGateway != nil || runtimeSupervisor.hasEngines
+            || FileManager.default.fileExists(atPath: runtimeRecordURL.path)
+            || FileManager.default.fileExists(atPath: legacyMigrationURL.path) {
             if await stop(interactive: interactive) {
                 resumeConnectionOnLaunch = false
                 autoManageSystemProxy = false
@@ -2132,158 +3194,8 @@ final class HarborProxyManager: ObservableObject {
     }
 
     func isInUse(_ id: String) -> Bool {
-        running && (id == activeNodeID || (underlayPort != nil && id == vpnGateUnderlayNodeID))
-    }
-
-    private func start(
-        nodeID: String? = nil,
-        route: VPNGateRoute,
-        policy: RoutingPolicy,
-        requestedPort: Int? = nil,
-        preservingSystemProxy: Bool = false,
-        cancellation: HarborLatencyCancellation? = nil
-    ) async {
-        guard !busy, !running else { return }
-        // A former Xray can still be alive if its health state was lost.
-        // Do not overwrite our process handle and leave an orphan listening.
-        if child != nil || underlayChild != nil {
-            guard await stopCore() else { return }
-        }
-        if FileManager.default.fileExists(atPath: runtimeRecordURL.path) {
-            await cleanupOrphan()
-            guard !FileManager.default.fileExists(atPath: runtimeRecordURL.path) else {
-                detail = "发现上次未清理的 Xray 进程，已阻止重复启动"
-                return
-            }
-        }
-        guard !HarborSystemProxy.hasBackup ||
-                preservingSystemProxy else {
-            detail = "系统代理状态尚未安全恢复"
-            return
-        }
-        guard let node = nodes.first(where: { $0.id == (nodeID ?? selectedID) }) else {
-            detail = "先导入并选择节点"
-            return
-        }
-        guard supportsCore(for: node) else {
-            detail = (node.protocolName == "openvpn" || HarborIndependentWARP.isBuiltIn(node))
-                ? "请从安装包恢复内置 Mihomo 内核" : "请从安装包恢复内置 Xray 内核"
-            return
-        }
-        busy = true; defer { busy = false }
-        status = "正在连接"; detail = ""
-        var startupStage = "port"
-        do {
-            guard cancellation?.isCancelled != true, !shuttingDownConnection else { throw CancellationError() }
-            let port = try await choosePort(requestedPort ?? configuredHTTPPort, cancellation: cancellation)
-            let isOpenVPN = node.protocolName == "openvpn"
-            let isStandaloneWARP = HarborIndependentWARP.isBuiltIn(node)
-            let underlayNodeID: String?
-            if case .underlay(let id) = route, isOpenVPN { underlayNodeID = id }
-            else { underlayNodeID = nil }
-            if case .warp(let profile) = route, (isOpenVPN || isStandaloneWARP) {
-                activeWARPProfile = profile
-            } else {
-                activeWARPProfile = nil
-            }
-            if let underlayNodeID {
-                startupStage = "underlay"
-                guard coreInstalled,
-                      let base = nodes.first(where: {
-                          $0.id == underlayNodeID && $0.protocolName != "openvpn"
-                      }) else {
-                    throw HarborProxyError.invalid("住宅节点的底座订阅节点已不存在")
-                }
-                try await startUnderlay(base, cancellation: cancellation)
-            }
-            startupStage = "configuration"
-            let config: Data
-            if isStandaloneWARP {
-                guard let profile = activeWARPProfile else {
-                    throw HarborProxyError.invalid("WARP 通道配置尚未就绪")
-                }
-                config = try HarborWARPConfig.make(profile: profile, httpPort: port)
-            } else {
-                config = try policy.configuration(
-                    for: node, port: port, underlayPort: underlayPort, warp: activeWARPProfile)
-            }
-            let file = root.appendingPathComponent("runtime-\(UUID().uuidString).json")
-            try HarborProbeFiles.write(config, to: file)
-            configPath = file
-            let process = Process()
-            process.executableURL = root.appendingPathComponent(
-                (isOpenVPN || isStandaloneWARP) ? "mihomo" : "xray")
-            process.currentDirectoryURL = root
-            process.arguments = (isOpenVPN || isStandaloneWARP)
-                ? ["-d", HarborMihomoInstaller.dataDirectory(root: root).path, "-f", file.path]
-                : ["run", "-config", file.path]
-            process.standardInput = FileHandle.nullDevice
-            // The active child may be adopted after an app restart. Its raw
-            // output must not depend on an app pipe or grow a persistent log.
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { [weak self] finished in
-                let pid = finished.processIdentifier
-                Task { @MainActor [weak self] in
-                    await self?.handleUnexpectedXrayExit(pid: pid)
-                }
-            }
-            startupStage = "launch"
-            try process.run()
-            child = process; localPort = port
-            startupStage = "record"
-            let record = HarborProxyProcessRecord(
-                pid: process.processIdentifier, configPath: file.path,
-                executablePath: process.executableURL?.path ?? "",
-                underlay: underlayRecord(nodeID: underlayNodeID),
-                warpEndpoint: activeWARPProfile?.endpoint
-            )
-            try HarborProbeFiles.replace(JSONEncoder().encode(record), at: runtimeRecordURL)
-            startupStage = "listener"
-            let ready = await HarborNodeLatencyTester.awaitListeningPair(
-                port: port, process: process, cancellation: cancellation) && !shuttingDownConnection
-            // Opening the two local listeners is the startup condition.
-            // External HTTPS probes can take 4s × 3 on a slow/blocked node;
-            // they must not hold up the UI or serialize every node switch.
-            guard HarborProxyStartupPolicy.canPublishListenerReady(
-                xrayRunning: process.isRunning, portsListening: ready
-            ) else {
-                throw HarborProxyError.invalid("代理内核未能监听本地 HTTP/SOCKS5 端口，请检查端口或节点配置")
-            }
-            startupStage = "identity"
-            guard runningConfigMatches(node.id, path: file) else {
-                proxyAudit("runtime_config_mismatch", nodeID: node.id)
-                throw HarborProxyError.invalid("运行配置与目标节点不一致，未将切换标记为成功")
-            }
-            // Commit UI identity only after the listener belongs to the new
-            // process and its complete outbound configuration matches the node.
-            activeNodeID = node.id
-            warpExitIP = nil
-            activePolicy = policy
-            if isOpenVPN { vpnGateUnderlayNodeID = underlayPort == nil ? nil : underlayNodeID }
-            running = true
-            proxyAudit("listener_ready", nodeID: node.id)
-            startLivenessMonitoring()
-            healthy = false
-            checkingConnectivity = true
-            status = "已启动 · 正在检测网络"
-            detail = "HTTP 127.0.0.1:\(port) · SOCKS5 \(port + 1)"
-            connectionGeneration &+= 1
-            let generation = connectionGeneration
-            await finishHealthCheck(port: port, generation: generation, systemProxyInteractive: false,
-                                    publishConnection: false, cancellation: cancellation)
-        } catch {
-            // Record the failing stage before stopCore clears the process and
-            // port. Only fixed labels and numeric exit/error codes are logged.
-            let processState = child.map { process in
-                process.isRunning ? "running" : "exit_\(process.terminationStatus)"
-            } ?? "not_started"
-            proxyAudit("startup_failed", nodeID: node.id,
-                       note: "stage=\(startupStage) process=\(processState) code=\((error as NSError).code)")
-            let cleaned = await stopCore()
-            status = "连接失败"
-            detail = error.localizedDescription + (cleaned ? "" : "；内核清理未完成")
-        }
+        (running && (id == activeNodeID || (underlayPort != nil && id == vpnGateUnderlayNodeID)))
+            || drainingBackend?.nodeID == id || drainingBackend?.underlayID == id
     }
 
     /// Recheck HTTPS over the running route, independently of website tests.
@@ -2294,21 +3206,36 @@ final class HarborProxyManager: ObservableObject {
         publishConnection: Bool = true,
         cancellation: HarborLatencyCancellation? = nil
     ) async {
+        let probeCancellation = cancellation ?? HarborLatencyCancellation()
+        activeHealthCancellation = probeCancellation
+        let epoch = connectionCoordinator.networkEpoch
+        defer {
+            if activeHealthCancellation === probeCancellation {
+                activeHealthCancellation = nil
+                if generation == connectionGeneration { checkingConnectivity = false }
+            }
+        }
+        guard networkOnline else { return }
         let isOpenVPN = activeNode?.protocolName == "openvpn"
         let isWarp = activeNode.map(HarborIndependentWARP.isBuiltIn) ?? false
+        let throughGateway = localGateway != nil
         let warpReport = isWarp ? await HarborWARPConnectivity.check(httpPort: port) : nil
         let reachable: Bool
-        if let warpReport {
+        if throughGateway {
+            let protocols = await gatewayProtocolsReachable(port: port, openVPN: isOpenVPN,
+                                                             cancellation: probeCancellation)
+            reachable = protocols && (!isWarp || warpReport?.verified == true)
+        } else if let warpReport {
             reachable = warpReport.verified
         } else if isOpenVPN {
             reachable = await HarborMihomoLatencyTester.checkActiveSOCKS(
-                port: port + 1, cancellation: cancellation)
+                port: port + 1, cancellation: probeCancellation)
         } else {
-            reachable = await HarborNodeLatencyTester.checkActiveHTTP(port: port, cancellation: cancellation)
+            reachable = await HarborNodeLatencyTester.checkActiveHTTP(port: port, cancellation: probeCancellation)
         }
-        guard generation == connectionGeneration,
-              running, localPort == port, cancellation?.isCancelled != true,
-              !shuttingDownConnection, !Task.isCancelled else { return }
+        guard generation == connectionGeneration, epoch == connectionCoordinator.networkEpoch,
+              running, localPort == port, !probeCancellation.isCancelled,
+              networkOnline, !shuttingDownConnection, !Task.isCancelled else { return }
         lastActiveHealthCheckAt = .now
         guard coreProcessAlive else {
             await handleUnexpectedXrayExit(pid: child?.processIdentifier ?? adoptedPID)
@@ -2320,6 +3247,11 @@ final class HarborProxyManager: ObservableObject {
             proxyAudit("health_identity_mismatch", nodeID: activeNodeID)
             status = "运行配置与选中节点不一致"
             detail = "代理内核已启动，但无法核对实际运行节点；请重新选择节点"
+            if throughGateway {
+                connectionPhase = .degraded
+                await localGateway?.suspendRouting(closeExisting: true)
+                scheduleGatewayRecovery(gatewayHealthPolicy.recordFailure(engineUnavailable: true))
+            }
             return
         }
         checkingConnectivity = false
@@ -2328,23 +3260,29 @@ final class HarborProxyManager: ObservableObject {
         proxyAudit(reachable ? "health_success" : "health_failed",
                    nodeID: activeNodeID, note: isOpenVPN ? "method=socks_https" : "method=http_proxy_https")
         if reachable {
+            if throughGateway { cancelGatewayRecovery(reset: true) }
+            lastSuccessfulHealthCheckAt = .now
+            scheduleActiveExitClassification()
+            connectionPhase = .connected
             status = "已连接"
             detail = isWarp
                 ? "WARP 出口已验证 \(warpExitIP ?? "IP 待识别") · HTTP \(port) / SOCKS5 \(port + 1)"
                 : "HTTP 127.0.0.1:\(port) · SOCKS5 \(port + 1)"
             guard publishConnection else { return }
             if let activeNode, !isWarp { enqueueExitGeoRefresh(for: [activeNode]) }
-            if autoManageSystemProxy && !systemManaged {
+            if !throughGateway, autoManageSystemProxy && !systemManaged {
                 await enableSystemProxy(interactive: systemProxyInteractive)
             }
         } else {
+            connectionPhase = .degraded
+            if throughGateway { scheduleGatewayRecovery(gatewayHealthPolicy.recordFailure()) }
             // Inbound identity and node selection remain committed; a probe
             // failure does not mean the Xray outbound changed to another node.
             status = isWarp ? "WARP 出口验证失败" : "代理仍在运行 · 连通性检查未通过"
             detail = isWarp
                 ? (warpReport?.reason ?? "WARP 真实出口验证失败，未接管系统代理")
                 : "当前代理未能完成 HTTPS 验证请求。可以重试网站检测或选择其他节点。"
-            if isWarp && systemManaged {
+            if isWarp && systemManaged && localGateway == nil {
                 do {
                     try await HarborSystemProxy.restore()
                     systemManaged = false
@@ -2389,7 +3327,9 @@ final class HarborProxyManager: ObservableObject {
         guard running, let port = localPort, !busy, !connectionTransition,
               !shuttingDownConnection, !checkingConnectivity else { return }
         checkingConnectivity = true
-        await finishHealthCheck(port: port, generation: connectionGeneration, systemProxyInteractive: false)
+        await HarborProbeScope.$priority.withValue(.health) {
+            await finishHealthCheck(port: port, generation: connectionGeneration, systemProxyInteractive: false)
+        }
     }
 
     func testRealLatency(_ ids: [String]) async {
@@ -2408,7 +3348,9 @@ final class HarborProxyManager: ObservableObject {
         } else {
             finalization = nil
         }
-        await testLatency(ids, finalization: finalization)
+        await HarborProbeScope.$priority.withValue(.manual) {
+            await testLatency(ids, finalization: finalization)
+        }
     }
 
     private func proxyResultIsUntested(_ id: String) -> Bool {
@@ -2715,7 +3657,9 @@ final class HarborProxyManager: ObservableObject {
         let generation = UUID()
         exitGeoBatchGeneration = generation
         exitGeoTask = Task(priority: .utility) { [weak self] in
-            await self?.runExitGeoQueue(generation: generation)
+            await HarborProbeScope.$priority.withValue(.geoIP) {
+                await self?.runExitGeoQueue(generation: generation)
+            }
         }
     }
 
@@ -2767,7 +3711,7 @@ final class HarborProxyManager: ObservableObject {
             // batches always use isolated inbounds so node switches cannot
             // attribute an exit IP to the wrong profile.
             let livePort = due.count == 1 && due[0].id == activeNodeID
-                && !exitGeoManualIDs.contains(due[0].id) && running && healthy
+                && !exitGeoManualIDs.contains(due[0].id) && running && healthy && !connectionTransition
                 ? localPort.map { $0 + 1 } : nil
             let liveGeneration = connectionGeneration
             let activeRoute = currentVPNGateRouteID
@@ -3056,6 +4000,7 @@ final class HarborProxyManager: ObservableObject {
         defer { connectionTransition = false }
         do {
             try await HarborSystemProxy.restore()
+            if let migrationGateway, await migrationGateway.stop() { self.migrationGateway = nil }
             systemManaged = false
             autoManageSystemProxy = false
             persist()
@@ -3064,20 +4009,109 @@ final class HarborProxyManager: ObservableObject {
         refreshSystemProxyState()
     }
 
+    /// Quitting the UI is not an explicit disconnect. When the user has
+    /// opted to resume the connection, leave the resident route and system
+    /// settings intact; the agent takes over health/recovery after XPC closes.
+    /// Legacy in-process connections and opted-out sessions retain stop-on-quit.
+    func prepareForApplicationQuit() async {
+        guard localGateway != nil, resumeConnectionOnLaunch else {
+            _ = await stop(interactive: false)
+            return
+        }
+        shuttingDownConnection = true
+        cancelGatewayRecovery(reset: true)
+        connectionCoordinator.beginStop()
+        activeHealthCancellation?.cancel()
+        activationPreflightCancellation?.cancel()
+        vpnGateDownloadCancellation?.cancel()
+        warpRegistrationTask?.cancel()
+        warpDiscoveryPool.invalidate()
+        cancelActiveExitClassification()
+        cancelLatencyTests()
+        cancelAllExitGeoWork()
+        websiteCancellation?.cancel()
+        geoRefreshTask?.cancel()
+        livenessTask?.cancel()
+        healthTask?.cancel()
+        // Do not block UI termination indefinitely, or send a stop command
+        // to a route whose commit acknowledgement may still be in flight.
+        let deadline = ContinuousClock.now + .seconds(8)
+        while (activationInProgress || connectionTransition || latencyTesting || exitGeoCleaningUp || websiteChecking),
+              ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        // Delegate only the remaining explicitly allowed alternatives, bound
+        // to the current live route. A failed handoff never authorizes a
+        // wider selection. No standby engine is launched at quit.
+        if !activationInProgress, !connectionTransition, let grant = detachedFallbackGrant() {
+            _ = try? await HarborProxyAgentClient.shared.call(.grantDetachedFallback(grant))
+        }
+        HarborProxyAgentClient.shared.disconnect()
+    }
+
+    private func detachedFallbackGrant() -> HarborDetachedFallbackGrant? {
+        guard fallbackPolicy.enabled, configurationLoaded, networkOnline,
+              migrationGateway == nil, let original = activeNode,
+              let backend = gatewayBackend, original.id == backend.nodeID,
+              original.endpointSignature == backend.endpointSignature,
+              let ip = backend.observedExitIP,
+              let evidence = nodeExitNetworkEvidence[original.id],
+              evidence.networkEpoch == connectionCoordinator.networkEpoch,
+              HarborProxyFallbackPolicy.ExitConstraint(evidence: evidence, observedIP: ip) != nil
+        else { return nil }
+        let remaining = max(0, 3 - attemptedFallbackIDs.subtracting([original.id]).count)
+        let candidates = Array(nodes.filter {
+            $0.id != original.id && !attemptedFallbackIDs.contains($0.id)
+                && fallbackPolicy.permits(nodeID: $0.id, signature: $0.endpointSignature)
+                && $0.protocolName == original.protocolName && supportsCore(for: $0)
+        }.sorted { $0.id < $1.id }.prefix(remaining))
+        guard !candidates.isEmpty else { return nil }
+        // Do not delegate an unverified or altered subscription underlay.
+        var underlayNode: HarborProxyNode?
+        if let id = backend.underlayID {
+            guard let base = nodes.first(where: { $0.id == id }), let engine = backend.underlay,
+                  engine.configurationUnchanged,
+                  let bytes = try? Data(contentsOf: engine.configuration),
+                  let expected = try? HarborXrayConfig.make(node: base, httpPort: engine.port,
+                      ruleMode: false, routeAllViaProxy: true),
+                  let actual = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+                  let originalConfig = try? JSONSerialization.jsonObject(with: expected) as? [String: Any],
+                  let actualOutbounds = actual["outbounds"] as? [[String: Any]],
+                  let expectedOutbounds = originalConfig["outbounds"] as? [[String: Any]],
+                  let a = actualOutbounds.first(where: { $0["tag"] as? String == "proxy" }),
+                  let b = expectedOutbounds.first(where: { $0["tag"] as? String == "proxy" }),
+                  NSDictionary(dictionary: a).isEqual(to: b)
+            else { return nil }
+            underlayNode = base
+        }
+        return HarborDetachedFallbackGrant(primaryID: backend.primary.id, sourceNode: original,
+            sourceEvidence: evidence, candidates: candidates, underlayNode: underlayNode,
+            warpAccount: backend.warp?.account)
+    }
+
     @discardableResult
     func stop(interactive: Bool = false) async -> Bool {
         guard !shuttingDownConnection else { return false }
         shuttingDownConnection = true
-        defer { shuttingDownConnection = false }
-        pendingActivation.clear()
+        connectionPhase = .stopping
+        cancelGatewayRecovery(reset: true)
+        defer {
+            shuttingDownConnection = false
+            connectionCoordinator.endStop()
+            if connectionPhase == .stopping { connectionPhase = running ? (healthy ? .connected : .degraded) : .stopped }
+        }
+        connectionCoordinator.beginStop()
+        activeHealthCancellation?.cancel()
         activationPreflightCancellation?.cancel()
         vpnGateDownloadCancellation?.cancel()
         warpRegistrationTask?.cancel()
+        warpDiscoveryPool.invalidate()
+        cancelActiveExitClassification()
         cancelLatencyTests()
         cancelAllExitGeoWork()
         websiteCancellation?.cancel()
         let shutdownDeadline = ContinuousClock.now + .seconds(35)
-        while connectionTransition || latencyTesting || exitGeoCleaningUp || websiteChecking {
+        while activationInProgress || connectionTransition || latencyTesting || exitGeoCleaningUp || websiteChecking {
             guard ContinuousClock.now < shutdownDeadline else {
                 detail = "后台操作尚未结束，当前代理已保留，请稍后重试"
                 return false
@@ -3088,6 +4122,7 @@ final class HarborProxyManager: ObservableObject {
                 }
             }
         }
+        await warpDiscoveryPool.shutdown()
         if HarborProxyRecoveryPolicy.mustRestoreBeforeStop(hasBackup: HarborSystemProxy.hasBackup) {
             do { try await HarborSystemProxy.restore() }
             catch {
@@ -3097,7 +4132,44 @@ final class HarborProxyManager: ObservableObject {
             }
         }
         systemManaged = false
+        // Before stopping the legacy process, recover any unadopted staging
+        // handles left by a lost IPC reply. All system references were restored above.
+        if FileManager.default.fileExists(atPath: legacyMigrationURL.path),
+           FileManager.default.fileExists(atPath: HarborProxyAgentConstants.journalURL.path) {
+            guard let snapshot = try? await HarborProxyAgentClient.shared.inspect(),
+                  snapshot.operationInProgress != true else {
+                detail = "迁移服务状态未确认，保留恢复记录"; return false
+            }
+            runtimeSupervisor.adoptSnapshot(snapshot)
+            for entry in snapshot.gateways {
+                guard let handle = try? HarborAgentGateway(httpPort: entry.port),
+                      await handle.stop() else {
+                    detail = "迁移入口仍被使用或尚未回收"; return false
+                }
+            }
+        }
         let stopped = await stopCore()
+        if stopped, FileManager.default.fileExists(atPath: legacyMigrationURL.path) {
+            // Explicit disconnect also retires an unadopted staging gateway.
+            // The agent refuses any listener that remains referenced by macOS.
+            if FileManager.default.fileExists(atPath: HarborProxyAgentConstants.journalURL.path) {
+                guard let snapshot = try? await HarborProxyAgentClient.shared.inspect() else {
+                    detail = "迁移服务状态未确认，保留恢复记录"; return false
+                }
+                runtimeSupervisor.adoptSnapshot(snapshot)
+                for entry in snapshot.gateways {
+                    guard let gateway = try? HarborAgentGateway(httpPort: entry.port),
+                          await gateway.stop() else {
+                        detail = "迁移入口尚未回收，保留恢复记录"; return false
+                    }
+                }
+                guard await runtimeSupervisor.reap(excluding: []) else {
+                    detail = "迁移内核尚未回收"; return false
+                }
+                HarborProxyAgentClient.shared.disconnect()
+            }
+            try? FileManager.default.removeItem(at: legacyMigrationURL)
+        }
         refreshSystemProxyState()
         return stopped
     }
@@ -3105,6 +4177,10 @@ final class HarborProxyManager: ObservableObject {
     /// Stop only our Xray child. Node switching keeps the fixed macOS proxy
     /// address and the ownership/recovery snapshot intact; no authorization.
     private var coreProcessAlive: Bool {
+        if let gatewayBackend {
+            return gatewayBackend.alive && localGateway?.isReady == true
+                && localGateway?.routingBackendID == gatewayBackend.primary.id
+        }
         let mainAlive = child?.isRunning == true
             || adoptedPID.map { Darwin.kill($0, 0) == 0 } == true
         let underlayAlive = underlayPort == nil
@@ -3117,14 +4193,18 @@ final class HarborProxyManager: ObservableObject {
         guard livenessTask == nil else { return }
         livenessTask = Task { [weak self] in
             while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(30)) }
+                do { try await Task.sleep(for: .seconds(HarborProxyHealthPolicy.livenessInterval)) }
                 catch { return }
                 guard let self, !Task.isCancelled else { return }
+                if !self.connectionTransition && !self.shuttingDownConnection {
+                    await self.reapDrainedGatewayBackend()
+                }
                 await self.reconcileXrayLiveness()
-                if self.running, !self.connectionTransition, !self.shuttingDownConnection,
+                if self.running, self.networkOnline, self.gatewayRecoveryTask == nil,
+                   !self.connectionTransition, !self.shuttingDownConnection,
                    !self.checkingConnectivity, let port = self.localPort,
                    Date().timeIntervalSince(self.lastActiveHealthCheckAt ?? .distantPast)
-                    >= HarborProxyLatencyPolicy.activeHealthCheckInterval {
+                    >= HarborProxyHealthPolicy.healthInterval {
                     self.checkingConnectivity = true
                     await self.finishHealthCheck(
                         port: port,
@@ -3165,13 +4245,43 @@ final class HarborProxyManager: ObservableObject {
     }
 
     private func reconcileXrayLiveness() async {
-        guard running else { return }
+        guard running, !connectionTransition, !shuttingDownConnection, !activationInProgress else { return }
+        if let localGateway {
+            guard let snapshot = try? await HarborProxyAgentClient.shared.inspect() else {
+                healthy = false
+                connectionPhase = networkOnline ? .degraded : .offline
+                status = "独立代理服务暂不可达"
+                return
+            }
+            guard !connectionTransition, !shuttingDownConnection, !activationInProgress else { return }
+            runtimeSupervisor.adoptSnapshot(snapshot)
+            localGateway.refresh(snapshot)
+            migrationGateway?.refresh(snapshot)
+            if let entry = snapshot.gateways.first(where: { $0.port == localGateway.port }),
+               entry.route?.primaryID != gatewayBackend?.primary.id {
+                // A lost commit reply may hide a completed agent transaction.
+                // Never report the previous node or destroy the committed core.
+                guard adoptResidentProxy(snapshot) else {
+                    healthy = false
+                    detail = "代理服务路由状态尚未确认，保留内核"
+                    return
+                }
+                healthy = false
+                lastActiveHealthCheckAt = nil
+                detail = "已重新同步代理服务实际路由，等待健康验证"
+            }
+        }
         if coreProcessAlive {
             if let activeNodeID, !runningConfigMatches(activeNodeID, path: configPath) {
                 healthy = false
                 status = "代理运行配置与选中节点不一致"
                 detail = "运行配置发生变化，已取消已连接状态；请重新选择节点"
                 proxyAudit("periodic_identity_mismatch", nodeID: activeNodeID)
+                if localGateway != nil, !connectionTransition, !activationInProgress, gatewayRecoveryTask == nil {
+                    await localGateway?.suspendRouting(closeExisting: true)
+                    connectionPhase = .degraded
+                    scheduleGatewayRecovery(gatewayHealthPolicy.recordFailure(engineUnavailable: true))
+                }
             }
             return
         }
@@ -3179,13 +4289,30 @@ final class HarborProxyManager: ObservableObject {
     }
 
     private func handleUnexpectedXrayExit(pid: Int32?) async {
-        guard !connectionTransition, !shuttingDownConnection, let pid,
-              HarborProxyLivenessPolicy.shouldHandleUnexpectedExit(
-                  running: running,
-                  intentionallyStopping: intentionallyStoppingCore,
-                  processMatches: pid == child?.processIdentifier || pid == adoptedPID,
-                  coreAlive: coreProcessAlive
-              ) else { return }
+        guard !connectionTransition, !shuttingDownConnection, !intentionallyStoppingCore, running else { return }
+        if let localGateway {
+            guard !coreProcessAlive else { return }
+            // The stable entry survives backend failure. Fail closed and
+            // retain system ownership; an explicit reconnect can rebuild it.
+            await localGateway.suspendRouting(closeExisting: true)
+            await migrationGateway?.suspendRouting(closeExisting: true)
+            healthy = false
+            checkingConnectivity = false
+            if gatewayRecoveryTask == nil || !networkOnline {
+                connectionPhase = networkOnline ? .degraded : .offline
+                status = networkOnline ? "代理后端异常 · 等待恢复" : "网络离线"
+                detail = "固定入口已保留，未绕过代理"
+            }
+            if networkOnline, gatewayRecoveryTask == nil, !activationInProgress {
+                proxyAudit("gateway_backend_unavailable", nodeID: activeNodeID)
+                scheduleGatewayRecovery(gatewayHealthPolicy.recordFailure(engineUnavailable: true))
+            }
+            return
+        }
+        guard let pid, HarborProxyLivenessPolicy.shouldHandleUnexpectedExit(
+            running: running, intentionallyStopping: intentionallyStoppingCore,
+            processMatches: pid == child?.processIdentifier || pid == adoptedPID,
+            coreAlive: coreProcessAlive) else { return }
         connectionTransition = true
         defer { connectionTransition = false }
         // If an Xray crash leaves macOS pointing to dead listeners, restore
@@ -3208,6 +4335,13 @@ final class HarborProxyManager: ObservableObject {
     }
 
     private func stopCore() async -> Bool {
+        if localGateway != nil || (runtimeSupervisor.hasEngines && child == nil && adoptedPID == nil) {
+            return await stopGatewayCore()
+        }
+        if let localPort, HarborSystemProxy.referencesListener(localPort) {
+            detail = "旧入口仍被系统网络服务引用，已保留内核"
+            return false
+        }
         intentionallyStoppingCore = true
         defer {
             intentionallyStoppingCore = false
@@ -3262,6 +4396,66 @@ final class HarborProxyManager: ObservableObject {
         configPath = nil; localPort = nil
         activeNodeID = nil
         running = false; healthy = false; checkingConnectivity = false; status = "已关闭"
+        refreshSystemProxyState()
+        return true
+    }
+
+    private func stopGatewayCore() async -> Bool {
+        guard !HarborSystemProxy.currentUsesManagedListener else {
+            detail = "系统代理仍使用固定入口，已保留监听服务"
+            return false
+        }
+        connectionGeneration &+= 1
+        livenessTask?.cancel()
+        livenessTask = nil
+        healthTask?.cancel()
+        healthTask = nil
+        if let localGateway, !(await localGateway.stop()) {
+            detail = "固定入口停止尚未确认，已保留内核记录"; return false
+        }
+        if let migrationGateway, !(await migrationGateway.stop()) {
+            detail = "旧固定入口停止尚未确认，已保留内核记录"; return false
+        }
+        migrationGateway = nil
+        // An interrupted migration may still own a legacy process record.
+        if FileManager.default.fileExists(atPath: runtimeRecordURL.path) {
+            guard let data = try? Data(contentsOf: legacyMigrationURL),
+                  let migration = try? JSONDecoder().decode(LegacyMigration.self, from: data),
+                  !HarborSystemProxy.referencesListener(migration.oldPort) else {
+                detail = "旧代理仍被引用或迁移记录未确认，保留旧内核"
+                return false
+            }
+            await cleanupOrphan()
+            guard !FileManager.default.fileExists(atPath: runtimeRecordURL.path) else {
+                detail = "旧代理尚未清理"; return false
+            }
+        }
+        let cleaned = await runtimeSupervisor.reap(excluding: [])
+        running = false
+        healthy = false
+        checkingConnectivity = false
+        if !cleaned {
+            status = "代理清理未完成"
+            detail = "内核未完全退出，保留进程记录与端口许可"
+            return false
+        }
+        localGateway = nil
+        gatewayBackend = nil
+        drainingBackend = nil
+        child = nil
+        configPath = nil
+        underlayChild = nil
+        underlayConfigPath = nil
+        underlayPort = nil
+        activeWARPProfile = nil
+        activePolicy = nil
+        warpExitIP = nil
+        lastSuccessfulHealthCheckAt = nil
+        activeNodeID = nil
+        localPort = nil
+        status = "已关闭"
+        try? FileManager.default.removeItem(at: legacyMigrationURL)
+        HarborProxyAgentClient.shared.disconnect()
         refreshSystemProxyState()
         return true
     }
@@ -3399,7 +4593,9 @@ final class HarborProxyManager: ObservableObject {
         }
         let isAlive = Darwin.kill(record.pid, 0) == 0
         if isAlive {
-            guard await recordedXrayIsOrphan(record) else {
+            guard let identity = HarborProcessIdentity.capture(pid: record.pid),
+                  identity.executablePath == URL(fileURLWithPath: record.executablePath).resolvingSymlinksInPath().path,
+                  await recordedXrayIsOrphan(record), identity.isCurrent else {
                 detail = "旧 Xray 仍由其他进程管理或运行身份已变更，已停止自动清理"
                 return
             }
@@ -3410,7 +4606,7 @@ final class HarborProxyManager: ObservableObject {
             if Darwin.kill(record.pid, 0) == 0 {
                 // Revalidate immediately before escalating, protecting against
                 // PID reuse and accidental termination of unrelated processes.
-                guard await recordedXrayIsOrphan(record) else {
+                guard identity.isCurrent, await recordedXrayIsOrphan(record), identity.isCurrent else {
                     detail = "旧 Xray 身份发生变化，已停止自动清理"
                     return
                 }
@@ -3434,7 +4630,9 @@ final class HarborProxyManager: ObservableObject {
                 return
             }
             if Darwin.kill(underlay.pid, 0) == 0 {
-                guard await recordedUnderlayIsOrphan(underlay) else {
+                guard let identity = HarborProcessIdentity.capture(pid: underlay.pid),
+                      identity.executablePath == URL(fileURLWithPath: underlay.executablePath).resolvingSymlinksInPath().path,
+                      await recordedUnderlayIsOrphan(underlay), identity.isCurrent else {
                     detail = "底座代理仍由其他进程管理，已停止自动清理"
                     return
                 }
@@ -3443,8 +4641,11 @@ final class HarborProxyManager: ObservableObject {
                     try? await Task.sleep(for: .milliseconds(50))
                 }
                 if Darwin.kill(underlay.pid, 0) == 0 {
-                    guard await recordedUnderlayIsOrphan(underlay) else { return }
+                    guard identity.isCurrent, await recordedUnderlayIsOrphan(underlay), identity.isCurrent else { return }
                     _ = Darwin.kill(underlay.pid, SIGKILL)
+                    for _ in 0..<20 where identity.isCurrent {
+                        try? await Task.sleep(for: .milliseconds(50))
+                    }
                 }
                 guard Darwin.kill(underlay.pid, 0) != 0 else {
                     detail = "底座代理未能退出，已保留恢复记录"
@@ -3457,25 +4658,6 @@ final class HarborProxyManager: ObservableObject {
         try? FileManager.default.removeItem(at: runtimeRecordURL)
     }
 
-    private func choosePort(_ requestedPort: Int,
-                            cancellation: HarborLatencyCancellation?) async throws -> Int {
-        let port = try HarborProxyPortPolicy.validate(httpPort: requestedPort)
-        // A just-stopped engine can take a short time to release its listeners.
-        // Wait only when occupied; never choose a different port implicitly.
-        let deadline = ContinuousClock.now + .seconds(2)
-        while ContinuousClock.now < deadline {
-            guard cancellation?.isCancelled != true, !shuttingDownConnection else { throw CancellationError() }
-            if !portListening(port), !portListening(port + 1) { return port }
-            try await Task.sleep(for: .milliseconds(100))
-        }
-        if portListening(port) {
-            throw HarborProxyError.invalid("HTTP 端口 \(port) 被其他进程占用。请关闭占用程序，或在代理页面手动更改端口；不会自动切换端口。")
-        }
-        if portListening(port + 1) {
-            throw HarborProxyError.invalid("SOCKS5 端口 \(port + 1) 被其他进程占用。请关闭占用程序，或在代理页面手动更改端口；不会自动切换端口。")
-        }
-        return port
-    }
     /// Check for a real listening socket instead of probing with bind(). A
     /// recently closed TCP connection can keep a port in TIME_WAIT and make a
     /// bind preflight fail even though Xray can immediately listen again.

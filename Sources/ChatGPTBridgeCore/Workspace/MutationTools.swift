@@ -225,29 +225,24 @@ public struct ShellTool: Sendable {
             process.standardError = err
 
             try process.run()
-            let deadline = Date().addingTimeInterval(TimeInterval(timeout))
-            while process.isRunning && Date() < deadline {
-                let outSize = (try? FileManager.default.attributesOfItem(atPath: stdoutURL.path)[.size] as? NSNumber)?.intValue ?? 0
-                let errSize = (try? FileManager.default.attributesOfItem(atPath: stderrURL.path)[.size] as? NSNumber)?.intValue ?? 0
-                if outSize + errSize > CommandSessionManager.maximumStoredOutputBytes {
-                    process.terminate()
-                    try? await Task.sleep(for: .milliseconds(200))
-                    if process.isRunning { process.interrupt() }
-                    throw BridgeError.writeFailed("命令输出超过 256 MiB 安全限额，已终止任务")
+            let cleanup = CommandProcessCleanup(process)
+            let deadline = ContinuousClock.now + .seconds(timeout)
+            do {
+                while process.isRunning && ContinuousClock.now < deadline {
+                    try Task.checkCancellation()
+                    let outSize = (try? FileManager.default.attributesOfItem(atPath: stdoutURL.path)[.size] as? NSNumber)?.intValue ?? 0
+                    let errSize = (try? FileManager.default.attributesOfItem(atPath: stderrURL.path)[.size] as? NSNumber)?.intValue ?? 0
+                    if outSize + errSize > CommandSessionManager.maximumStoredOutputBytes {
+                        throw BridgeError.writeFailed("命令输出超过 256 MiB 安全限额，已终止任务")
+                    }
+                    try await Task.sleep(for: .milliseconds(100))
                 }
-                try await Task.sleep(for: .milliseconds(100))
-            }
-            // Check the wall-clock deadline even when the child exited just
-            // before a heavily loaded executor resumed this task. Otherwise a
-            // five-second command can incorrectly pass a one-second timeout.
-            if Date() >= deadline {
-                if process.isRunning {
-                    process.terminate()
-                    try await Task.sleep(for: .milliseconds(200))
-                    if process.isRunning { process.interrupt() }
-                }
+                try Task.checkCancellation()
+                if ContinuousClock.now >= deadline { throw BridgeError.commandTimedOut(timeout) }
+            } catch {
+                await cleanup.stop(process)
                 try? out.close(); try? err.close()
-                throw BridgeError.commandTimedOut(timeout)
+                throw error
             }
             try out.close(); try err.close()
             let finalOutBytes = (try FileManager.default.attributesOfItem(atPath: stdoutURL.path)[.size] as? NSNumber)?.intValue ?? 0

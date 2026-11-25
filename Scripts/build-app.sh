@@ -17,6 +17,11 @@ install_app=true
 if [[ "${2:-}" == "--no-install" ]]; then
   install_app=false
 fi
+if [[ "${CODEX_HARBOR_REQUIRE_DEVELOPER_ID:-0}" == 1 &&
+      "${CODEX_HARBOR_SIGN_IDENTITY:-}" != "Developer ID Application:"* ]]; then
+  echo "正式发布需要显式配置 Developer ID Application 证书；拒绝临时或本地签名。" >&2
+  exit 6
+fi
 # Avoid overloading smaller Macs; keep an explicit override for CI.
 cpu_count="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 memory_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 8589934592)"
@@ -74,6 +79,14 @@ trap release_build_lock EXIT
 sign_identity="${CODEX_HARBOR_SIGN_IDENTITY:-auto}"
 sign_keychain_args=()
 sign_keychain_lookup_args=()
+if [[ -n "${CODEX_HARBOR_SIGN_KEYCHAIN:-}" ]]; then
+  if [[ "$sign_identity" == "auto" || "$sign_identity" == "-" || ! -f "$CODEX_HARBOR_SIGN_KEYCHAIN" ]]; then
+    echo "显式签名钥匙串需要有效文件及明确的代码签名身份。" >&2
+    exit 6
+  fi
+  sign_keychain_args=(--keychain "$CODEX_HARBOR_SIGN_KEYCHAIN")
+  sign_keychain_lookup_args=("$CODEX_HARBOR_SIGN_KEYCHAIN")
+fi
 local_signing_profile="${CODEX_HARBOR_SIGNING_PROFILE:-$HOME/Library/Application Support/CodexHarbor/CodeSigning/profile.json}"
 # Once configured, pin the exact certificate instead of silently selecting a
 # different identity or returning to ad-hoc signing after a keychain failure.
@@ -129,7 +142,11 @@ if [[ "$sign_identity" != "-" ]]; then
   fi
   echo "==> 稳定代码签名身份：$sign_identity"
 else
-  echo "==> 警告：没有有效的持久代码签名身份，当前只能 ad-hoc 签名。" >&2
+  if [[ "$install_app" == true ]]; then
+    echo "独立代理服务需要持久签名身份；拒绝安装无法建立认证 XPC 的版本。" >&2
+    exit 6
+  fi
+  echo "==> 警告：没有有效的持久代码签名身份，仅允许生成开发包，独立代理服务不可用。" >&2
   echo "    更新 Agent 后，macOS 可能要求重新开启辅助功能和屏幕录制授权。" >&2
   echo "    免费方案：用钥匙串访问 → 证书助理创建「Codex Harbor Local Code Signing」自签名代码签名证书。" >&2
   echo "    或者登录 Xcode 的免费 Apple Account / Personal Team 创建开发证书。" >&2
@@ -151,7 +168,7 @@ case "$mode" in
       swift build --disable-sandbox -c release --jobs "$jobs"
     ;;
   package-only)
-    if [[ ! -x "$build_root/release/CodexHarbor" || ! -x "$build_root/release/HarborChatGPTAgent" || ! -x "$build_root/release/HarborUsageCardAgent" ]]; then
+    if [[ ! -x "$build_root/release/CodexHarbor" || ! -x "$build_root/release/HarborChatGPTAgent" || ! -x "$build_root/release/HarborUsageCardAgent" || ! -x "$build_root/release/HarborProxyAgent" ]]; then
       echo "缺少 Release 可执行文件，不能仅打包。请先运行：Scripts/build-app.sh fast" >&2
       exit 4
     fi
@@ -168,6 +185,7 @@ mkdir -p "$staging_app_path/Contents/MacOS" "$staging_app_path/Contents/Helpers"
 cp "$build_root/release/CodexHarbor" "$staging_app_path/Contents/MacOS/CodexHarbor"
 cp "$build_root/release/HarborChatGPTAgent" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
 cp "$build_root/release/HarborUsageCardAgent" "$staging_app_path/Contents/Helpers/HarborUsageCardAgent"
+cp "$build_root/release/HarborProxyAgent" "$staging_app_path/Contents/Helpers/HarborProxyAgent"
 cp "$project_root/Resources/Info.plist" "$staging_app_path/Contents/Info.plist"
 # Stamp builds with a monotonic revision and exact Git commit.
 build_number="$(git -C "$project_root" rev-list --count HEAD 2>/dev/null || echo 13)"
@@ -248,7 +266,7 @@ cp "$project_root/Resources/Mihomo/LICENSE" "$staging_app_path/Contents/Resource
 chmod 755 "$mihomo_destination/mihomo"
 "$mihomo_destination/mihomo" -v >/dev/null
 echo "==> 已内置 Mihomo OpenVPN 内核（$host_arch）"
-chmod 755 "$staging_app_path/Contents/MacOS/CodexHarbor" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent" "$staging_app_path/Contents/Helpers/HarborUsageCardAgent"
+chmod 755 "$staging_app_path/Contents/MacOS/CodexHarbor" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent" "$staging_app_path/Contents/Helpers/HarborUsageCardAgent" "$staging_app_path/Contents/Helpers/HarborProxyAgent"
 # Sign nested executables first, then the enclosing app. Avoid --deep when
 # signing: it can re-sign nested code with an unexpected identity.
 sign_options=()
@@ -259,6 +277,7 @@ codesign --force "${sign_options[@]}" --sign "$sign_identity" "${sign_keychain_a
 codesign --force "${sign_options[@]}" --sign "$sign_identity" "${sign_keychain_args[@]}" --identifier "com.codexharbor.mihomo" "$mihomo_destination/mihomo"
 codesign --force "${sign_options[@]}" --sign "$sign_identity" "${sign_keychain_args[@]}" --identifier "com.codexharbor.agent" "$staging_app_path/Contents/Helpers/HarborChatGPTAgent"
 codesign --force "${sign_options[@]}" --sign "$sign_identity" "${sign_keychain_args[@]}" --identifier "com.codexharbor.usage-card-agent" "$staging_app_path/Contents/Helpers/HarborUsageCardAgent"
+codesign --force "${sign_options[@]}" --sign "$sign_identity" "${sign_keychain_args[@]}" --identifier "com.codexharbor.proxy-agent" "$staging_app_path/Contents/Helpers/HarborProxyAgent"
 codesign --force "${sign_options[@]}" --sign "$sign_identity" "${sign_keychain_args[@]}" "$staging_app_path"
 
 codesign --verify --deep --strict "$staging_app_path"
@@ -276,7 +295,14 @@ if [[ "$install_app" != true ]]; then
 fi
 
 echo "==> 安装到 /Applications"
-rm -rf "$installed_staging_path" "$installed_backup_path"
+source "$project_root/Scripts/proxy-deployment-guard.sh"
+proxy_unload_quiescent_agent || exit 6
+if [[ -e "$installed_backup_path" ]]; then
+  echo "保留的上一版本仍存在；请在确认可回退且验收完成后手动归档，拒绝覆盖备份。" >&2
+  exit 6
+fi
+proxy_backup_configuration || exit 6
+rm -rf "$installed_staging_path"
 /usr/bin/ditto "$app_path" "$installed_staging_path"
 codesign --verify --deep --strict "$installed_staging_path"
 plutil -lint "$installed_staging_path/Contents/Info.plist"

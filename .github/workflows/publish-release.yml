@@ -50,21 +50,18 @@ jobs:
           /bin/zsh -n Scripts/build-app.sh
           /bin/zsh -n Scripts/create-dmg.sh
           /bin/zsh -n Scripts/verify-dmg.sh
+          /bin/bash -n Scripts/package-official-release.sh
           plutil -lint Resources/Info.plist
           swift test --parallel --jobs "$CODEX_HARBOR_BUILD_JOBS"
-      - name: Build and sign Apple Silicon app once
-        run: ./Scripts/build-app.sh fast --no-install
-      - name: Create versioned installer and verify mounted copy
+      - name: Sign, verify and notarize the Apple Silicon installer
         shell: bash
-        run: |
-          set -euo pipefail
-          ./Scripts/create-dmg.sh
-          source_dmg=$(./Scripts/create-dmg.sh --print-path)
-          ./Scripts/verify-dmg.sh "$source_dmg"
-          asset="Codex-Harbor-v${VERSION}-arm64.dmg"
-          cp "$source_dmg" "dist/$asset"
-          (cd dist && shasum -a 256 "$asset" > SHA256SUMS)
-          echo "ASSET_NAME=$asset" >> "$GITHUB_ENV"
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          MACOS_NOTARY_APP_PASSWORD: ${{ secrets.MACOS_NOTARY_APP_PASSWORD }}
+        run: /bin/bash Scripts/package-official-release.sh
       - name: Publish GitHub Release
         shell: bash
         run: |
@@ -72,7 +69,7 @@ jobs:
           {
             printf '# Codex Harbor v%s\n\n' "$VERSION"
             git log -1 --format=%b
-            printf '\nThe Apple Silicon DMG includes Xray and Mihomo and uses an ad-hoc signature.\n'
+            printf '\nThe Apple Silicon DMG includes Xray and Mihomo, uses Developer ID signing, and is notarized by Apple.\n'
             printf '\nSource commit `%s`\n' "$GITHUB_SHA"
           } > "$RUNNER_TEMP/release-notes.md"
           gh release create "v${VERSION}" "dist/${ASSET_NAME}" dist/SHA256SUMS \

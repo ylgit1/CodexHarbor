@@ -22,34 +22,52 @@ do {
     let profile = try JSONDecoder().decode(
         SigningProfile.self, from: Data(contentsOf: profileURL))
     let directory = profileURL.deletingLastPathComponent()
+    let generation = URL(fileURLWithPath: profile.keychainPath).deletingLastPathComponent()
+    let nested = generation.deletingLastPathComponent() == directory
+        && generation.lastPathComponent.hasPrefix("generation-")
+        && UUID(uuidString: String(generation.lastPathComponent.dropFirst("generation-".count))) != nil
+    var generationInfo = stat()
     guard profile.identity.range(of: "^[A-Fa-f0-9]{40}$",
                                  options: .regularExpression) != nil,
-          profile.keychainPath == directory.appendingPathComponent("signing.keychain-db").path,
-          profile.passwordPath == directory.appendingPathComponent("keychain.password").path,
+          generation == directory || nested,
+          lstat(generation.path, &generationInfo) == 0,
+          (generationInfo.st_mode & S_IFMT) == S_IFDIR,
+          generationInfo.st_uid == geteuid(), (generationInfo.st_mode & 0o077) == 0,
+          profile.keychainPath == generation.appendingPathComponent("signing.keychain-db").path,
+          profile.passwordPath == generation.appendingPathComponent("keychain.password").path,
           FileManager.default.fileExists(atPath: profile.keychainPath) else {
         fail("固定签名配置不完整，已停止打包；不会改用临时签名")
     }
-    let attributes = try FileManager.default.attributesOfItem(atPath: profile.passwordPath)
-    guard let owner = attributes[.ownerAccountID] as? NSNumber,
-          owner.uint32Value == geteuid(),
-          let mode = attributes[.posixPermissions] as? NSNumber,
-          mode.intValue & 0o077 == 0 else {
-        fail("签名凭据文件必须仅供当前用户读写，已停止打包")
-    }
-    let password = try String(contentsOfFile: profile.passwordPath, encoding: .utf8)
-        .trimmingCharacters(in: .newlines)
-    guard !password.isEmpty else { fail("签名凭据为空，已停止打包") }
     SecKeychainSetUserInteractionAllowed(false)
     var keychain: SecKeychain?
     let opened = SecKeychainOpen(profile.keychainPath, &keychain)
     guard opened == errSecSuccess, let keychain else {
         fail("无法打开专用签名钥匙串（\(opened)），已停止打包")
     }
-    let status = password.withCString {
-        SecKeychainUnlock(keychain, UInt32(password.utf8.count), $0, true)
+    var keychainStatus: SecKeychainStatus = 0
+    let statusResult = SecKeychainGetStatus(keychain, &keychainStatus)
+    guard statusResult == errSecSuccess else {
+        fail("无法确认专用签名钥匙串状态（\(statusResult)），已停止打包")
     }
-    guard status == errSecSuccess else {
-        fail("无法解锁专用签名钥匙串（\(status)），已停止打包")
+    // An explicitly unlocked keychain may be used without replaying a stale
+    // stored password. Never reset, replace, or weaken its access controls.
+    if keychainStatus & SecKeychainStatus(kSecUnlockStateStatus) == 0 {
+        let attributes = try FileManager.default.attributesOfItem(atPath: profile.passwordPath)
+        guard let owner = attributes[.ownerAccountID] as? NSNumber,
+              owner.uint32Value == geteuid(),
+              let mode = attributes[.posixPermissions] as? NSNumber,
+              mode.intValue & 0o077 == 0 else {
+            fail("签名凭据文件必须仅供当前用户读写，已停止打包")
+        }
+        let password = try String(contentsOfFile: profile.passwordPath, encoding: .utf8)
+            .trimmingCharacters(in: .newlines)
+        guard !password.isEmpty else { fail("签名凭据为空，已停止打包") }
+        let status = password.withCString {
+            SecKeychainUnlock(keychain, UInt32(password.utf8.count), $0, true)
+        }
+        guard status == errSecSuccess else {
+            fail("无法解锁专用签名钥匙串（\(status)）；请在钥匙串访问中解锁原钥匙串，不会自动更换签名身份")
+        }
     }
     // codesign requires the identity's keychain on the user's search list,
     // even with --keychain. Append ours without changing existing entries or

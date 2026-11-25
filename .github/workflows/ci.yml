@@ -49,6 +49,7 @@ jobs:
           /bin/zsh -n Scripts/build-app.sh
           /bin/zsh -n Scripts/create-dmg.sh
           /bin/zsh -n Scripts/verify-dmg.sh
+          /bin/bash -n Scripts/package-official-release.sh
           plutil -lint Resources/Info.plist
       - name: Unit and integration tests
         run: swift test --parallel --jobs "$CODEX_HARBOR_BUILD_JOBS"

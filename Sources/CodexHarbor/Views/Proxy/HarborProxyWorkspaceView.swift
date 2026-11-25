@@ -659,15 +659,13 @@ struct HarborProxyWorkspaceView: View {
     }
 
     private var headerNode: HarborProxyNode? {
-        if let id = visibleSwitchingNodeID {
-            return proxy.nodes.first { $0.id == id }
-        }
-        if proxy.running, let node = proxy.activeNode { return node }
+        if proxy.running { return proxy.activeNode }
+        if let id = visibleSwitchingNodeID { return proxy.nodes.first { $0.id == id } }
         return proxy.selectedNode
     }
 
     private var proxyNodeTitle: String {
-        headerNode?.displayName ?? "未选择代理节点"
+        headerNode?.displayName ?? (proxy.running ? "实际运行节点未识别" : "未选择代理节点")
     }
 
     private var proxyConnectionType: HarborProxyConnectionType? {
@@ -684,7 +682,14 @@ struct HarborProxyWorkspaceView: View {
         if !proxy.configurationLoaded {
             return proxy.configurationLoadError == nil ? "正在读取代理配置…" : "代理配置暂不可读取"
         }
-        if visibleSwitchingNodeID != nil { return "正在切换 · 启动并验证新节点" }
+        if proxy.connectionPhase == .offline { return "网络离线 · 暂停恢复" }
+        if proxy.connectionPhase == .recovering { return "正在恢复当前节点" }
+        if proxy.connectionPhase == .stopping { return "正在停止并回收代理资源" }
+        if proxy.connectionPhase == .failed && proxy.running { return proxy.status }
+        if let id = visibleSwitchingNodeID {
+            let requested = proxy.nodes.first { $0.id == id }?.displayName ?? "新节点"
+            return "正在验证：\(requested)"
+        }
         if proxy.running && proxy.checkingConnectivity {
             return "正在连接 · 本地端口已就绪，检测真实网络中"
         }
@@ -726,6 +731,20 @@ struct HarborProxyWorkspaceView: View {
         guard let node = headerNode,
               let latency = proxy.probeResults[node.id]?.milliseconds else { return .secondary }
         return latencyColor(latency)
+    }
+
+    private func exitEvidenceLabel(_ evidence: HarborProxyNetworkEvidence) -> String {
+        let kind: String
+        switch evidence.kind {
+        case .residential: kind = "住宅候选"
+        case .cellular: kind = "移动网络候选"
+        case .hosting: kind = "机房候选"
+        case .other, .unknown: kind = "未知"
+        }
+        let confidence = evidence.confidence == .corroborated ? "多源一致"
+            : evidence.confidence == .conflicting ? "证据冲突"
+            : evidence.confidence == .singleSource ? "单源" : "待验证"
+        return "出口类型 \(kind) · \(confidence)"
     }
 
     private var currentNode: some View {
@@ -777,6 +796,30 @@ struct HarborProxyWorkspaceView: View {
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(HarborColors.green)
                     }
+                }
+                if proxy.running, let node = proxy.activeNode {
+                    HStack(spacing: 8) {
+                        if let entry = proxy.entranceLocation(for: node)?.ip {
+                            Text("入口 \(entry)")
+                        }
+                        if let exit = proxy.currentVerifiedExitIP {
+                            Text("出口 \(exit)")
+                        } else if proxy.healthy {
+                            Text("出口 IP 待识别")
+                        }
+                        if let evidence = proxy.exitNetworkEvidence(for: node) {
+                            Text(exitEvidenceLabel(evidence))
+                                .help("证据来源：\(evidence.sources?.joined(separator: ", ") ?? "历史记录")")
+                        } else if proxy.healthy {
+                            Text("出口类型待识别")
+                        }
+                        if let checkedAt = proxy.lastSuccessfulHealthCheckAt {
+                            Text("最近成功 \(checkedAt, style: .time)")
+                        }
+                    }
+                    .font(.system(size: 9.5, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
                 }
             }
             Spacer(minLength: 12)
@@ -1975,6 +2018,12 @@ struct HarborProxyWorkspaceView: View {
     @ViewBuilder
     private func nodeNameActions(_ node: HarborProxyNode) -> some View {
         Button {
+            proxy.toggleFallbackAuthorization(node)
+        } label: {
+            Label(proxy.isAuthorizedFallback(node) ? "取消备用节点授权" : "允许作为自动恢复备用节点",
+                  systemImage: proxy.isAuthorizedFallback(node) ? "shield.slash" : "checkmark.shield")
+        }
+        Button {
             renameText = node.displayName
             renameTarget = RenameTarget(id: node.id)
         } label: {
@@ -2320,6 +2369,15 @@ struct HarborProxyWorkspaceView: View {
                         set: { proxy.setResumeConnectionOnLaunch($0) }
                     ))
                     .font(.system(size: 11))
+                    Toggle("允许自动切换已授权备用节点", isOn: Binding(
+                        get: { proxy.fallbackPolicy.enabled },
+                        set: { proxy.setAutomaticFallback($0) }
+                    ))
+                    .font(.system(size: 11))
+                    Text("默认关闭。右键节点单独授权；仅在同节点恢复失败后，验证相同协议、出口国家及网络类型。证据不足时不切换。")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     Button("从安装包修复代理内核") {
                         editor = nil
                         Task { await proxy.installBundledXray() }

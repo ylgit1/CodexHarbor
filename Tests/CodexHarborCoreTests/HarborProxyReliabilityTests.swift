@@ -230,7 +230,9 @@ struct HarborProxyReliabilityTests {
             forcedProxyDomains: ["proxy.example.test"], localHosts: ["nas.internal"],
             verificationHost: "health.example.test", localHostAddresses: ["nas.internal": ["192.168.1.2"]])
         #expect(HarborMihomoConfig.matches(configuration: config, node: node))
-        try config.write(to: file)
+        let protectedOpenVPN = try HarborGatewayConfiguration.protectMihomo(config,
+            ports: [18080, 18081, 19200, 19201], aliases: ["nas.internal"])
+        try protectedOpenVPN.write(to: file)
         let openVPN = try HarborProxyCommand.runBlocking(
             mihomo, arguments: ["-t", "-d", directory.path, "-f", file.path], timeout: 8,
             outputLimit: 16_384, captureDiagnostics: true)
@@ -238,9 +240,11 @@ struct HarborProxyReliabilityTests {
 
         let ordinary = HarborProxyNode(name: "test", protocolName: "vless", host: "192.0.2.2", port: 443,
                                       credential: "00000000-0000-0000-0000-000000000001")
-        try HarborXrayConfig.make(node: ordinary, httpPort: 19202, ruleMode: true,
+        let ordinaryConfig = try HarborXrayConfig.make(node: ordinary, httpPort: 19202, ruleMode: true,
             forcedProxyDomains: ["proxy.example.test"], routeVerificationViaProxy: true,
-            verificationHost: "health.example.test", localHosts: ["nas.internal"]).write(to: file)
+            verificationHost: "health.example.test", localHosts: ["nas.internal"])
+        try HarborGatewayConfiguration.protectXray(ordinaryConfig,
+            ports: [18080, 18081, 19202, 19203], aliases: ["nas.internal"]).write(to: file)
         let check = try HarborProxyCommand.runBlocking(xray.appendingPathComponent("xray"),
             arguments: ["run", "-test", "-config", file.path], timeout: 8, outputLimit: 16_384,
             captureDiagnostics: true,

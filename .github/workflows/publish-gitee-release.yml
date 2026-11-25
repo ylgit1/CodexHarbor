@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing GitHub Release tag to sync (e.g. v0.1.33)"
+        description: "Existing notarized GitHub Release tag to sync"
         required: true
         type: string
 
@@ -37,16 +37,17 @@ jobs:
        github.event.workflow_run.head_branch == 'main' &&
        github.event.workflow_run.head_repository.full_name == github.repository &&
        startsWith(github.event.workflow_run.head_commit.message, 'release: v'))
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 190
     env:
       GH_TOKEN: ${{ github.token }}
-      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
       REQUESTED_TAG: ${{ inputs.tag }}
       PUBLISHED_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
       - name: Require Gitee publishing authorization
         shell: bash
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         run: |
           if [ -z "${GITEE_TOKEN:-}" ]; then
             echo "::error::Missing GITEE_TOKEN. Add a Gitee Personal Access Token with projects permission under Settings > Secrets and variables > Actions."
@@ -101,15 +102,20 @@ jobs:
             --dir "$RUNNER_TEMP/gitee-installer" --pattern "$asset"
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
             --dir "$RUNNER_TEMP/gitee-installer" --pattern SHA256SUMS
-          (
-            cd "$RUNNER_TEMP/gitee-installer"
-            sha256sum --check SHA256SUMS
-          )
-          echo "ASSET_PATH=$RUNNER_TEMP/gitee-installer/$asset" >> "$GITHUB_ENV"
-          echo "ASSET_SHA256=$(sha256sum "$RUNNER_TEMP/gitee-installer/$asset" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          asset_path="$RUNNER_TEMP/gitee-installer/$asset"
+          actual_sha=$(/usr/bin/shasum -a 256 "$asset_path" | cut -d' ' -f1)
+          /usr/bin/awk -v asset="$asset" -v sha="$actual_sha" \
+            'NF == 2 && $2 == asset && $1 == sha { count++ } END { exit count != 1 }' \
+            "$RUNNER_TEMP/gitee-installer/SHA256SUMS"
+          CODEX_HARBOR_EXPECTED_VERSION="${TAG#v}" CODEX_HARBOR_EXPECTED_COMMIT="${SOURCE_COMMIT:0:12}" \
+            ./Scripts/verify-dmg.sh "$asset_path" --notarized --static-only
+          echo "ASSET_PATH=$asset_path" >> "$GITHUB_ENV"
+          echo "ASSET_SHA256=$actual_sha" >> "$GITHUB_ENV"
 
       - name: Synchronize source commit and tag to Gitee
         shell: bash
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         run: |
           set -euo pipefail
           askpass="$RUNNER_TEMP/gitee-askpass.sh"
@@ -153,6 +159,8 @@ jobs:
 
       - name: Upload and verify Gitee Release attachment
         shell: bash
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         run: |
           set -euo pipefail
           notes="$RUNNER_TEMP/gitee-installer/release-notes.md"

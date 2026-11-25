@@ -10,6 +10,7 @@ health_url="http://127.0.0.1:19473/health"
 bridge_config_path="$HOME/Library/Application Support/CodexHarbor/ChatGPTBridge/config.json"
 expected_catalog_version=""
 expected_tool_count=""
+source "${0:A:h}/proxy-deployment-guard.sh"
 
 rollback() {
   local reason="$1"
@@ -19,6 +20,12 @@ rollback() {
     return 1
   fi
 
+  # Downgrading while the resident service owns a listener would strand
+  # macOS or make the old app unable to stop the active engine.
+  if ! proxy_unload_quiescent_agent; then
+    echo "自动回滚暂缓：代理运行态未确认清空。已保留当前应用和上一版本。" >&2
+    return 1
+  fi
   echo "==> 正在恢复上一版本 Codex Harbor"
   rm -rf "$installed_app_path"
   mv "$backup_app_path" "$installed_app_path"
@@ -46,6 +53,12 @@ verify_static_install() {
   plutil -lint "$installed_app_path/Contents/Info.plist" >/dev/null || return 1
   [[ -x "$installed_app_path/Contents/MacOS/CodexHarbor" ]] || return 1
   [[ -x "$helper_path" ]] || return 1
+  [[ -x "$installed_app_path/Contents/Helpers/HarborProxyAgent" ]] || return 1
+  [[ -x "$installed_app_path/Contents/Helpers/HarborUsageCardAgent" ]] || return 1
+  [[ -x "$installed_app_path/Contents/Resources/Xray/$(uname -m)/xray" ]] || return 1
+  [[ -x "$installed_app_path/Contents/Resources/Mihomo/$(uname -m)/mihomo" ]] || return 1
+  [[ -f "$installed_app_path/Contents/Resources/Xray/$(uname -m)/geoip.dat" ]] || return 1
+  [[ -f "$installed_app_path/Contents/Resources/Xray/$(uname -m)/geosite.dat" ]] || return 1
   read_expected_catalog || return 1
 }
 
@@ -104,6 +117,5 @@ if ! verify_agent_health; then
   exit 11
 fi
 
-echo "==> 安装后健康检查通过，清理上一版本备份"
-rm -rf "$backup_app_path"
+echo "==> Bridge 健康检查通过，保留上一版本直到网络代理验收完成"
 echo "$installed_app_path"
